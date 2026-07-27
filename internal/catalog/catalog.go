@@ -18,6 +18,16 @@ const (
 	Advisory Enforcement = "ADVISORY"
 )
 
+// Masking declares whether a connector can mask a column itself. For the
+// SaaS-REST-API connector category this design targets, genuine
+// source-side masking is the exception rather than the norm - see
+// DESIGN.md ADR-002 - so v1 only implements local (gateway-side) masking
+// and treats any value other than MaskingUnsupported as an error rather
+// than a pushdown opportunity it doesn't know how to use.
+type Masking string
+
+const MaskingUnsupported Masking = "unsupported"
+
 type PredicateCapability struct {
 	Ops         []string    `json:"ops"`
 	Enforcement Enforcement `json:"enforcement"`
@@ -35,7 +45,7 @@ func (c PredicateCapability) SupportsOp(op string) bool {
 type Table struct {
 	Name          string                         `json:"table"`
 	Predicates    map[string]PredicateCapability `json:"predicates"`
-	Masking       string                         `json:"masking"`
+	Masking       Masking                        `json:"masking"`
 	JoinKeyInList bool                           `json:"join_key_in_list"`
 	MaxInList     int                            `json:"max_in_list"`
 }

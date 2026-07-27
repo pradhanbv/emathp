@@ -184,6 +184,17 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals, masks p
 		root = &Project{Child: root, Cols: cols}
 	}
 
+	// A mask is about to be applied locally - assert the catalog agrees
+	// this connector can't mask itself. v1 has no pushed-masking
+	// implementation, so a catalog claiming otherwise is a configuration
+	// error to catch now, not a capability to silently ignore.
+	if len(maskCols) > 0 {
+		t, ok := cat.Table(table)
+		if !ok || t.Masking != catalog.MaskingUnsupported {
+			return nil, fmt.Errorf("%w: %s declares masking %q", ErrMaskingUnsupported, table, t.Masking)
+		}
+	}
+
 	// The scan projects the union of the output columns, every predicate
 	// column (pushed or local), and mask columns - then the top Project
 	// trims back. Join keys join this union in Cycle 10.
@@ -228,6 +239,16 @@ func ParseTable(sql string) (string, error) {
 
 // classify is the capability walk: ENFORCED -> push, ADVISORY -> retain
 // locally, unknown column/op -> retain locally as Unsupported.
+//
+// Deliberate simplification: this applies the ADVISORY-never-pushes rule
+// to every predicate regardless of Origin. ADR-002 only requires that for
+// SECURITY predicates (over-filtering risk - see DESIGN.md ADR-002, "Why
+// not push security predicates to ADVISORY connectors"); for USER
+// predicates it says ADVISORY should still be pushed as a volume
+// optimization, with the local filter kept for correctness regardless.
+// Not fixed here: safe (over-conservative, costs bandwidth not
+// correctness) and no current fixture exercises a user-origin predicate
+// against an ADVISORY column. See IMPLEMENTATION_PLAN.md Cycle 2.
 func classify(cat *catalog.Catalog, table, column, op string) Verdict {
 	capa, ok := cat.Capability(table, column)
 	if !ok || !capa.SupportsOp(op) {

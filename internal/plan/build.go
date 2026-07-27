@@ -38,6 +38,46 @@ func (p *Plan) Scan(table string) *Scan {
 	return p.scans[table]
 }
 
+// PrimaryScan returns the plan's one Scan. v1 is single-table only, so
+// there's never more than one to choose between; joins (Cycle 10) will
+// need callers to go through Scan(table) instead.
+func (p *Plan) PrimaryScan() *Scan {
+	for _, s := range p.scans {
+		return s
+	}
+	return nil
+}
+
+// Filters returns every Filter node in the tree, pushed and local alike -
+// what exec needs to know both what to send to the connector and what to
+// re-check afterward.
+func (p *Plan) Filters() []*Filter {
+	var out []*Filter
+	walk(p.Root, func(n Node) {
+		if f, ok := n.(*Filter); ok {
+			out = append(out, f)
+		}
+	})
+	return out
+}
+
+// OutputColumns returns the final output projection - what the top
+// Project node trims the over-projected scan back down to.
+func (p *Plan) OutputColumns() []ProjectCol {
+	if proj, ok := p.Root.(*Project); ok {
+		return proj.Cols
+	}
+	scan := p.PrimaryScan()
+	if scan == nil {
+		return nil
+	}
+	cols := make([]ProjectCol, len(scan.Project))
+	for i, c := range scan.Project {
+		cols[i] = ProjectCol{Name: c}
+	}
+	return cols
+}
+
 func normalizeExpr(expr string) string {
 	return strings.Join(strings.Fields(expr), " ")
 }
@@ -47,7 +87,8 @@ var parser = sqlparser.NewTestParser()
 // Build parses sql (v1 surface: single table, conjunctive WHERE, simple
 // column projection) and classifies every predicate - from the query text
 // and from residuals - against cat's capability profile for the table.
-func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan, error) {
+// masks declares which output columns get CLS masking applied.
+func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals, masks policy.Masks) (*Plan, error) {
 	stmt, err := parser.Parse(sql)
 	if err != nil {
 		return nil, fmt.Errorf("plan: parse: %w", err)
@@ -67,9 +108,16 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan,
 		return nil, err
 	}
 
-	scan := &Scan{Table: table, Project: projectCols}
+	scan := &Scan{Table: table}
 	verdicts := make(map[string]Verdict)
 	var root Node = scan
+
+	// predicateCols collects every predicate's column, pushed or local,
+	// in first-seen order. A PUSHED_ENFORCED predicate's column still
+	// needs fetching: the verification filter (Cycle 6) re-checks it
+	// locally after fetch, so over-projection applies to it too.
+	var predicateCols []string
+	seenCol := make(map[string]bool)
 
 	applyPredicate := func(col, op, value string, origin Origin) Verdict {
 		exprText := normalizeExpr(col + " " + op + " " + value)
@@ -77,6 +125,10 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan,
 		verdicts[exprText] = v
 		if v.Site == Pushed {
 			scan.Pushed = append(scan.Pushed, col)
+		}
+		if !seenCol[col] {
+			seenCol[col] = true
+			predicateCols = append(predicateCols, col)
 		}
 		root = &Filter{
 			Child: root,
@@ -116,13 +168,26 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan,
 		})
 	}
 
+	var maskCols []string
 	if len(projectCols) > 0 {
 		cols := make([]ProjectCol, len(projectCols))
 		for i, c := range projectCols {
 			cols[i] = ProjectCol{Name: c}
+			for _, m := range masks {
+				if m.Table == table && m.Column == c {
+					fn := m.Fn
+					cols[i].Mask = &fn
+					maskCols = append(maskCols, c)
+				}
+			}
 		}
 		root = &Project{Child: root, Cols: cols}
 	}
+
+	// The scan projects the union of the output columns, every predicate
+	// column (pushed or local), and mask columns - then the top Project
+	// trims back. Join keys join this union in Cycle 10.
+	scan.Project = dedupUnion(projectCols, predicateCols, maskCols)
 
 	return &Plan{
 		Root:     root,
@@ -130,6 +195,20 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan,
 		scans:    map[string]*Scan{table: scan},
 		security: security,
 	}, nil
+}
+
+func dedupUnion(lists ...[]string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, list := range lists {
+		for _, c := range list {
+			if !seen[c] {
+				seen[c] = true
+				out = append(out, c)
+			}
+		}
+	}
+	return out
 }
 
 // ParseTable extracts the table sql queries, without building a plan.

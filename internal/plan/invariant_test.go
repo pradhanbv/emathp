@@ -35,7 +35,7 @@ func buildFor(t *testing.T, persona, sql string) *plan.Plan {
 	residuals, err := pol.ResidualsFor(personaRole[persona], table)
 	require.NoError(t, err)
 
-	p, err := plan.Build(sql, cat, residuals)
+	p, err := plan.Build(sql, cat, residuals, nil)
 	require.NoError(t, err)
 	return p
 }

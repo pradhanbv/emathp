@@ -1,0 +1,147 @@
+// Package exec runs a built plan against a connector.Source: fetch the
+// over-projected scan, apply every locally-retained Filter, mask, then
+// trim to the final output projection.
+package exec
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+
+	"github.com/pradhanbv/emathp/internal/connector"
+	"github.com/pradhanbv/emathp/internal/plan"
+)
+
+type Result struct {
+	Columns []string
+	Rows    []map[string]string
+	Debug   Debug
+}
+
+type Debug struct {
+	FetchedColumns []string
+}
+
+// Run executes p against source.
+func Run(ctx context.Context, p *plan.Plan, source connector.Source) (*Result, error) {
+	scan := p.PrimaryScan()
+	if scan == nil {
+		return nil, fmt.Errorf("exec: plan has no scan")
+	}
+
+	filters := p.Filters()
+
+	pushed := make(map[string]string, len(filters))
+	for _, f := range filters {
+		if f.Site == plan.Pushed {
+			pushed[f.Pred.Column] = unquote(f.Pred.Value)
+		}
+	}
+
+	rows, err := source.Fetch(ctx, connector.FetchRequest{
+		Table:   scan.Table,
+		Columns: scan.Project,
+		Filters: pushed,
+	})
+	if err != nil {
+		var colErr *connector.ColumnUnavailableError
+		if errors.As(err, &colErr) && securityPredicateNeedsColumn(filters, colErr.Column) {
+			return nil, fmt.Errorf("%w: source cannot supply column %q, required by tenant policy",
+				plan.ErrEntitlementDenied, colErr.Column)
+		}
+		return nil, err
+	}
+
+	rows = applyLocalFilters(rows, filters)
+
+	outCols := p.OutputColumns()
+	outRows, err := project(rows, outCols)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, len(outCols))
+	for i, c := range outCols {
+		names[i] = c.Name
+	}
+
+	return &Result{
+		Columns: names,
+		Rows:    outRows,
+		Debug:   Debug{FetchedColumns: scan.Project},
+	}, nil
+}
+
+// securityPredicateNeedsColumn is the fail-closed check from
+// TestMissingPredicateColumnFailsClosed: a source hiding a column a user
+// predicate depends on is a different problem (UNSUPPORTED_PREDICATE
+// territory), but hiding a column an RLS rule depends on is an
+// entitlement failure - we can no longer prove the policy holds, so we
+// refuse rather than serve rows we can't verify are properly filtered.
+func securityPredicateNeedsColumn(filters []*plan.Filter, column string) bool {
+	for _, f := range filters {
+		if f.Pred.Origin == plan.SecurityOrigin && f.Pred.Column == column {
+			return true
+		}
+	}
+	return false
+}
+
+func applyLocalFilters(rows []connector.Row, filters []*plan.Filter) []connector.Row {
+	var out []connector.Row
+	for _, r := range rows {
+		keep := true
+		for _, f := range filters {
+			if f.Site != plan.Local {
+				continue
+			}
+			if r[f.Pred.Column] != unquote(f.Pred.Value) {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func project(rows []connector.Row, cols []plan.ProjectCol) ([]map[string]string, error) {
+	out := make([]map[string]string, 0, len(rows))
+	for _, r := range rows {
+		o := make(map[string]string, len(cols))
+		for _, c := range cols {
+			v := r[c.Name]
+			if c.Mask != nil {
+				masked, err := applyMask(*c.Mask, v)
+				if err != nil {
+					return nil, err
+				}
+				v = masked
+			}
+			o[c.Name] = v
+		}
+		out = append(out, o)
+	}
+	return out, nil
+}
+
+func applyMask(fn, value string) (string, error) {
+	switch fn {
+	case "sha256":
+		sum := sha256.Sum256([]byte(value))
+		return hex.EncodeToString(sum[:]), nil
+	default:
+		return "", fmt.Errorf("exec: unsupported mask function %q", fn)
+	}
+}
+
+func unquote(v string) string {
+	if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {
+		return v[1 : len(v)-1]
+	}
+	return v
+}

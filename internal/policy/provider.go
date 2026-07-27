@@ -85,3 +85,23 @@ func (p *Provider) ResidualsFor(role, table string) (Residuals, error) {
 	}
 	return out, nil
 }
+
+// Masks is the CLS half of a role's compiled policy: which columns get
+// masked, and how.
+type Masks []CLSRule
+
+// MasksFor returns the CLS rules role's policy declares against table.
+func (p *Provider) MasksFor(role, table string) (Masks, error) {
+	rp, ok := p.roles[role]
+	if !ok {
+		return nil, fmt.Errorf("policy: unknown role %q", role)
+	}
+
+	var out Masks
+	for _, m := range rp.CLS {
+		if m.Table == table {
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}

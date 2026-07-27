@@ -20,7 +20,7 @@ func TestCapabilityClassification(t *testing.T) {
 	require.NoError(t, err)
 
 	p, err := plan.Build("SELECT id,region FROM sf.accounts WHERE status='open'", cat,
-		policy.Residuals{{Table: "sf.accounts", Expr: "region = $principal.region"}})
+		policy.Residuals{{Table: "sf.accounts", Expr: "region = $principal.region"}}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, plan.PushedEnforced, p.VerdictFor("status = 'open'").Disposition)
@@ -47,9 +47,9 @@ func TestSamePredicateDifferentCapabilityProfile(t *testing.T) {
 
 	const sql = "SELECT id FROM sf.accounts WHERE status='open'"
 
-	advisoryPlan, err := plan.Build(sql, advisoryCat, nil)
+	advisoryPlan, err := plan.Build(sql, advisoryCat, nil, nil)
 	require.NoError(t, err)
-	enforcedPlan, err := plan.Build(sql, enforcedCat, nil)
+	enforcedPlan, err := plan.Build(sql, enforcedCat, nil, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, plan.Residual, advisoryPlan.VerdictFor("status = 'open'").Disposition)

@@ -1,0 +1,10 @@
+{
+  "table": "sf.accounts",
+  "predicates": {
+    "status": { "ops": ["="], "enforcement": "ENFORCED" },
+    "region": { "ops": ["="], "enforcement": "ADVISORY" }
+  },
+  "masking": "unsupported",
+  "join_key_in_list": true,
+  "max_in_list": 200
+}

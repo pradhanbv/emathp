@@ -1,8 +1,8 @@
 // Package policy holds tenant policy compiled toward the plan: row-level
 // security residuals that get injected as Filter nodes rather than applied
-// as a post-filter (ADR-002). This cycle defines the shape the planner
-// consumes; the provider that produces it from OPA-style rules lands with
-// RLS injection.
+// as a post-filter (ADR-002). Provider stands in for OPA's Compile API -
+// the injection mechanism downstream is real, only this evaluator is
+// stubbed, behind an interface built for exactly this swap.
 package policy
 
 // Residual is a security predicate that must hold for a query against

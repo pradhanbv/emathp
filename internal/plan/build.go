@@ -16,6 +16,18 @@ type Plan struct {
 	Root     Node
 	verdicts map[string]Verdict
 	scans    map[string]*Scan
+
+	// security is a pre-mutation snapshot of every security-origin
+	// predicate Build injected. Only needed because tests simulate an
+	// optimizer bug by mutating the tree after the fact (RemoveFilter) -
+	// see IMPLEMENTATION_PLAN.md Cycle 3. Without it, AssertInvariant
+	// would have nothing to check the mutated tree against but itself.
+	security []securityPredicate
+}
+
+type securityPredicate struct {
+	Pred    Predicate
+	Verdict Verdict
 }
 
 func (p *Plan) VerdictFor(expr string) Verdict {
@@ -59,7 +71,7 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan,
 	verdicts := make(map[string]Verdict)
 	var root Node = scan
 
-	applyPredicate := func(col, op, value string, origin Origin) {
+	applyPredicate := func(col, op, value string, origin Origin) Verdict {
 		exprText := normalizeExpr(col + " " + op + " " + value)
 		v := classify(cat, table, col, op)
 		verdicts[exprText] = v
@@ -71,6 +83,7 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan,
 			Pred:  Predicate{Column: col, Op: op, Value: value, Origin: origin},
 			Site:  v.Site,
 		}
+		return v
 	}
 
 	if sel.Where != nil {
@@ -87,6 +100,7 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan,
 		}
 	}
 
+	var security []securityPredicate
 	for _, r := range residuals {
 		if r.Table != table {
 			continue
@@ -95,7 +109,11 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan,
 		if err != nil {
 			return nil, err
 		}
-		applyPredicate(col, op, value, SecurityOrigin)
+		v := applyPredicate(col, op, value, SecurityOrigin)
+		security = append(security, securityPredicate{
+			Pred:    Predicate{Column: col, Op: op, Value: value, Origin: SecurityOrigin},
+			Verdict: v,
+		})
 	}
 
 	if len(projectCols) > 0 {
@@ -110,7 +128,23 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals) (*Plan,
 		Root:     root,
 		verdicts: verdicts,
 		scans:    map[string]*Scan{table: scan},
+		security: security,
 	}, nil
+}
+
+// ParseTable extracts the table sql queries, without building a plan.
+// Orchestration code needs the table before it can ask a policy.Provider
+// for residuals, which Build then takes as an argument.
+func ParseTable(sql string) (string, error) {
+	stmt, err := parser.Parse(sql)
+	if err != nil {
+		return "", fmt.Errorf("plan: parse: %w", err)
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || len(sel.From) != 1 {
+		return "", ErrUnsupportedStatement
+	}
+	return tableName(sel.From[0])
 }
 
 // classify is the capability walk: ENFORCED -> push, ADVISORY -> retain

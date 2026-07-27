@@ -1,0 +1,7 @@
+{
+  "role": "support_agent",
+  "rls": [{ "table": "sf.accounts", "expr": "region = $principal.region" }],
+  "cls": [{ "table": "sf.accounts", "column": "email", "fn": "sha256" }],
+  "objects": { "deny": ["sf.opportunities"] },
+  "policy_version": 47
+}

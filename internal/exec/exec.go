@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/pradhanbv/emathp/internal/connector"
 	"github.com/pradhanbv/emathp/internal/obs"
@@ -25,8 +26,18 @@ type Debug struct {
 	FetchedColumns []string
 }
 
-// Run executes p against source.
-func Run(ctx context.Context, p *plan.Plan, source connector.Source) (*Result, error) {
+// Run executes p against source, resolving any $principal.<attr>
+// predicate values against attrs at comparison time rather than having
+// them baked into p.
+//
+// This matters once a plan can be cached and shared across principals
+// (Cycle 7, ADR-003): p is not mutated here, and never should be - two
+// principals in the same role produce the same cache key (tenant, role,
+// policy version/shape, capability shape, sql shape all match) but can
+// have different attribute values, so binding has to happen per call,
+// against a read-only plan, never by writing into the shared Filter
+// nodes.
+func Run(ctx context.Context, p *plan.Plan, source connector.Source, attrs map[string]string) (*Result, error) {
 	scan := p.PrimaryScan()
 	if scan == nil {
 		return nil, fmt.Errorf("exec: plan has no scan")
@@ -37,7 +48,11 @@ func Run(ctx context.Context, p *plan.Plan, source connector.Source) (*Result, e
 	pushed := make(map[string]string, len(filters))
 	for _, f := range filters {
 		if f.Site == plan.Pushed {
-			pushed[f.Pred.Column] = unquote(f.Pred.Value)
+			v, err := resolveValue(f.Pred.Value, attrs)
+			if err != nil {
+				return nil, err
+			}
+			pushed[f.Pred.Column] = v
 		}
 	}
 
@@ -62,11 +77,14 @@ func Run(ctx context.Context, p *plan.Plan, source connector.Source) (*Result, e
 	// in the rows that came back. Re-apply every PUSHED security
 	// predicate locally; any row that fails it means the connector's
 	// real behaviour diverged from its declared capability.
-	if err := verifyPushedSecurityPredicates(rows, filters); err != nil {
+	if err := verifyPushedSecurityPredicates(rows, filters, attrs); err != nil {
 		return nil, err
 	}
 
-	rows = applyLocalFilters(rows, filters)
+	rows, err = applyLocalFilters(rows, filters, attrs)
+	if err != nil {
+		return nil, err
+	}
 
 	outCols := p.OutputColumns()
 	outRows, err := project(rows, outCols)
@@ -107,12 +125,15 @@ func securityPredicateNeedsColumn(filters []*plan.Filter, column string) bool {
 // fails it means the predicate "appears pushed, does nothing" - the
 // realistic failure isn't vendor dishonesty, it's our own connector
 // sending the wrong query param and the source silently ignoring it.
-func verifyPushedSecurityPredicates(rows []connector.Row, filters []*plan.Filter) error {
+func verifyPushedSecurityPredicates(rows []connector.Row, filters []*plan.Filter, attrs map[string]string) error {
 	for _, f := range filters {
 		if f.Pred.Origin != plan.SecurityOrigin || f.Site != plan.Pushed {
 			continue
 		}
-		want := unquote(f.Pred.Value)
+		want, err := resolveValue(f.Pred.Value, attrs)
+		if err != nil {
+			return err
+		}
 		violations := 0
 		for _, r := range rows {
 			if r[f.Pred.Column] != want {
@@ -128,7 +149,7 @@ func verifyPushedSecurityPredicates(rows []connector.Row, filters []*plan.Filter
 	return nil
 }
 
-func applyLocalFilters(rows []connector.Row, filters []*plan.Filter) []connector.Row {
+func applyLocalFilters(rows []connector.Row, filters []*plan.Filter, attrs map[string]string) ([]connector.Row, error) {
 	var out []connector.Row
 	for _, r := range rows {
 		keep := true
@@ -136,7 +157,11 @@ func applyLocalFilters(rows []connector.Row, filters []*plan.Filter) []connector
 			if f.Site != plan.Local {
 				continue
 			}
-			if r[f.Pred.Column] != unquote(f.Pred.Value) {
+			want, err := resolveValue(f.Pred.Value, attrs)
+			if err != nil {
+				return nil, err
+			}
+			if r[f.Pred.Column] != want {
 				keep = false
 				break
 			}
@@ -145,7 +170,7 @@ func applyLocalFilters(rows []connector.Row, filters []*plan.Filter) []connector
 			out = append(out, r)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func project(rows []connector.Row, cols []plan.ProjectCol) ([]map[string]string, error) {
@@ -176,6 +201,24 @@ func applyMask(fn, value string) (string, error) {
 	default:
 		return "", fmt.Errorf("exec: unsupported mask function %q", fn)
 	}
+}
+
+// resolveValue turns a predicate value into a concrete string to compare
+// against a fetched row: a literal gets unquoted, a $principal.<attr>
+// placeholder gets looked up in attrs. Missing attribute fails closed
+// (PRINCIPAL_UNRESOLVED territory) rather than comparing against an empty
+// string, which would silently match or silently drop every row
+// depending on data - the same bug class over-projection exists to avoid.
+func resolveValue(value string, attrs map[string]string) (string, error) {
+	const prefix = "$principal."
+	if attr, ok := strings.CutPrefix(value, prefix); ok {
+		v, ok := attrs[attr]
+		if !ok {
+			return "", fmt.Errorf("%w: missing principal attribute %q", plan.ErrEntitlementDenied, attr)
+		}
+		return v, nil
+	}
+	return unquote(value), nil
 }
 
 func unquote(v string) string {

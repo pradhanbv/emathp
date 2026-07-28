@@ -8,6 +8,7 @@ import (
 	"github.com/pradhanbv/emathp/internal/catalog"
 	"github.com/pradhanbv/emathp/internal/connector"
 	"github.com/pradhanbv/emathp/internal/identity/fixtures"
+	"github.com/pradhanbv/emathp/internal/plancache"
 	"github.com/pradhanbv/emathp/internal/policy"
 	"github.com/pradhanbv/emathp/internal/server"
 )
@@ -32,9 +33,10 @@ func main() {
 	// tenant registry in a real deployment; the fixtures package is the
 	// same one the test suite uses (see internal/identity/fixtures).
 	s := server.New(server.Deps{
-		Catalog:  cat,
-		Policy:   pol,
-		Identity: fixtures.IssuerRegistry(),
+		Catalog:   cat,
+		Policy:    pol,
+		Identity:  fixtures.IssuerRegistry(),
+		PlanCache: plancache.New(),
 		Sources: map[string]connector.Source{
 			"sf": connector.NewHTTPSource(*sfURL),
 		},

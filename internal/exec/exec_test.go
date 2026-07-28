@@ -119,9 +119,11 @@ func runQuery(t *testing.T, persona, sql string, cat *catalog.Catalog, source co
 
 	role := personaRole[persona]
 
+	// residuals stay unbound ($principal.region, not 'EMEA') - Build
+	// produces a plan safe to share across principals in the same role.
+	// exec.Run resolves attrs at comparison time instead (Cycle 7,
+	// ADR-003: binding happens after a plan-cache lookup, not before).
 	residuals, err := pol.ResidualsFor(role, table)
-	require.NoError(t, err)
-	residuals, err = policy.BindResiduals(residuals, personaAttrs[persona])
 	require.NoError(t, err)
 
 	masks, err := pol.MasksFor(role, table)
@@ -130,7 +132,7 @@ func runQuery(t *testing.T, persona, sql string, cat *catalog.Catalog, source co
 	p, err := plan.Build(sql, cat, residuals, masks)
 	require.NoError(t, err)
 
-	result, err := exec.Run(context.Background(), p, source)
+	result, err := exec.Run(context.Background(), p, source, personaAttrs[persona])
 	if err != nil {
 		if errors.Is(err, plan.ErrEntitlementDenied) {
 			return queryResult{Code: 403, ErrorCode: "ENTITLEMENT_DENIED"}

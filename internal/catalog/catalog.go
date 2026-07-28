@@ -5,10 +5,13 @@
 package catalog
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 type Enforcement string
@@ -95,4 +98,34 @@ func (c *Catalog) Capability(table, column string) (PredicateCapability, bool) {
 	}
 	cap, ok := t.Predicates[column]
 	return cap, ok
+}
+
+// ShapeHash stands in for the real design's connector_capability_version
+// (DESIGN.md ADR-003): a plan cache key component that must change
+// whenever a capability change could invalidate cached pushdown verdicts.
+// A real system versions the catalog explicitly (a monotonic counter
+// bumped on publish); this is a content hash instead - self-updating,
+// but it can't distinguish "capability changed" from "capability changed
+// back", which a real version number can. Good enough for a prototype
+// with no catalog-publish pipeline to version against.
+func (c *Catalog) ShapeHash(table string) (string, error) {
+	t, ok := c.tables[table]
+	if !ok {
+		return "", fmt.Errorf("catalog: unknown table %q", table)
+	}
+
+	cols := make([]string, 0, len(t.Predicates))
+	for col := range t.Predicates {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+
+	h := sha256.New()
+	for _, col := range cols {
+		p := t.Predicates[col]
+		fmt.Fprintf(h, "%s:%v:%s;", col, p.Ops, p.Enforcement)
+	}
+	fmt.Fprintf(h, "masking:%s;", t.Masking)
+
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }

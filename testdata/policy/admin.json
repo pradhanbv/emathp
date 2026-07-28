@@ -1,0 +1,7 @@
+{
+  "role": "admin",
+  "rls": [],
+  "cls": [],
+  "objects": { "deny": [] },
+  "policy_version": 1
+}

@@ -1,10 +1,10 @@
 // Package server implements the gateway's HTTP boundary: the /v1/query
 // handler and the response envelope every cycle fills in a little more.
-// Cycle 6 replaces the hardcoded stub with the real pipeline: resolve the
-// principal, check L1 object authorization, compile policy into a plan,
-// assert the fail-closed invariant, execute (with the runtime
-// verification filter), map the result or a domain error onto the
-// envelope.
+// Cycle 6 replaced the hardcoded stub with the real pipeline; Cycle 7
+// inserts the plan cache between policy resolution and Build, and moves
+// $principal.<attr> binding into exec.Run (after the cache lookup, per
+// ADR-003 - a plan shared across principals in the same role must never
+// have another principal's values written into it).
 package server
 
 import (
@@ -18,6 +18,7 @@ import (
 	"github.com/pradhanbv/emathp/internal/exec"
 	"github.com/pradhanbv/emathp/internal/identity"
 	"github.com/pradhanbv/emathp/internal/plan"
+	"github.com/pradhanbv/emathp/internal/plancache"
 	"github.com/pradhanbv/emathp/internal/policy"
 )
 
@@ -26,10 +27,11 @@ import (
 // both construct these the same way, from whatever source fits their
 // context (real files, temp fixtures, a mock connector's URL).
 type Deps struct {
-	Catalog  *catalog.Catalog
-	Policy   *policy.Provider
-	Identity *identity.Registry
-	Sources  map[string]connector.Source // connector prefix (e.g. "sf") -> source
+	Catalog   *catalog.Catalog
+	Policy    *policy.Provider
+	Identity  *identity.Registry
+	PlanCache *plancache.Cache
+	Sources   map[string]connector.Source // connector prefix (e.g. "sf") -> source
 }
 
 type Server struct {
@@ -78,30 +80,19 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	residuals, err := s.deps.Policy.ResidualsFor(role, table)
-	if err != nil {
-		writeError(w, http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
-		return
-	}
-	residuals, err = policy.BindResiduals(residuals, principal.Attributes)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "PRINCIPAL_UNRESOLVED", err.Error())
-		return
-	}
-
-	masks, err := s.deps.Policy.MasksFor(role, table)
-	if err != nil {
-		writeError(w, http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
-		return
-	}
-
-	p, err := plan.Build(req.SQL, s.deps.Catalog, residuals, masks)
+	// Plan cache lookup (ADR-003): built fresh on a miss, reused on a hit.
+	// The plan itself never contains a resolved $principal value - it's
+	// only safe to share across principals in the same role because
+	// binding happens later, in exec.Run, against a read-only plan.
+	p, _, _, err := plancache.Resolve(s.deps.PlanCache, req.SQL, s.deps.Catalog, s.deps.Policy, principal.Tenant, role)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "UNSUPPORTED_PREDICATE", err.Error())
 		return
 	}
 
-	// LAYER 2's fail-closed check, after parameter binding (ADR-002).
+	// LAYER 2's fail-closed check. Runs on every request, including
+	// cache hits (ADR-002) - cheap, and a defence against a corrupted or
+	// tampered cache entry, not just a fresh-build sanity check.
 	if err := plan.AssertInvariant(p); err != nil {
 		writeError(w, http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
 		return
@@ -113,7 +104,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := exec.Run(r.Context(), p, source)
+	result, err := exec.Run(r.Context(), p, source, principal.Attributes)
 	if err != nil {
 		if errors.Is(err, plan.ErrEntitlementDenied) {
 			writeError(w, http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())

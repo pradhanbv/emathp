@@ -237,6 +237,53 @@ func ParseTable(sql string) (string, error) {
 	return tableName(sel.From[0])
 }
 
+// Shape returns sql normalized with every literal value replaced by a
+// placeholder - the plan cache key's sql_shape component (DESIGN.md
+// ADR-003). Two queries differing only in a WHERE-clause value (e.g.
+// status='open' vs status='closed') must produce the same shape, so a
+// cached plan (with a parameter slot, not the value baked in) can serve
+// both.
+func Shape(sql string) (string, error) {
+	stmt, err := parser.Parse(sql)
+	if err != nil {
+		return "", fmt.Errorf("plan: parse: %w", err)
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || len(sel.From) != 1 {
+		return "", ErrUnsupportedStatement
+	}
+
+	table, err := tableName(sel.From[0])
+	if err != nil {
+		return "", err
+	}
+	projectCols, err := projection(sel.SelectExprs)
+	if err != nil {
+		return "", err
+	}
+
+	var predShapes []string
+	if sel.Where != nil {
+		conjuncts, err := splitConjuncts(sel.Where.Expr)
+		if err != nil {
+			return "", err
+		}
+		for _, c := range conjuncts {
+			col, op, _, err := comparisonParts(c)
+			if err != nil {
+				return "", err
+			}
+			predShapes = append(predShapes, col+" "+op+" ?")
+		}
+	}
+
+	shape := "SELECT " + strings.Join(projectCols, ",") + " FROM " + table
+	if len(predShapes) > 0 {
+		shape += " WHERE " + strings.Join(predShapes, " AND ")
+	}
+	return shape, nil
+}
+
 // classify is the capability walk: ENFORCED -> push, ADVISORY -> retain
 // locally, unknown column/op -> retain locally as Unsupported.
 //

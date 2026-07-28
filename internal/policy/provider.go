@@ -1,6 +1,8 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -104,6 +106,45 @@ func (p *Provider) MasksFor(role, table string) (Masks, error) {
 		}
 	}
 	return out, nil
+}
+
+// Version is the plan cache key's policy_version component (DESIGN.md
+// ADR-003): a policy rewrite bumping this must invalidate any plan cached
+// under the old value, so a stale cached plan never carries superseded
+// entitlements.
+func (p *Provider) Version(role string) (int, error) {
+	rp, ok := p.roles[role]
+	if !ok {
+		return 0, fmt.Errorf("policy: unknown role %q", role)
+	}
+	return rp.PolicyVersion, nil
+}
+
+// ShapeHash is the plan cache key's policy_shape_hash component: a
+// structural fingerprint of role's whole policy document (every RLS rule,
+// CLS mask, and object-deny entry, not just what one query touches).
+// Deliberately coarser than the real design's per-query OPA
+// Compile-API-derived hash - adding a mask to an unrelated table
+// invalidates this role's entire cached-plan set rather than just the
+// affected table's. Safe (only widens what gets invalidated, never
+// narrows it) at the cost of hit ratio.
+func (p *Provider) ShapeHash(role string) (string, error) {
+	rp, ok := p.roles[role]
+	if !ok {
+		return "", fmt.Errorf("policy: unknown role %q", role)
+	}
+
+	h := sha256.New()
+	for _, r := range rp.RLS {
+		fmt.Fprintf(h, "rls:%s:%s;", r.Table, r.Expr)
+	}
+	for _, m := range rp.CLS {
+		fmt.Fprintf(h, "cls:%s:%s:%s;", m.Table, m.Column, m.Fn)
+	}
+	for _, o := range rp.Objects.Deny {
+		fmt.Fprintf(h, "deny:%s;", o)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
 // ObjectDenied is Layer 1 (DESIGN.md ADR-002): may role touch table at

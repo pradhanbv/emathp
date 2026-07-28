@@ -9,6 +9,7 @@ import (
 	"github.com/pradhanbv/emathp/internal/connector"
 	"github.com/pradhanbv/emathp/internal/identity/fixtures"
 	"github.com/pradhanbv/emathp/internal/mocksf"
+	"github.com/pradhanbv/emathp/internal/plancache"
 	"github.com/pradhanbv/emathp/internal/policy"
 	"github.com/pradhanbv/emathp/internal/server"
 )
@@ -37,9 +38,10 @@ func testDepsWithCatalog(t *testing.T, sf *mocksf.TestServer, catalogDir string)
 	require.NoError(t, err)
 
 	return server.Deps{
-		Catalog:  cat,
-		Policy:   pol,
-		Identity: fixtures.IssuerRegistry(),
+		Catalog:   cat,
+		Policy:    pol,
+		Identity:  fixtures.IssuerRegistry(),
+		PlanCache: plancache.New(),
 		Sources: map[string]connector.Source{
 			"sf": connector.NewHTTPSource(sf.URL),
 		},

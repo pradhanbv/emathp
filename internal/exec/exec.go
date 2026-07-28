@@ -56,7 +56,7 @@ func Run(ctx context.Context, p *plan.Plan, source connector.Source, attrs map[s
 		}
 	}
 
-	rows, err := source.Fetch(ctx, connector.FetchRequest{
+	rows, _, err := source.Fetch(ctx, connector.FetchRequest{
 		Table:   scan.Table,
 		Columns: scan.Project,
 		Filters: pushed,

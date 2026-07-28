@@ -11,7 +11,10 @@
 // lease behavior the real design specifies for a multi-pod fleet.
 package ratelimit
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 type Limiter struct {
 	mu      sync.Mutex
@@ -49,4 +52,31 @@ func (l *Limiter) Allow(connector string) bool {
 	}
 	b.used++
 	return true
+}
+
+// Remaining reports connector's unused budget, or -1 if it has no
+// configured limit (unlimited). Test-only in practice today - the gateway
+// itself only needs Allow's boolean - but it's the natural way to assert
+// that a specific call spent a token, which freshness revalidation
+// (Cycle 9) needs to prove.
+func (l *Limiter) Remaining(connector string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[connector]
+	if !ok {
+		return -1
+	}
+	return b.limit - b.used
+}
+
+// ExhaustedError signals Allow declined a call for connector. Returned by
+// callers that wrap Allow's boolean into a richer error path (the
+// freshness Source, so a live fetch and a revalidation probe both fail the
+// same way a plain fetch used to).
+type ExhaustedError struct {
+	Connector string
+}
+
+func (e *ExhaustedError) Error() string {
+	return fmt.Sprintf("rate limit exhausted for connector %q", e.Connector)
 }

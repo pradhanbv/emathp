@@ -17,11 +17,24 @@ type Row map[string]string
 // FetchRequest is what exec asks a Source for: Columns is the
 // over-projected required-columns set computed at plan time (Scan.Project
 // - see plan.Build), and Filters is every predicate that was pushed down
-// for the source to apply itself.
+// for the source to apply itself. ETag is optional: set it to make the
+// request conditional (If-None-Match), which the freshness cache (Cycle 9,
+// ADR-005) uses to revalidate a stale entry without re-fetching unchanged
+// data.
 type FetchRequest struct {
 	Table   string
 	Columns []string
 	Filters map[string]string
+	ETag    string
+}
+
+// FetchMeta carries the fetch's caching-relevant metadata back to the
+// caller: the ETag a subsequent request could use for conditional fetch,
+// and whether this response was a 304 (ETag matched, no new data - Rows is
+// empty in that case; the caller already has the current data).
+type FetchMeta struct {
+	ETag        string
+	NotModified bool
 }
 
 // Source fetches rows for one table, filtered and projected as asked. One
@@ -36,7 +49,7 @@ type FetchRequest struct {
 // like a cross-connector join would be. See DESIGN.md ADR-007 for why
 // (real, e.g. SOQL relationship subqueries, but rejected as scope).
 type Source interface {
-	Fetch(ctx context.Context, req FetchRequest) ([]Row, error)
+	Fetch(ctx context.Context, req FetchRequest) ([]Row, FetchMeta, error)
 }
 
 // ColumnUnavailableError signals a source cannot supply Column at all -

@@ -24,13 +24,24 @@ func NewHTTPSource(baseURL string) *HTTPSource {
 	return &HTTPSource{BaseURL: strings.TrimSuffix(baseURL, "/")}
 }
 
-func (s *HTTPSource) Fetch(ctx context.Context, req FetchRequest) ([]Row, error) {
+func (s *HTTPSource) Fetch(ctx context.Context, req FetchRequest) ([]Row, FetchMeta, error) {
 	var all []Row
 	offset := 0
+	etag := ""
 	for {
-		page, hasMore, err := s.fetchPage(ctx, req, offset)
+		page, hasMore, meta, err := s.fetchPage(ctx, req, offset)
 		if err != nil {
-			return nil, err
+			return nil, FetchMeta{}, err
+		}
+		if meta.NotModified {
+			// A conditional request only makes sense against the first
+			// page - the ETag covers the whole result set, so a 304 short-
+			// circuits pagination entirely rather than fetching pages the
+			// caller already has.
+			return nil, meta, nil
+		}
+		if offset == 0 {
+			etag = meta.ETag
 		}
 		all = append(all, page...)
 		if !hasMore {
@@ -38,10 +49,10 @@ func (s *HTTPSource) Fetch(ctx context.Context, req FetchRequest) ([]Row, error)
 		}
 		offset += len(page)
 	}
-	return all, nil
+	return all, FetchMeta{ETag: etag}, nil
 }
 
-func (s *HTTPSource) fetchPage(ctx context.Context, req FetchRequest, offset int) ([]Row, bool, error) {
+func (s *HTTPSource) fetchPage(ctx context.Context, req FetchRequest, offset int) ([]Row, bool, FetchMeta, error) {
 	q := url.Values{}
 	if len(req.Columns) > 0 {
 		q.Set("fields", strings.Join(req.Columns, ","))
@@ -55,12 +66,15 @@ func (s *HTTPSource) fetchPage(ctx context.Context, req FetchRequest, offset int
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return nil, false, fmt.Errorf("connector: build request: %w", err)
+		return nil, false, FetchMeta{}, fmt.Errorf("connector: build request: %w", err)
+	}
+	if offset == 0 && req.ETag != "" {
+		httpReq.Header.Set("If-None-Match", req.ETag)
 	}
 
 	resp, err := s.client().Do(httpReq)
 	if err != nil {
-		return nil, false, fmt.Errorf("connector: %w", err)
+		return nil, false, FetchMeta{}, fmt.Errorf("connector: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -71,22 +85,25 @@ func (s *HTTPSource) fetchPage(ctx context.Context, req FetchRequest, offset int
 			HasMore bool  `json:"has_more"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-			return nil, false, fmt.Errorf("connector: decode response: %w", err)
+			return nil, false, FetchMeta{}, fmt.Errorf("connector: decode response: %w", err)
 		}
-		return body.Rows, body.HasMore, nil
+		return body.Rows, body.HasMore, FetchMeta{ETag: resp.Header.Get("ETag")}, nil
+
+	case http.StatusNotModified:
+		return nil, false, FetchMeta{NotModified: true}, nil
 
 	case http.StatusUnprocessableEntity:
 		var body struct {
 			Field string `json:"field"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&body)
-		return nil, false, &ColumnUnavailableError{Column: body.Field}
+		return nil, false, FetchMeta{}, &ColumnUnavailableError{Column: body.Field}
 
 	case http.StatusTooManyRequests:
-		return nil, false, fmt.Errorf("connector: rate limited, retry after %s", resp.Header.Get("Retry-After"))
+		return nil, false, FetchMeta{}, fmt.Errorf("connector: rate limited, retry after %s", resp.Header.Get("Retry-After"))
 
 	default:
-		return nil, false, fmt.Errorf("connector: unexpected status %d", resp.StatusCode)
+		return nil, false, FetchMeta{}, fmt.Errorf("connector: unexpected status %d", resp.StatusCode)
 	}
 }
 

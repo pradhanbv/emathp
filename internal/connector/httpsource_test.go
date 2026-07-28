@@ -23,7 +23,7 @@ func TestConnectorPaginationAndETag(t *testing.T) {
 	sf := mocksf.Start(t, mocksf.Rows(250), mocksf.PageSize(100))
 	source := connector.NewHTTPSource(sf.URL)
 
-	rows, err := source.Fetch(context.Background(), connector.FetchRequest{
+	rows, _, err := source.Fetch(context.Background(), connector.FetchRequest{
 		Table:   "sf.accounts",
 		Columns: []string{"id"},
 	})
@@ -54,7 +54,7 @@ func TestHideColumnFailsTheCall(t *testing.T) {
 	sf := mocksf.Start(t, mocksf.Rows(5), mocksf.HideColumn("region"))
 	source := connector.NewHTTPSource(sf.URL)
 
-	_, err := source.Fetch(context.Background(), connector.FetchRequest{
+	_, _, err := source.Fetch(context.Background(), connector.FetchRequest{
 		Table:   "sf.accounts",
 		Columns: []string{"id", "region"},
 	})
@@ -72,7 +72,7 @@ func TestHideColumnFailsTheCall(t *testing.T) {
 func TestCapabilityFilteringAndLieAbout(t *testing.T) {
 	honest := mocksf.Start(t, mocksf.Rows(10), mocksf.Capability("region", catalog.Enforced))
 	honestSource := connector.NewHTTPSource(honest.URL)
-	rows, err := honestSource.Fetch(context.Background(), connector.FetchRequest{
+	rows, _, err := honestSource.Fetch(context.Background(), connector.FetchRequest{
 		Table:   "sf.accounts",
 		Columns: []string{"id", "region"},
 		Filters: map[string]string{"region": "EMEA"},
@@ -86,11 +86,37 @@ func TestCapabilityFilteringAndLieAbout(t *testing.T) {
 
 	lying := mocksf.Start(t, mocksf.Rows(10), mocksf.Capability("region", catalog.Enforced), mocksf.LieAbout("region"))
 	lyingSource := connector.NewHTTPSource(lying.URL)
-	rows, err = lyingSource.Fetch(context.Background(), connector.FetchRequest{
+	rows, _, err = lyingSource.Fetch(context.Background(), connector.FetchRequest{
 		Table:   "sf.accounts",
 		Columns: []string{"id", "region"},
 		Filters: map[string]string{"region": "EMEA"},
 	})
 	require.NoError(t, err)
 	require.Len(t, rows, 10, "lying connector ignores the filter it claims to enforce")
+}
+
+// TestFetchWithETagReturnsNotModified proves the connector.Source-level
+// conditional-fetch path the freshness cache (Cycle 9) depends on: passing
+// back the ETag a prior Fetch returned short-circuits to NotModified with
+// zero rows, rather than re-fetching data the caller already has.
+func TestFetchWithETagReturnsNotModified(t *testing.T) {
+	sf := mocksf.Start(t, mocksf.Rows(5))
+	source := connector.NewHTTPSource(sf.URL)
+
+	_, meta, err := source.Fetch(context.Background(), connector.FetchRequest{
+		Table:   "sf.accounts",
+		Columns: []string{"id"},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, meta.ETag)
+	require.False(t, meta.NotModified)
+
+	rows, meta2, err := source.Fetch(context.Background(), connector.FetchRequest{
+		Table:   "sf.accounts",
+		Columns: []string{"id"},
+		ETag:    meta.ETag,
+	})
+	require.NoError(t, err)
+	require.True(t, meta2.NotModified)
+	require.Empty(t, rows)
 }

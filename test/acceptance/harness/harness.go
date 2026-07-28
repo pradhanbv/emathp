@@ -83,6 +83,14 @@ func (g *Gateway) QueryWithHeader(persona, sql, header, value string) *Response 
 	})
 }
 
+// QueryFresh is Query plus a max_staleness budget (e.g. "60s") in the
+// request body, for the freshness-cache tests (ADR-005).
+func (g *Gateway) QueryFresh(persona, sql, maxStaleness string, opts ...ReqOption) *Response {
+	body := fmt.Sprintf(`{"sql":%q,"max_staleness":%q}`, sql, maxStaleness)
+	allOpts := append([]ReqOption{Token(persona)}, opts...)
+	return g.POST("/v1/query", body, allOpts...)
+}
+
 // PollResult is the /v1/jobs/{id} response an async query's PollURL
 // resolves to.
 type PollResult struct {

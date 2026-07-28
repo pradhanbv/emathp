@@ -47,10 +47,10 @@ func newFakeSource(rows []connector.Row) *fakeSource {
 	return &fakeSource{rows: rows, hiddenColumns: map[string]bool{}}
 }
 
-func (s *fakeSource) Fetch(_ context.Context, req connector.FetchRequest) ([]connector.Row, error) {
+func (s *fakeSource) Fetch(_ context.Context, req connector.FetchRequest) ([]connector.Row, connector.FetchMeta, error) {
 	for _, col := range req.Columns {
 		if s.hiddenColumns[col] {
-			return nil, &connector.ColumnUnavailableError{Column: col}
+			return nil, connector.FetchMeta{}, &connector.ColumnUnavailableError{Column: col}
 		}
 	}
 
@@ -72,7 +72,7 @@ func (s *fakeSource) Fetch(_ context.Context, req connector.FetchRequest) ([]con
 		}
 		out = append(out, row)
 	}
-	return out, nil
+	return out, connector.FetchMeta{}, nil
 }
 
 func sha256hex(s string) string {

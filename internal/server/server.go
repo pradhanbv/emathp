@@ -6,7 +6,10 @@
 // ADR-003 - a plan shared across principals in the same role must never
 // have another principal's values written into it). Cycle 8 adds the
 // rate-limit check and the Prefer: respond-async reroute, both built
-// around a single run() that both the sync and async paths call.
+// around a single run() that both the sync and async paths call. Cycle 9
+// wraps the connector Source in a freshness.Source per request, so
+// max_staleness caching and rate-limit spend live together at the one call
+// site that actually goes out to a connector.
 package server
 
 import (
@@ -18,10 +21,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pradhanbv/emathp/internal/catalog"
 	"github.com/pradhanbv/emathp/internal/connector"
 	"github.com/pradhanbv/emathp/internal/exec"
+	"github.com/pradhanbv/emathp/internal/freshness"
 	"github.com/pradhanbv/emathp/internal/identity"
 	"github.com/pradhanbv/emathp/internal/plan"
 	"github.com/pradhanbv/emathp/internal/plancache"
@@ -39,6 +44,7 @@ type Deps struct {
 	Identity  *identity.Registry
 	PlanCache *plancache.Cache
 	RateLimit *ratelimit.Limiter
+	Freshness *freshness.Cache
 	Sources   map[string]connector.Source // connector prefix (e.g. "sf") -> source
 }
 
@@ -138,30 +144,56 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 
 	connectorName := connectorPrefix(table)
 
-	// Rate limit reservation, after planning succeeds so a query that
-	// would fail for other reasons doesn't spend quota it was never
-	// going to use (matches the sequence in DESIGN.md Section 2.3).
-	if !s.deps.RateLimit.Allow(connectorName) {
-		o := errorOutcome(http.StatusTooManyRequests, "RATE_LIMIT_EXHAUSTED",
-			fmt.Sprintf("rate limit exhausted for connector %q; retry after the window resets or use Prefer: respond-async", connectorName))
-		o.Headers = map[string]string{"Retry-After": "1"}
-		return o
-	}
-
 	source, ok := s.deps.Sources[connectorName]
 	if !ok {
 		return errorOutcome(http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", "no connector configured for "+table)
 	}
 
-	result, err := exec.Run(ctx, p, source, principal.Attributes)
+	// Freshness (ADR-005): a cache hit within max_staleness never touches
+	// the rate limiter or the connector at all. A miss or stale entry
+	// spends exactly one token and makes one (conditional, if an ETag is on
+	// hand) call - the same reservation-after-planning sequencing
+	// DESIGN.md Section 2.3 describes, just moved inside the wrapper so it
+	// only fires when a call is actually going out.
+	fresh := &freshness.Source{
+		Inner:        source,
+		Cache:        s.deps.Freshness,
+		RateLimit:    s.deps.RateLimit,
+		Connector:    connectorName,
+		MaxStaleness: parseMaxStaleness(req.MaxStaleness),
+	}
+
+	result, err := exec.Run(ctx, p, fresh, principal.Attributes)
 	if err != nil {
+		var exhausted *ratelimit.ExhaustedError
+		if errors.As(err, &exhausted) {
+			o := errorOutcome(http.StatusTooManyRequests, "RATE_LIMIT_EXHAUSTED",
+				fmt.Sprintf("rate limit exhausted for connector %q; retry after the window resets or use Prefer: respond-async", connectorName))
+			o.Headers = map[string]string{"Retry-After": "1"}
+			return o
+		}
 		if errors.Is(err, plan.ErrEntitlementDenied) {
 			return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
 		}
 		return errorOutcome(http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", err.Error())
 	}
 
-	return resultOutcome(result)
+	return resultOutcome(result, fresh)
+}
+
+// parseMaxStaleness turns the request's max_staleness (e.g. "60s") into a
+// duration. Empty or malformed input means "no budget" - always live,
+// never cached - which is the fail-safe direction: worst case is an extra
+// live fetch, never data staler than the caller asked for.
+func parseMaxStaleness(s string) time.Duration {
+	if s == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0
+	}
+	return d
 }
 
 // asyncJob is the in-memory record behind Prefer: respond-async. Not a
@@ -220,7 +252,7 @@ func connectorPrefix(table string) string {
 	return table
 }
 
-func resultOutcome(result *exec.Result) outcome {
+func resultOutcome(result *exec.Result, fresh *freshness.Source) outcome {
 	rows := make([][]any, len(result.Rows))
 	for i, row := range result.Rows {
 		vals := make([]any, len(result.Columns))
@@ -230,15 +262,21 @@ func resultOutcome(result *exec.Result) outcome {
 		rows[i] = vals
 	}
 
-	freshness := int64(0)
+	var meta *Meta
+	if fresh.CacheHit || fresh.Revalidated {
+		meta = &Meta{CacheHit: fresh.CacheHit, Revalidated: fresh.Revalidated}
+	}
+
+	freshnessMS := fresh.AgeMS
 	return outcome{
 		Status: http.StatusOK,
 		Body: QueryResponse{
 			Columns:         result.Columns,
 			Rows:            rows,
-			FreshnessMS:     &freshness,
+			FreshnessMS:     &freshnessMS,
 			RateLimitStatus: map[string]string{"sf": "ok"},
 			TraceID:         "trace-stub",
+			Meta:            meta,
 		},
 	}
 }

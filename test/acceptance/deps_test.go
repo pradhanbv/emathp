@@ -77,3 +77,27 @@ func testDepsJoin(t *testing.T, sf *mocksf.TestServer, zd *mockzd.TestServer) se
 		},
 	}
 }
+
+// testDepsZD is testDeps for a zd-only query - the timeout cycle
+// (Cycle 11) doesn't need sf at all.
+func testDepsZD(t *testing.T, zd *mockzd.TestServer) server.Deps {
+	t.Helper()
+
+	cat, err := catalog.Load(defaultCatalogDir)
+	require.NoError(t, err)
+
+	pol, err := policy.Load("../../testdata/policy")
+	require.NoError(t, err)
+
+	return server.Deps{
+		Catalog:   cat,
+		Policy:    pol,
+		Identity:  fixtures.IssuerRegistry(),
+		PlanCache: plancache.New(),
+		RateLimit: ratelimit.New(),
+		Freshness: freshness.New(),
+		Sources: map[string]connector.Source{
+			"zd": connector.NewHTTPSource(zd.URL),
+		},
+	}
+}

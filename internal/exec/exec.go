@@ -33,6 +33,21 @@ type Debug struct {
 	FetchedColumns []string
 }
 
+// SourceTimeoutError signals a connector fetch didn't complete within the
+// request's timeout budget (Cycle 11, ADR-009). Distinct from a generic
+// fetch error so a caller can attribute the failure to one connector -
+// the NDJSON streaming path reports this as a partial result rather than
+// failing the whole request opaquely.
+type SourceTimeoutError struct {
+	Connector string
+}
+
+func (e *SourceTimeoutError) Error() string {
+	return fmt.Sprintf("exec: connector %q timed out", e.Connector)
+}
+
+func (e *SourceTimeoutError) Unwrap() error { return context.DeadlineExceeded }
+
 // Run executes p against sources (keyed by connector prefix, e.g. "sf"),
 // resolving any $principal.<attr> predicate values against attrs at
 // comparison time rather than having them baked into p.
@@ -170,6 +185,14 @@ func fetchScanRows(ctx context.Context, source connector.Source, scan *plan.Scan
 		Filters: pushed,
 	})
 	if err != nil {
+		// ADR-009: a connector fetch that outlives the request's timeout
+		// budget is a distinct failure mode from a generic connector error
+		// - attributed to the specific connector so a caller (the NDJSON
+		// streaming path) can report a partial result rather than failing
+		// the whole request opaquely.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, &SourceTimeoutError{Connector: connectorPrefix(scan.Table)}
+		}
 		var colErr *connector.ColumnUnavailableError
 		if errors.As(err, &colErr) && securityPredicateNeedsColumn(filters, colErr.Column) {
 			return nil, fmt.Errorf("%w: source cannot supply column %q, required by tenant policy",

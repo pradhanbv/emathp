@@ -93,6 +93,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// restrictive mask wins, etc.) is unmodeled.
 	role := principal.Roles[0]
 
+	if r.Header.Get("Accept") == "application/x-ndjson" {
+		s.runStream(w, r.Context(), req, principal, role)
+		return
+	}
+
 	if r.Header.Get("Prefer") == "respond-async" {
 		id := s.startAsync(req, principal, role)
 		writeOutcome(w, outcome{
@@ -109,15 +114,21 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	writeOutcome(w, s.run(r.Context(), req, principal, role))
 }
 
-// run executes the full pipeline: L1 object authz, plan cache lookup,
-// the fail-closed invariant, the rate-limit reservation, and exec (with
-// its own runtime verification filter). Shared by the synchronous
-// handler and the async job goroutine so neither path can drift from the
-// other's behaviour.
-func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.Principal, role string) outcome {
+// errConnectorMissing signals a table's connector prefix has no entry in
+// Deps.Sources - a deployment/config error, not a query error.
+var errConnectorMissing = errors.New("no connector configured")
+
+// buildAndRoute runs everything before exec.Run: parse every referenced
+// table, L1 object authz, the plan-cache lookup (build on miss), the
+// fail-closed invariant, and one freshness-wrapped Source per distinct
+// connector the query touches. Shared by run() (JSON response) and
+// runStream() (NDJSON response, Cycle 11) so neither can drift from the
+// other's admission and routing logic - they differ only in how they turn
+// exec.Run's result or error into a response.
+func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, role string) (*plan.Plan, map[string]connector.Source, error) {
 	tables, err := plan.ParseTables(req.SQL)
 	if err != nil {
-		return errorOutcome(http.StatusBadRequest, "UNSUPPORTED_PREDICATE", err.Error())
+		return nil, nil, err
 	}
 
 	// LAYER 1 - object-level authz, ours, pre-plan (ADR-002). Denied
@@ -126,7 +137,7 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 	// named first.
 	for _, table := range tables {
 		if s.deps.Policy.ObjectDenied(role, table) {
-			return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", "role may not access "+table)
+			return nil, nil, fmt.Errorf("%w: role may not access %s", plan.ErrEntitlementDenied, table)
 		}
 	}
 
@@ -136,14 +147,14 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 	// binding happens later, in exec.Run, against a read-only plan.
 	p, _, _, err := plancache.Resolve(s.deps.PlanCache, req.SQL, s.deps.Catalog, s.deps.Policy, principal.Tenant, role)
 	if err != nil {
-		return errorOutcome(http.StatusBadRequest, "UNSUPPORTED_PREDICATE", err.Error())
+		return nil, nil, err
 	}
 
 	// LAYER 2's fail-closed check. Runs on every request, including
 	// cache hits (ADR-002) - cheap, and a defence against a corrupted or
 	// tampered cache entry, not just a fresh-build sanity check.
 	if err := plan.AssertInvariant(p); err != nil {
-		return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
+		return nil, nil, err
 	}
 
 	// Freshness (ADR-005): a cache hit within max_staleness never touches
@@ -163,7 +174,7 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 		}
 		source, ok := s.deps.Sources[name]
 		if !ok {
-			return errorOutcome(http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", "no connector configured for "+table)
+			return nil, nil, fmt.Errorf("%w: no connector configured for %s", errConnectorMissing, table)
 		}
 		sources[name] = &freshness.Source{
 			Inner:        source,
@@ -174,22 +185,125 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 		}
 	}
 
+	return p, sources, nil
+}
+
+// classifyError maps an error from buildAndRoute or exec.Run to an HTTP
+// status and response code. defaultStatus/defaultCode apply to whatever
+// doesn't match a recognized type - callers pass a different default
+// depending on which stage the error came from (buildAndRoute's default is
+// a query-shape problem; exec.Run's is a connector problem), since a bare
+// type switch can't otherwise tell the two apart.
+func classifyError(err error, defaultStatus int, defaultCode string) (status int, code string) {
+	var exhausted *ratelimit.ExhaustedError
+	var timedOut *exec.SourceTimeoutError
+	switch {
+	case errors.As(err, &exhausted):
+		return http.StatusTooManyRequests, "RATE_LIMIT_EXHAUSTED"
+	case errors.As(err, &timedOut):
+		return http.StatusGatewayTimeout, "SOURCE_TIMEOUT"
+	case errors.Is(err, plan.ErrEntitlementDenied):
+		return http.StatusForbidden, "ENTITLEMENT_DENIED"
+	case errors.Is(err, errConnectorMissing):
+		return http.StatusBadGateway, "CONNECTOR_AUTH_FAILED"
+	default:
+		return defaultStatus, defaultCode
+	}
+}
+
+// run executes the full pipeline and shapes the result as the plain JSON
+// envelope. Shared by the synchronous handler and the async job goroutine
+// so neither path can drift from the other's behaviour.
+func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.Principal, role string) outcome {
+	p, sources, err := s.buildAndRoute(req, principal, role)
+	if err != nil {
+		status, code := classifyError(err, http.StatusBadRequest, "UNSUPPORTED_PREDICATE")
+		return errorOutcome(status, code, err.Error())
+	}
+
+	timeout := parseTimeout(req.Timeout)
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	result, err := exec.Run(ctx, p, sources, principal.Attributes)
 	if err != nil {
+		status, code := classifyError(err, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED")
+		message := err.Error()
 		var exhausted *ratelimit.ExhaustedError
 		if errors.As(err, &exhausted) {
-			o := errorOutcome(http.StatusTooManyRequests, "RATE_LIMIT_EXHAUSTED",
-				fmt.Sprintf("rate limit exhausted for connector %q; retry after the window resets or use Prefer: respond-async", exhausted.Connector))
+			message = fmt.Sprintf("rate limit exhausted for connector %q; retry after the window resets or use Prefer: respond-async", exhausted.Connector)
+		}
+		o := errorOutcome(status, code, message)
+		if code == "RATE_LIMIT_EXHAUSTED" {
 			o.Headers = map[string]string{"Retry-After": "1"}
-			return o
 		}
-		if errors.Is(err, plan.ErrEntitlementDenied) {
-			return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
-		}
-		return errorOutcome(http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", err.Error())
+		return o
 	}
 
 	return resultOutcome(result, summarizeFreshness(sources))
+}
+
+// runStream is buildAndRoute+exec.Run shaped as a single NDJSON terminal
+// Frame instead of a JSON outcome (Cycle 11, ADR-009). The one failure mode
+// this cycle attributes to a specific connector is a timeout
+// (*exec.SourceTimeoutError): Partial is set and Sources names which
+// connector didn't finish in time. Any other error falls back to the same
+// classification run() uses, reported in Frame.Error instead of a source
+// name, since it isn't attributable to one connector the way a timeout is.
+func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req QueryRequest, principal identity.Principal, role string) {
+	timeout := parseTimeout(req.Timeout)
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	frame := Frame{IsTerminal: true, TraceID: "trace-stub"}
+
+	p, sources, err := s.buildAndRoute(req, principal, role)
+	if err == nil {
+		var result *exec.Result
+		result, err = exec.Run(ctx, p, sources, principal.Attributes)
+		if err == nil {
+			frame.Columns = result.Columns
+			frame.Rows = rowsToAny(result.Columns, result.Rows)
+		}
+	}
+
+	if err != nil {
+		frame.Partial = true
+		var timedOut *exec.SourceTimeoutError
+		if errors.As(err, &timedOut) {
+			frame.Sources = map[string]SourceStatus{timedOut.Connector: {Error: "SOURCE_TIMEOUT"}}
+		} else {
+			_, code := classifyError(err, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED")
+			frame.Error = &ErrorBody{Code: code, Message: err.Error()}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	_ = json.NewEncoder(w).Encode(frame)
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+// parseTimeout turns the request's timeout (e.g. "1s") into a duration.
+// Empty or malformed input means "no deadline" - the fail-safe direction:
+// worst case a slow connector runs to completion instead of being cut off,
+// never a request failing on a budget the caller didn't actually ask for.
+func parseTimeout(s string) time.Duration {
+	if s == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0
+	}
+	return d
 }
 
 // freshnessSummary folds every connector's freshness.Source state into one
@@ -296,15 +410,23 @@ func connectorPrefix(table string) string {
 	return table
 }
 
-func resultOutcome(result *exec.Result, fresh freshnessSummary) outcome {
-	rows := make([][]any, len(result.Rows))
-	for i, row := range result.Rows {
-		vals := make([]any, len(result.Columns))
-		for j, col := range result.Columns {
+// rowsToAny converts exec's []map[string]string rows into the response
+// envelope's positional [][]any shape (column order fixed by columns) -
+// shared by the JSON and NDJSON response paths.
+func rowsToAny(columns []string, rows []map[string]string) [][]any {
+	out := make([][]any, len(rows))
+	for i, row := range rows {
+		vals := make([]any, len(columns))
+		for j, col := range columns {
 			vals[j] = row[col]
 		}
-		rows[i] = vals
+		out[i] = vals
 	}
+	return out
+}
+
+func resultOutcome(result *exec.Result, fresh freshnessSummary) outcome {
+	rows := rowsToAny(result.Columns, result.Rows)
 
 	var meta *Meta
 	if fresh.CacheHit || fresh.Revalidated || result.JoinStrategy != "" {

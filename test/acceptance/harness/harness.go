@@ -3,9 +3,11 @@
 package harness
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -89,6 +91,61 @@ func (g *Gateway) QueryFresh(persona, sql, maxStaleness string, opts ...ReqOptio
 	body := fmt.Sprintf(`{"sql":%q,"max_staleness":%q}`, sql, maxStaleness)
 	allOpts := append([]ReqOption{Token(persona)}, opts...)
 	return g.POST("/v1/query", body, allOpts...)
+}
+
+// StreamResponse is a decoded `Accept: application/x-ndjson` response - one
+// or more NDJSON lines, the last of which is terminal (Cycle 11, ADR-009).
+type StreamResponse struct {
+	Code   int
+	Header http.Header
+	body   []byte
+}
+
+// QueryStream is Query for the NDJSON streaming path: sets
+// Accept: application/x-ndjson and an optional timeout (e.g. "1s") in the
+// request body.
+func (g *Gateway) QueryStream(persona, sql, timeout string) *StreamResponse {
+	g.t.Helper()
+
+	body := fmt.Sprintf(`{"sql":%q,"timeout":%q}`, sql, timeout)
+	req, err := http.NewRequest(http.MethodPost, g.srv.URL+"/v1/query", bytes.NewBufferString(body))
+	if err != nil {
+		g.t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/x-ndjson")
+	Token(persona)(req)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		g.t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		g.t.Fatalf("read body: %v", err)
+	}
+
+	return &StreamResponse{Code: resp.StatusCode, Header: resp.Header, body: data}
+}
+
+// NDJSON decodes the response body as newline-delimited Frame objects.
+func (r *StreamResponse) NDJSON() []server.Frame {
+	var frames []server.Frame
+	scanner := bufio.NewScanner(bytes.NewReader(r.body))
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var f server.Frame
+		if err := json.Unmarshal(line, &f); err != nil {
+			continue
+		}
+		frames = append(frames, f)
+	}
+	return frames
 }
 
 // PollResult is the /v1/jobs/{id} response an async query's PollURL

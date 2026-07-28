@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/pradhanbv/emathp/internal/connector"
 )
@@ -20,6 +21,7 @@ type Server struct {
 	tickets   []connector.Row
 	pageSize  int
 	maxInList int
+	delay     time.Duration
 	callCount atomic.Int64
 }
 
@@ -41,6 +43,12 @@ func Tickets(n int, status string) Option {
 // instead of quietly returning a partial (and therefore wrong) result.
 func MaxInList(n int) Option {
 	return func(s *Server) { s.maxInList = n }
+}
+
+// Delay adds a fixed delay before every response, for timeout testing
+// (Cycle 11, ADR-009) - mirrors mocksf.Delay.
+func Delay(d time.Duration) Option {
+	return func(s *Server) { s.delay = d }
 }
 
 // New builds a mock with the given options. pageSize defaults large enough
@@ -66,6 +74,10 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	s.callCount.Add(1)
+
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	}
 
 	q := r.URL.Query()
 

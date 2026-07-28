@@ -1,0 +1,40 @@
+# Three profiles, three commands (see README):
+#   docker compose --profile core --profile mocks up -d
+#   go test ./...
+#   docker compose --profile testing run k6
+# Not TDD'd (IMPLEMENTATION_PLAN.md ground rule 4) - compose wiring is
+# infrastructure, not behavior a test proves.
+services:
+  mocksf:
+    build:
+      context: .
+      target: mocksf
+    profiles: ["mocks"]
+    ports:
+      - "8081:8081"
+    command: ["--rows", "2000", "--page-size", "500"]
+
+  mockzd:
+    build:
+      context: .
+      target: mockzd
+    profiles: ["mocks"]
+    ports:
+      - "8082:8082"
+    command: ["--tickets", "50000"]
+
+  gateway:
+    build:
+      context: .
+      target: gateway
+    profiles: ["core"]
+    ports:
+      - "8080:8080"
+    command: ["--sf-url", "http://mocksf:8081", "--zd-url", "http://mockzd:8082"]
+
+  k6:
+    image: grafana/k6:latest
+    profiles: ["testing"]
+    volumes:
+      - ./k6:/scripts:ro
+    entrypoint: ["k6", "run", "-e", "BASE_URL=http://gateway:8080", "/scripts/load.js"]

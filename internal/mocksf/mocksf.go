@@ -257,6 +257,7 @@ func genRows(n int) []connector.Row {
 		}
 		rows[i] = connector.Row{
 			"id":     fmt.Sprintf("a%06d", i),
+			"name":   fmt.Sprintf("Account %d", i),
 			"email":  fmt.Sprintf("user%d@example.com", i),
 			"region": region,
 			"status": "open",

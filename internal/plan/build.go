@@ -153,12 +153,12 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals, masks p
 		if err != nil {
 			return nil, err
 		}
-		for _, c := range conjuncts {
+		for i, c := range conjuncts {
 			col, op, value, err := comparisonParts(c)
 			if err != nil {
 				return nil, err
 			}
-			wheres = append(wheres, whereCond{Col: col, Op: op, Value: value})
+			wheres = append(wheres, whereCond{Col: col, Op: op, Literal: value, Param: paramPlaceholder(i)})
 		}
 	}
 
@@ -201,9 +201,19 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals, masks p
 
 // whereCond is one WHERE-clause conjunct, already stripped of its table
 // alias (single-table Build never had qualifiers; buildJoin routes each
-// conjunct to its owning side before this point).
+// conjunct to its owning side before this point). Literal is the actual
+// text the query used (e.g. "'open'") - kept only so VerdictFor can be
+// looked up by the text a caller actually wrote. Param is the
+// "$param.N" placeholder stored in the Filter/Predicate instead: a cached
+// Plan is shared across every future request of the same shape (ADR-003),
+// so the literal itself must never be baked in - it's re-extracted fresh
+// from each request's own SQL by ExtractParams and bound at exec.Run time,
+// the same way $principal.<attr> values already were (Cycle 7). Baking
+// Literal in directly here was exactly the bug this indirection fixes:
+// every cache hit after the first silently kept re-using whichever
+// request's literal built the plan.
 type whereCond struct {
-	Col, Op, Value string
+	Col, Op, Literal, Param string
 }
 
 // buildSideTree builds one Scan plus its stack of Filter nodes - the whole
@@ -223,8 +233,14 @@ func buildSideTree(table string, wheres []whereCond, residuals policy.Residuals,
 	var predicateCols []string
 	seenCol := make(map[string]bool)
 
-	applyPredicate := func(col, op, value string, origin Origin) Verdict {
-		exprText := normalizeExpr(col + " " + op + " " + value)
+	// verdictValue is the text VerdictFor's caller would naturally write
+	// (the actual literal, or $principal.<attr> for a residual);
+	// storedValue is what's kept in the Filter/Predicate for exec to
+	// resolve later - a $param.N placeholder for a user literal, or the
+	// unchanged $principal.<attr> text for a residual, which was already
+	// resolved lazily before this fix existed.
+	applyPredicate := func(col, op, verdictValue, storedValue string, origin Origin) Verdict {
+		exprText := normalizeExpr(col + " " + op + " " + verdictValue)
 		v := classify(cat, table, col, op)
 		verdicts[exprText] = v
 		if v.Site == Pushed {
@@ -236,14 +252,14 @@ func buildSideTree(table string, wheres []whereCond, residuals policy.Residuals,
 		}
 		root = &Filter{
 			Child: root,
-			Pred:  Predicate{Column: col, Op: op, Value: value, Origin: origin},
+			Pred:  Predicate{Column: col, Op: op, Value: storedValue, Origin: origin},
 			Site:  v.Site,
 		}
 		return v
 	}
 
 	for _, w := range wheres {
-		applyPredicate(w.Col, w.Op, w.Value, UserOrigin)
+		applyPredicate(w.Col, w.Op, w.Literal, w.Param, UserOrigin)
 	}
 
 	var security []securityPredicate
@@ -255,7 +271,7 @@ func buildSideTree(table string, wheres []whereCond, residuals policy.Residuals,
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
-		v := applyPredicate(col, op, value, SecurityOrigin)
+		v := applyPredicate(col, op, value, value, SecurityOrigin)
 		security = append(security, securityPredicate{
 			Pred:    Predicate{Column: col, Op: op, Value: value, Origin: SecurityOrigin},
 			Verdict: v,
@@ -363,16 +379,22 @@ func buildJoin(sel *sqlparser.Select, je *sqlparser.JoinTableExpr, cat *catalog.
 		if err != nil {
 			return nil, err
 		}
-		for _, c := range conjuncts {
+		// Param placeholders are numbered by i, the conjunct's position in
+		// the ORIGINAL (unsplit) list - not its position after being
+		// bucketed into leftWhere/rightWhere - so it lines up with
+		// ExtractParams, which re-parses the same original list without
+		// ever routing by alias.
+		for i, c := range conjuncts {
 			alias, col, op, value, err := comparisonPartsQualified(c)
 			if err != nil {
 				return nil, err
 			}
+			wc := whereCond{Col: col, Op: op, Literal: value, Param: paramPlaceholder(i)}
 			switch alias {
 			case leftAlias:
-				leftWhere = append(leftWhere, whereCond{Col: col, Op: op, Value: value})
+				leftWhere = append(leftWhere, wc)
 			case rightAlias:
-				rightWhere = append(rightWhere, whereCond{Col: col, Op: op, Value: value})
+				rightWhere = append(rightWhere, wc)
 			default:
 				return nil, fmt.Errorf("%w: unknown table alias %q", ErrUnsupportedStatement, alias)
 			}
@@ -429,6 +451,63 @@ func buildJoin(sel *sqlparser.Select, je *sqlparser.JoinTableExpr, cat *catalog.
 		scans:    map[string]*Scan{leftTable: leftScan, rightTable: rightScan},
 		security: append(leftSecurity, rightSecurity...),
 	}, nil
+}
+
+// ParamPrefix is the marker exec's resolveValue recognizes for a
+// WHERE-clause literal that must be re-resolved per call - see whereCond's
+// doc comment for why the literal itself is never stored in the Plan.
+// Exported so exec can parse exactly the prefix this package writes,
+// rather than each side keeping its own copy of the string in sync by
+// hand.
+const ParamPrefix = "$param."
+
+func paramPlaceholder(i int) string {
+	return fmt.Sprintf("%s%d", ParamPrefix, i)
+}
+
+// ExtractParams re-parses sql's WHERE-clause literal values, in the exact
+// order Build assigns them $param.N placeholders (conjunct position in the
+// unsplit list - see paramPlaceholder and buildJoin's ordering note).
+// Called at exec time against the CURRENT request's own SQL text - not the
+// (possibly different) request that built and cached the Plan - so a plan
+// cache hit never serves a stale literal. Residual ($principal.<attr>)
+// predicates aren't part of this: they come from policy, not the query
+// text, and were already resolved lazily before this existed.
+func ExtractParams(sql string) ([]string, error) {
+	stmt, err := parser.Parse(sql)
+	if err != nil {
+		return nil, fmt.Errorf("plan: parse: %w", err)
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || len(sel.From) != 1 {
+		return nil, ErrUnsupportedStatement
+	}
+	if sel.Where == nil {
+		return nil, nil
+	}
+
+	conjuncts, err := splitConjuncts(sel.Where.Expr)
+	if err != nil {
+		return nil, err
+	}
+
+	params := make([]string, len(conjuncts))
+	for i, c := range conjuncts {
+		cmp, ok := c.(*sqlparser.ComparisonExpr)
+		if !ok {
+			return nil, fmt.Errorf("%w: only simple comparisons supported", ErrUnsupportedPredicate)
+		}
+		lit, ok := cmp.Right.(*sqlparser.Literal)
+		if !ok {
+			return nil, fmt.Errorf("%w: right side must be a literal", ErrUnsupportedPredicate)
+		}
+		value, err := literalText(lit)
+		if err != nil {
+			return nil, err
+		}
+		params[i] = value
+	}
+	return params, nil
 }
 
 func maskColsFor(table string, masks policy.Masks) []string {

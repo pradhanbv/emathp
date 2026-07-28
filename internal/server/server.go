@@ -129,15 +129,16 @@ var errConnectorMissing = errors.New("no connector configured")
 
 // buildAndRoute runs everything before exec.Run: parse every referenced
 // table, L1 object authz, the plan-cache lookup (build on miss), the
-// fail-closed invariant, and one freshness-wrapped Source per distinct
-// connector the query touches. Shared by run() (JSON response) and
-// runStream() (NDJSON response, Cycle 11) so neither can drift from the
-// other's admission and routing logic - they differ only in how they turn
-// exec.Run's result or error into a response.
-func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, role string) (*plan.Plan, map[string]connector.Source, error) {
+// fail-closed invariant, one freshness-wrapped Source per distinct
+// connector the query touches, and the CURRENT request's own WHERE-clause
+// literals. Shared by run() (JSON response) and runStream() (NDJSON
+// response, Cycle 11) so neither can drift from the other's admission and
+// routing logic - they differ only in how they turn exec.Run's result or
+// error into a response.
+func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, role string) (*plan.Plan, map[string]connector.Source, []string, error) {
 	tables, err := plan.ParseTables(req.SQL)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// LAYER 1 - object-level authz, ours, pre-plan (ADR-002). Denied
@@ -146,24 +147,34 @@ func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, r
 	// named first.
 	for _, table := range tables {
 		if s.deps.Policy.ObjectDenied(role, table) {
-			return nil, nil, fmt.Errorf("%w: role may not access %s", plan.ErrEntitlementDenied, table)
+			return nil, nil, nil, fmt.Errorf("%w: role may not access %s", plan.ErrEntitlementDenied, table)
 		}
 	}
 
 	// Plan cache lookup (ADR-003): built fresh on a miss, reused on a hit.
-	// The plan itself never contains a resolved $principal value - it's
-	// only safe to share across principals in the same role because
-	// binding happens later, in exec.Run, against a read-only plan.
+	// The plan itself never contains a resolved $principal value, or (as of
+	// this fix) a resolved WHERE-clause literal either - both are re-bound
+	// per call, never baked into a plan every future request of the same
+	// shape will share.
 	p, _, _, err := plancache.Resolve(s.deps.PlanCache, req.SQL, s.deps.Catalog, s.deps.Policy, principal.Tenant, role)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// LAYER 2's fail-closed check. Runs on every request, including
 	// cache hits (ADR-002) - cheap, and a defence against a corrupted or
 	// tampered cache entry, not just a fresh-build sanity check.
 	if err := plan.AssertInvariant(p); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+
+	// The CURRENT request's own WHERE-clause literals, re-parsed from
+	// req.SQL directly rather than read off p - p may be a cache hit built
+	// from a different request's SQL text that merely shares this one's
+	// shape. See plan.ExtractParams and exec.Run's doc comment.
+	params, err := plan.ExtractParams(req.SQL)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	// Freshness (ADR-005): a cache hit within max_staleness never touches
@@ -183,7 +194,7 @@ func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, r
 		}
 		source, ok := s.deps.Sources[name]
 		if !ok {
-			return nil, nil, fmt.Errorf("%w: no connector configured for %s", errConnectorMissing, table)
+			return nil, nil, nil, fmt.Errorf("%w: no connector configured for %s", errConnectorMissing, table)
 		}
 		sources[name] = &freshness.Source{
 			Inner:        source,
@@ -194,7 +205,7 @@ func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, r
 		}
 	}
 
-	return p, sources, nil
+	return p, sources, params, nil
 }
 
 // classifyError maps an error from buildAndRoute or exec.Run to an HTTP
@@ -226,7 +237,7 @@ func classifyError(err error, defaultStatus int, defaultCode string) (status int
 func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.Principal, role string) outcome {
 	traceID := obs.TraceIDFrom(ctx)
 
-	p, sources, err := s.buildAndRoute(req, principal, role)
+	p, sources, params, err := s.buildAndRoute(req, principal, role)
 	if err != nil {
 		status, code := classifyError(err, http.StatusBadRequest, "UNSUPPORTED_PREDICATE")
 		return errorOutcome(traceID, status, code, err.Error())
@@ -239,7 +250,7 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 		defer cancel()
 	}
 
-	result, err := exec.Run(ctx, p, sources, principal.Attributes)
+	result, err := exec.Run(ctx, p, sources, principal.Attributes, params)
 	if err != nil {
 		status, code := classifyError(err, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED")
 		message := err.Error()
@@ -274,10 +285,10 @@ func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req Query
 
 	frame := Frame{IsTerminal: true, TraceID: obs.TraceIDFrom(ctx)}
 
-	p, sources, err := s.buildAndRoute(req, principal, role)
+	p, sources, params, err := s.buildAndRoute(req, principal, role)
 	if err == nil {
 		var result *exec.Result
-		result, err = exec.Run(ctx, p, sources, principal.Attributes)
+		result, err = exec.Run(ctx, p, sources, principal.Attributes, params)
 		if err == nil {
 			frame.Columns = result.Columns
 			frame.Rows = rowsToAny(result.Columns, result.Rows)

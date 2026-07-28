@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/pradhanbv/emathp/internal/connector"
@@ -49,19 +50,24 @@ func (e *SourceTimeoutError) Error() string {
 func (e *SourceTimeoutError) Unwrap() error { return context.DeadlineExceeded }
 
 // Run executes p against sources (keyed by connector prefix, e.g. "sf"),
-// resolving any $principal.<attr> predicate values against attrs at
+// resolving any $principal.<attr> predicate value against attrs and any
+// ordinary WHERE-clause literal ($param.N) against params, both at
 // comparison time rather than having them baked into p.
 //
-// This matters once a plan can be cached and shared across principals
+// This matters once a plan can be cached and shared across requests
 // (Cycle 7, ADR-003): p is not mutated here, and never should be - two
-// principals in the same role produce the same cache key (tenant, role,
-// policy version/shape, capability shape, sql shape all match) but can
-// have different attribute values, so binding has to happen per call,
-// against a read-only plan, never by writing into the shared Filter
-// nodes.
-func Run(ctx context.Context, p *plan.Plan, sources map[string]connector.Source, attrs map[string]string) (*Result, error) {
+// requests of the same shape (same tenant, role, policy version/shape,
+// capability shape, sql shape) share the exact same cached Plan, whether
+// they're different principals (different attrs) or the same principal
+// running the query with different WHERE-clause literals (different
+// params) - binding has to happen per call, against a read-only plan,
+// never by writing into the shared Filter nodes. params comes from
+// plan.ExtractParams(sql) run against the CURRENT request's own SQL text,
+// never the plan's - see whereCond's doc comment in the plan package for
+// the bug this indirection exists to prevent.
+func Run(ctx context.Context, p *plan.Plan, sources map[string]connector.Source, attrs map[string]string, params []string) (*Result, error) {
 	if join := p.PrimaryJoin(); join != nil {
-		return runJoin(ctx, p, join, sources, attrs)
+		return runJoin(ctx, p, join, sources, attrs, params)
 	}
 
 	scan := p.PrimaryScan()
@@ -74,7 +80,7 @@ func Run(ctx context.Context, p *plan.Plan, sources map[string]connector.Source,
 		return nil, err
 	}
 
-	rows, err := fetchScanRows(ctx, source, scan, p.Filters(), attrs, nil)
+	rows, err := fetchScanRows(ctx, source, scan, p.Filters(), attrs, params, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +104,7 @@ func Run(ctx context.Context, p *plan.Plan, sources map[string]connector.Source,
 // chunk at a time instead of once per build row. The two fetched row sets
 // are then joined in memory - pushdown reduced which probe rows came back,
 // this just pairs what did.
-func runJoin(ctx context.Context, p *plan.Plan, join *plan.Join, sources map[string]connector.Source, attrs map[string]string) (*Result, error) {
+func runJoin(ctx context.Context, p *plan.Plan, join *plan.Join, sources map[string]connector.Source, attrs map[string]string, params []string) (*Result, error) {
 	buildScan := plan.ScanIn(join.Left)
 	probeScan := plan.ScanIn(join.Right)
 	if buildScan == nil || probeScan == nil {
@@ -114,7 +120,7 @@ func runJoin(ctx context.Context, p *plan.Plan, join *plan.Join, sources map[str
 		return nil, err
 	}
 
-	buildRows, err := fetchScanRows(ctx, buildSource, buildScan, plan.FiltersIn(join.Left), attrs, nil)
+	buildRows, err := fetchScanRows(ctx, buildSource, buildScan, plan.FiltersIn(join.Left), attrs, params, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +137,7 @@ func runJoin(ctx context.Context, p *plan.Plan, join *plan.Join, sources map[str
 	probeFilters := plan.FiltersIn(join.Right)
 	var probeRows []connector.Row
 	for _, chunk := range chunks {
-		rows, err := fetchScanRows(ctx, probeSource, probeScan, probeFilters, attrs,
+		rows, err := fetchScanRows(ctx, probeSource, probeScan, probeFilters, attrs, params,
 			map[string][]string{join.On.RightCol: chunk})
 		if err != nil {
 			return nil, err
@@ -164,11 +170,11 @@ func runJoin(ctx context.Context, p *plan.Plan, join *plan.Join, sources map[str
 // locally-retained one. Shared by the single-scan path and each side of a
 // join: the fail-closed sequence doesn't change depending on whether this
 // is the query's only scan.
-func fetchScanRows(ctx context.Context, source connector.Source, scan *plan.Scan, filters []*plan.Filter, attrs map[string]string, extra map[string][]string) ([]connector.Row, error) {
+func fetchScanRows(ctx context.Context, source connector.Source, scan *plan.Scan, filters []*plan.Filter, attrs map[string]string, params []string, extra map[string][]string) ([]connector.Row, error) {
 	pushed := make(map[string][]string, len(filters)+len(extra))
 	for _, f := range filters {
 		if f.Site == plan.Pushed {
-			v, err := resolveValue(f.Pred.Value, attrs)
+			v, err := resolveValue(f.Pred.Value, attrs, params)
 			if err != nil {
 				return nil, err
 			}
@@ -208,11 +214,11 @@ func fetchScanRows(ctx context.Context, source connector.Source, scan *plan.Scan
 	// that came back. Re-apply every PUSHED security predicate locally;
 	// any row that fails it means the connector's real behaviour diverged
 	// from its declared capability.
-	if err := verifyPushedSecurityPredicates(rows, filters, attrs); err != nil {
+	if err := verifyPushedSecurityPredicates(rows, filters, attrs, params); err != nil {
 		return nil, err
 	}
 
-	return applyLocalFilters(rows, filters, attrs)
+	return applyLocalFilters(rows, filters, attrs, params)
 }
 
 func sourceFor(sources map[string]connector.Source, table string) (connector.Source, error) {
@@ -348,12 +354,12 @@ func securityPredicateNeedsColumn(filters []*plan.Filter, column string) bool {
 // fails it means the predicate "appears pushed, does nothing" - the
 // realistic failure isn't vendor dishonesty, it's our own connector
 // sending the wrong query param and the source silently ignoring it.
-func verifyPushedSecurityPredicates(rows []connector.Row, filters []*plan.Filter, attrs map[string]string) error {
+func verifyPushedSecurityPredicates(rows []connector.Row, filters []*plan.Filter, attrs map[string]string, params []string) error {
 	for _, f := range filters {
 		if f.Pred.Origin != plan.SecurityOrigin || f.Site != plan.Pushed {
 			continue
 		}
-		want, err := resolveValue(f.Pred.Value, attrs)
+		want, err := resolveValue(f.Pred.Value, attrs, params)
 		if err != nil {
 			return err
 		}
@@ -372,7 +378,7 @@ func verifyPushedSecurityPredicates(rows []connector.Row, filters []*plan.Filter
 	return nil
 }
 
-func applyLocalFilters(rows []connector.Row, filters []*plan.Filter, attrs map[string]string) ([]connector.Row, error) {
+func applyLocalFilters(rows []connector.Row, filters []*plan.Filter, attrs map[string]string, params []string) ([]connector.Row, error) {
 	var out []connector.Row
 	for _, r := range rows {
 		keep := true
@@ -380,7 +386,7 @@ func applyLocalFilters(rows []connector.Row, filters []*plan.Filter, attrs map[s
 			if f.Site != plan.Local {
 				continue
 			}
-			want, err := resolveValue(f.Pred.Value, attrs)
+			want, err := resolveValue(f.Pred.Value, attrs, params)
 			if err != nil {
 				return nil, err
 			}
@@ -427,19 +433,37 @@ func applyMask(fn, value string) (string, error) {
 }
 
 // resolveValue turns a predicate value into a concrete string to compare
-// against a fetched row: a literal gets unquoted, a $principal.<attr>
-// placeholder gets looked up in attrs. Missing attribute fails closed
-// (PRINCIPAL_UNRESOLVED territory) rather than comparing against an empty
-// string, which would silently match or silently drop every row
-// depending on data - the same bug class over-projection exists to avoid.
-func resolveValue(value string, attrs map[string]string) (string, error) {
-	const prefix = "$principal."
-	if attr, ok := strings.CutPrefix(value, prefix); ok {
+// against a fetched row: a $principal.<attr> placeholder gets looked up in
+// attrs, a $param.N placeholder gets looked up in params (the CURRENT
+// request's own WHERE-clause literals, re-extracted fresh by
+// plan.ExtractParams rather than read from the plan - see whereCond's doc
+// comment in the plan package), anything else is a literal and gets
+// unquoted directly. Missing attribute/param fails closed
+// (PRINCIPAL_UNRESOLVED / UNSUPPORTED_PREDICATE territory) rather than
+// comparing against an empty string, which would silently match or
+// silently drop every row depending on data - the same bug class
+// over-projection exists to avoid.
+// principalPrefix has no cross-package counterpart to share (nothing else
+// writes it), so it stays local, unlike plan.ParamPrefix below.
+const principalPrefix = "$principal."
+
+func resolveValue(value string, attrs map[string]string, params []string) (string, error) {
+	if attr, ok := strings.CutPrefix(value, principalPrefix); ok {
 		v, ok := attrs[attr]
 		if !ok {
 			return "", fmt.Errorf("%w: missing principal attribute %q", plan.ErrEntitlementDenied, attr)
 		}
 		return v, nil
+	}
+	if idxStr, ok := strings.CutPrefix(value, plan.ParamPrefix); ok {
+		idx, err := strconv.Atoi(idxStr)
+		if err != nil {
+			return "", fmt.Errorf("exec: malformed param placeholder %q", value)
+		}
+		if idx < 0 || idx >= len(params) {
+			return "", fmt.Errorf("exec: param %d out of range (query has %d parameter(s)) - the current request's SQL no longer matches the shape its cached plan was built from", idx, len(params))
+		}
+		return unquote(params[idx]), nil
 	}
 	return unquote(value), nil
 }

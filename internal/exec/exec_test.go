@@ -142,7 +142,10 @@ func runQuery(t *testing.T, persona, sql string, cat *catalog.Catalog, source co
 	p, err := plan.Build(sql, cat, residuals, masks)
 	require.NoError(t, err)
 
-	result, err := exec.Run(context.Background(), p, map[string]connector.Source{"sf": source}, personaAttrs[persona])
+	params, err := plan.ExtractParams(sql)
+	require.NoError(t, err)
+
+	result, err := exec.Run(context.Background(), p, map[string]connector.Source{"sf": source}, personaAttrs[persona], params)
 	if err != nil {
 		if errors.Is(err, plan.ErrEntitlementDenied) {
 			return queryResult{Code: 403, ErrorCode: "ENTITLEMENT_DENIED"}

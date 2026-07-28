@@ -140,7 +140,9 @@ func cacheKey(req connector.FetchRequest) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s|%s|", req.Table, strings.Join(cols, ","))
 	for _, k := range keys {
-		fmt.Fprintf(&b, "%s=%s,", k, req.Filters[k])
+		vals := append([]string(nil), req.Filters[k]...)
+		sort.Strings(vals)
+		fmt.Fprintf(&b, "%s=%s,", k, strings.Join(vals, "+"))
 	}
 	return b.String()
 }

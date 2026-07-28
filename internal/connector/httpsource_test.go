@@ -75,7 +75,7 @@ func TestCapabilityFilteringAndLieAbout(t *testing.T) {
 	rows, _, err := honestSource.Fetch(context.Background(), connector.FetchRequest{
 		Table:   "sf.accounts",
 		Columns: []string{"id", "region"},
-		Filters: map[string]string{"region": "EMEA"},
+		Filters: map[string][]string{"region": {"EMEA"}},
 	})
 	require.NoError(t, err)
 	for _, r := range rows {
@@ -89,7 +89,7 @@ func TestCapabilityFilteringAndLieAbout(t *testing.T) {
 	rows, _, err = lyingSource.Fetch(context.Background(), connector.FetchRequest{
 		Table:   "sf.accounts",
 		Columns: []string{"id", "region"},
-		Filters: map[string]string{"region": "EMEA"},
+		Filters: map[string][]string{"region": {"EMEA"}},
 	})
 	require.NoError(t, err)
 	require.Len(t, rows, 10, "lying connector ignores the filter it claims to enforce")

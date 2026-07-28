@@ -85,9 +85,17 @@ type Equi struct {
 	RightCol string
 }
 
+// Join is a two-table equi-join. v1's only strategy is semi-join: Left is
+// always the build side (scanned in full) and Right the probe side (its
+// join-key values pushed as a chunked IN-list) - a positional rule (FROM
+// table = build, JOIN table = probe) rather than a cost-based choice,
+// since there are no cardinality stats to choose from. MaxInList is the
+// probe table's catalog-declared IN-list capacity, resolved at build time
+// since it's a static capability, not a runtime value.
 type Join struct {
 	Left, Right Node
 	On          Equi
+	MaxInList   int
 }
 
 func (j *Join) Children() []Node { return []Node{j.Left, j.Right} }

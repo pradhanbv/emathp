@@ -7,6 +7,8 @@
 package plancache
 
 import (
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/pradhanbv/emathp/internal/catalog"
@@ -73,7 +75,7 @@ func (c *Cache) put(key Key, p *plan.Plan) {
 // never mutated in place - see exec.Run's doc comment on why binding
 // happens per call, not by writing into a shared cached plan.
 func Resolve(cache *Cache, sql string, cat *catalog.Catalog, pol *policy.Provider, tenant, role string) (*plan.Plan, Key, bool, error) {
-	table, err := plan.ParseTable(sql)
+	tables, err := plan.ParseTables(sql)
 	if err != nil {
 		return nil, Key{}, false, err
 	}
@@ -90,7 +92,7 @@ func Resolve(cache *Cache, sql string, cat *catalog.Catalog, pol *policy.Provide
 	if err != nil {
 		return nil, Key{}, false, err
 	}
-	capShape, err := cat.ShapeHash(table)
+	capShape, err := combinedCapShape(cat, tables)
 	if err != nil {
 		return nil, Key{}, false, err
 	}
@@ -108,13 +110,19 @@ func Resolve(cache *Cache, sql string, cat *catalog.Catalog, pol *policy.Provide
 		return p, key, true, nil
 	}
 
-	residuals, err := pol.ResidualsFor(role, table)
-	if err != nil {
-		return nil, key, false, err
-	}
-	masks, err := pol.MasksFor(role, table)
-	if err != nil {
-		return nil, key, false, err
+	var residuals policy.Residuals
+	var masks policy.Masks
+	for _, table := range tables {
+		r, err := pol.ResidualsFor(role, table)
+		if err != nil {
+			return nil, key, false, err
+		}
+		residuals = append(residuals, r...)
+		m, err := pol.MasksFor(role, table)
+		if err != nil {
+			return nil, key, false, err
+		}
+		masks = append(masks, m...)
 	}
 
 	p, err := plan.Build(sql, cat, residuals, masks)
@@ -124,4 +132,20 @@ func Resolve(cache *Cache, sql string, cat *catalog.Catalog, pol *policy.Provide
 
 	cache.put(key, p)
 	return p, key, false, nil
+}
+
+// combinedCapShape folds every referenced table's capability shape into
+// one cache-key component - a join's cached plan must invalidate if
+// either side's capability profile changes, not just one.
+func combinedCapShape(cat *catalog.Catalog, tables []string) (string, error) {
+	shapes := make([]string, 0, len(tables))
+	for _, t := range tables {
+		h, err := cat.ShapeHash(t)
+		if err != nil {
+			return "", err
+		}
+		shapes = append(shapes, t+":"+h)
+	}
+	sort.Strings(shapes)
+	return strings.Join(shapes, "|"), nil
 }

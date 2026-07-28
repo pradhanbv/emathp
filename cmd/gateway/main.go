@@ -21,6 +21,8 @@ func main() {
 	policyDir := flag.String("policy", "testdata/policy", "policy fixture directory")
 	sfURL := flag.String("sf-url", "http://localhost:8081", "Salesforce mock connector URL")
 	sfLimit := flag.Int("sf-limit", 0, "sf connector call budget for this process's lifetime (0 = unlimited)")
+	zdURL := flag.String("zd-url", "http://localhost:8082", "Zendesk mock connector URL")
+	zdLimit := flag.Int("zd-limit", 0, "zd connector call budget for this process's lifetime (0 = unlimited)")
 	flag.Parse()
 
 	cat, err := catalog.Load(*catalogDir)
@@ -36,6 +38,9 @@ func main() {
 	if *sfLimit > 0 {
 		limiter.SetLimit("sf", *sfLimit)
 	}
+	if *zdLimit > 0 {
+		limiter.SetLimit("zd", *zdLimit)
+	}
 
 	// The issuer registry is control-plane state that would come from the
 	// tenant registry in a real deployment; the fixtures package is the
@@ -49,9 +54,10 @@ func main() {
 		Freshness: freshness.New(),
 		Sources: map[string]connector.Source{
 			"sf": connector.NewHTTPSource(*sfURL),
+			"zd": connector.NewHTTPSource(*zdURL),
 		},
 	})
 
-	log.Printf("gateway listening on %s (sf connector -> %s)", *addr, *sfURL)
+	log.Printf("gateway listening on %s (sf connector -> %s, zd connector -> %s)", *addr, *sfURL, *zdURL)
 	log.Fatal(http.ListenAndServe(*addr, s.Handler()))
 }

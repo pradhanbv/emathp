@@ -29,8 +29,9 @@ func buildFor(t *testing.T, persona, sql string) *plan.Plan {
 	pol, err := policy.Load("../../testdata/policy")
 	require.NoError(t, err)
 
-	table, err := plan.ParseTable(sql)
+	tables, err := plan.ParseTables(sql)
 	require.NoError(t, err)
+	table := tables[0]
 
 	residuals, err := pol.ResidualsFor(personaRole[persona], table)
 	require.NoError(t, err)

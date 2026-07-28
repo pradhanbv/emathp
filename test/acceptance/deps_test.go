@@ -10,6 +10,7 @@ import (
 	"github.com/pradhanbv/emathp/internal/freshness"
 	"github.com/pradhanbv/emathp/internal/identity/fixtures"
 	"github.com/pradhanbv/emathp/internal/mocksf"
+	"github.com/pradhanbv/emathp/internal/mockzd"
 	"github.com/pradhanbv/emathp/internal/plancache"
 	"github.com/pradhanbv/emathp/internal/policy"
 	"github.com/pradhanbv/emathp/internal/ratelimit"
@@ -48,6 +49,31 @@ func testDepsWithCatalog(t *testing.T, sf *mocksf.TestServer, catalogDir string)
 		Freshness: freshness.New(),
 		Sources: map[string]connector.Source{
 			"sf": connector.NewHTTPSource(sf.URL),
+		},
+	}
+}
+
+// testDepsJoin is testDeps plus a "zd" connector - the semi-join cycle's
+// two-connector case (Cycle 10).
+func testDepsJoin(t *testing.T, sf *mocksf.TestServer, zd *mockzd.TestServer) server.Deps {
+	t.Helper()
+
+	cat, err := catalog.Load(defaultCatalogDir)
+	require.NoError(t, err)
+
+	pol, err := policy.Load("../../testdata/policy")
+	require.NoError(t, err)
+
+	return server.Deps{
+		Catalog:   cat,
+		Policy:    pol,
+		Identity:  fixtures.IssuerRegistry(),
+		PlanCache: plancache.New(),
+		RateLimit: ratelimit.New(),
+		Freshness: freshness.New(),
+		Sources: map[string]connector.Source{
+			"sf": connector.NewHTTPSource(sf.URL),
+			"zd": connector.NewHTTPSource(zd.URL),
 		},
 	}
 }

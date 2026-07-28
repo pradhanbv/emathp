@@ -57,8 +57,8 @@ func (s *fakeSource) Fetch(_ context.Context, req connector.FetchRequest) ([]con
 	var out []connector.Row
 	for _, r := range s.rows {
 		keep := true
-		for col, want := range req.Filters {
-			if r[col] != want {
+		for col, vals := range req.Filters {
+			if !containsStr(vals, r[col]) {
 				keep = false
 				break
 			}
@@ -73,6 +73,15 @@ func (s *fakeSource) Fetch(_ context.Context, req connector.FetchRequest) ([]con
 		out = append(out, row)
 	}
 	return out, connector.FetchMeta{}, nil
+}
+
+func containsStr(vals []string, v string) bool {
+	for _, want := range vals {
+		if want == v {
+			return true
+		}
+	}
+	return false
 }
 
 func sha256hex(s string) string {
@@ -114,8 +123,9 @@ func runQuery(t *testing.T, persona, sql string, cat *catalog.Catalog, source co
 	pol, err := policy.Load("../../testdata/policy")
 	require.NoError(t, err)
 
-	table, err := plan.ParseTable(sql)
+	tables, err := plan.ParseTables(sql)
 	require.NoError(t, err)
+	table := tables[0]
 
 	role := personaRole[persona]
 
@@ -132,7 +142,7 @@ func runQuery(t *testing.T, persona, sql string, cat *catalog.Catalog, source co
 	p, err := plan.Build(sql, cat, residuals, masks)
 	require.NoError(t, err)
 
-	result, err := exec.Run(context.Background(), p, source, personaAttrs[persona])
+	result, err := exec.Run(context.Background(), p, map[string]connector.Source{"sf": source}, personaAttrs[persona])
 	if err != nil {
 		if errors.Is(err, plan.ErrEntitlementDenied) {
 			return queryResult{Code: 403, ErrorCode: "ENTITLEMENT_DENIED"}

@@ -40,6 +40,15 @@ func Rows(n int) Option {
 	return func(s *Server) { s.rows = genRows(n) }
 }
 
+// Accounts generates n synthetic accounts all in region, with a name and
+// an external_id - the join key the semi-join cycle's probe side
+// (mockzd.Tickets) correlates against. external_id values are
+// "ext-000000".."ext-{n-1:06d}", a numbering scheme mockzd's organization_id
+// generation is built to overlap with.
+func Accounts(n int, region string) Option {
+	return func(s *Server) { s.rows = genAccounts(n, region) }
+}
+
 // PageSize caps how many rows the mock returns per call, regardless of
 // what the client asks for - a server-side limit, like real APIs impose.
 func PageSize(n int) Option {
@@ -164,7 +173,9 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 
 // filterRows applies only the columns declared as actually-filtered
 // (s.filtered) - an absent or lied-about column is accepted as a query
-// parameter but has no effect on which rows come back.
+// parameter but has no effect on which rows come back. A repeated query
+// param (org_id=a&org_id=b) is an IN-list; a single value is the equality
+// case of the same check.
 func (s *Server) filterRows(q map[string][]string) []connector.Row {
 	var out []connector.Row
 	for _, row := range s.rows {
@@ -176,7 +187,7 @@ func (s *Server) filterRows(q map[string][]string) []connector.Row {
 			if !s.filtered[col] {
 				continue
 			}
-			if row[col] != vals[0] {
+			if !containsStr(vals, row[col]) {
 				keep = false
 				break
 			}
@@ -186,6 +197,30 @@ func (s *Server) filterRows(q map[string][]string) []connector.Row {
 		}
 	}
 	return out
+}
+
+func containsStr(vals []string, v string) bool {
+	for _, want := range vals {
+		if want == v {
+			return true
+		}
+	}
+	return false
+}
+
+func genAccounts(n int, region string) []connector.Row {
+	rows := make([]connector.Row, n)
+	for i := 0; i < n; i++ {
+		rows[i] = connector.Row{
+			"id":          fmt.Sprintf("a%06d", i),
+			"name":        fmt.Sprintf("Account %d", i),
+			"email":       fmt.Sprintf("user%d@example.com", i),
+			"region":      region,
+			"status":      "open",
+			"external_id": fmt.Sprintf("ext-%06d", i),
+		}
+	}
+	return rows
 }
 
 func genRows(n int) []connector.Row {

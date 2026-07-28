@@ -1,0 +1,9 @@
+{
+  "table": "zd.tickets",
+  "predicates": {
+    "status": { "ops": ["="], "enforcement": "ENFORCED" }
+  },
+  "masking": "unsupported",
+  "join_key_in_list": true,
+  "max_in_list": 200
+}

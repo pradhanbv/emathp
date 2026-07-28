@@ -115,15 +115,19 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 // handler and the async job goroutine so neither path can drift from the
 // other's behaviour.
 func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.Principal, role string) outcome {
-	table, err := plan.ParseTable(req.SQL)
+	tables, err := plan.ParseTables(req.SQL)
 	if err != nil {
 		return errorOutcome(http.StatusBadRequest, "UNSUPPORTED_PREDICATE", err.Error())
 	}
 
 	// LAYER 1 - object-level authz, ours, pre-plan (ADR-002). Denied
-	// before we ever touch the catalog or build a plan.
-	if s.deps.Policy.ObjectDenied(role, table) {
-		return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", "role may not access "+table)
+	// before we ever touch the catalog or build a plan. A join is denied
+	// if either side is - both tables need admission, not just the one
+	// named first.
+	for _, table := range tables {
+		if s.deps.Policy.ObjectDenied(role, table) {
+			return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", "role may not access "+table)
+		}
 	}
 
 	// Plan cache lookup (ADR-003): built fresh on a miss, reused on a hit.
@@ -142,33 +146,40 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 		return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
 	}
 
-	connectorName := connectorPrefix(table)
-
-	source, ok := s.deps.Sources[connectorName]
-	if !ok {
-		return errorOutcome(http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", "no connector configured for "+table)
-	}
-
 	// Freshness (ADR-005): a cache hit within max_staleness never touches
 	// the rate limiter or the connector at all. A miss or stale entry
 	// spends exactly one token and makes one (conditional, if an ETag is on
 	// hand) call - the same reservation-after-planning sequencing
 	// DESIGN.md Section 2.3 describes, just moved inside the wrapper so it
-	// only fires when a call is actually going out.
-	fresh := &freshness.Source{
-		Inner:        source,
-		Cache:        s.deps.Freshness,
-		RateLimit:    s.deps.RateLimit,
-		Connector:    connectorName,
-		MaxStaleness: parseMaxStaleness(req.MaxStaleness),
+	// only fires when a call is actually going out. A join needs one
+	// wrapper per distinct connector (Cycle 10) - each side's rate budget
+	// and freshness cache are its own connector's, not shared.
+	maxStaleness := parseMaxStaleness(req.MaxStaleness)
+	sources := make(map[string]connector.Source, len(tables))
+	for _, table := range tables {
+		name := connectorPrefix(table)
+		if _, ok := sources[name]; ok {
+			continue
+		}
+		source, ok := s.deps.Sources[name]
+		if !ok {
+			return errorOutcome(http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", "no connector configured for "+table)
+		}
+		sources[name] = &freshness.Source{
+			Inner:        source,
+			Cache:        s.deps.Freshness,
+			RateLimit:    s.deps.RateLimit,
+			Connector:    name,
+			MaxStaleness: maxStaleness,
+		}
 	}
 
-	result, err := exec.Run(ctx, p, fresh, principal.Attributes)
+	result, err := exec.Run(ctx, p, sources, principal.Attributes)
 	if err != nil {
 		var exhausted *ratelimit.ExhaustedError
 		if errors.As(err, &exhausted) {
 			o := errorOutcome(http.StatusTooManyRequests, "RATE_LIMIT_EXHAUSTED",
-				fmt.Sprintf("rate limit exhausted for connector %q; retry after the window resets or use Prefer: respond-async", connectorName))
+				fmt.Sprintf("rate limit exhausted for connector %q; retry after the window resets or use Prefer: respond-async", exhausted.Connector))
 			o.Headers = map[string]string{"Retry-After": "1"}
 			return o
 		}
@@ -178,7 +189,40 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 		return errorOutcome(http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", err.Error())
 	}
 
-	return resultOutcome(result, fresh)
+	return resultOutcome(result, summarizeFreshness(sources))
+}
+
+// freshnessSummary folds every connector's freshness.Source state into one
+// response-level view: CacheHit only if every fetch this request made was
+// served from cache (a join is only as cache-fresh as its stalest side),
+// Revalidated if any side had to, AgeMS the oldest of them (the result is
+// only as fresh as its stalest input).
+type freshnessSummary struct {
+	CacheHit    bool
+	Revalidated bool
+	AgeMS       int64
+}
+
+func summarizeFreshness(sources map[string]connector.Source) freshnessSummary {
+	var sum freshnessSummary
+	first := true
+	for _, src := range sources {
+		fs, ok := src.(*freshness.Source)
+		if !ok {
+			continue
+		}
+		if first {
+			sum.CacheHit = fs.CacheHit
+			first = false
+		} else {
+			sum.CacheHit = sum.CacheHit && fs.CacheHit
+		}
+		sum.Revalidated = sum.Revalidated || fs.Revalidated
+		if fs.AgeMS > sum.AgeMS {
+			sum.AgeMS = fs.AgeMS
+		}
+	}
+	return sum
 }
 
 // parseMaxStaleness turns the request's max_staleness (e.g. "60s") into a
@@ -252,7 +296,7 @@ func connectorPrefix(table string) string {
 	return table
 }
 
-func resultOutcome(result *exec.Result, fresh *freshness.Source) outcome {
+func resultOutcome(result *exec.Result, fresh freshnessSummary) outcome {
 	rows := make([][]any, len(result.Rows))
 	for i, row := range result.Rows {
 		vals := make([]any, len(result.Columns))
@@ -263,8 +307,13 @@ func resultOutcome(result *exec.Result, fresh *freshness.Source) outcome {
 	}
 
 	var meta *Meta
-	if fresh.CacheHit || fresh.Revalidated {
-		meta = &Meta{CacheHit: fresh.CacheHit, Revalidated: fresh.Revalidated}
+	if fresh.CacheHit || fresh.Revalidated || result.JoinStrategy != "" {
+		meta = &Meta{
+			CacheHit:          fresh.CacheHit,
+			Revalidated:       fresh.Revalidated,
+			JoinStrategy:      result.JoinStrategy,
+			NaiveCallEstimate: result.NaiveCallEstimate,
+		}
 	}
 
 	freshnessMS := fresh.AgeMS

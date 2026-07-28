@@ -17,14 +17,18 @@ type Row map[string]string
 // FetchRequest is what exec asks a Source for: Columns is the
 // over-projected required-columns set computed at plan time (Scan.Project
 // - see plan.Build), and Filters is every predicate that was pushed down
-// for the source to apply itself. ETag is optional: set it to make the
-// request conditional (If-None-Match), which the freshness cache (Cycle 9,
-// ADR-005) uses to revalidate a stale entry without re-fetching unchanged
-// data.
+// for the source to apply itself. A single-value equality filter is a
+// one-element slice; the semi-join rewrite (Cycle 10, ADR-007) needs the
+// same field to carry a build-side key chunk as an IN-list, which is why
+// this is map[string][]string rather than map[string]string - one type for
+// both shapes rather than a second field only one join side ever uses.
+// ETag is optional: set it to make the request conditional
+// (If-None-Match), which the freshness cache (Cycle 9, ADR-005) uses to
+// revalidate a stale entry without re-fetching unchanged data.
 type FetchRequest struct {
 	Table   string
 	Columns []string
-	Filters map[string]string
+	Filters map[string][]string
 	ETag    string
 }
 

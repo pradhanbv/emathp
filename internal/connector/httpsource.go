@@ -57,8 +57,10 @@ func (s *HTTPSource) fetchPage(ctx context.Context, req FetchRequest, offset int
 	if len(req.Columns) > 0 {
 		q.Set("fields", strings.Join(req.Columns, ","))
 	}
-	for col, val := range req.Filters {
-		q.Set(col, val)
+	for col, vals := range req.Filters {
+		for _, v := range vals {
+			q.Add(col, v)
+		}
 	}
 	q.Set("offset", strconv.Itoa(offset))
 

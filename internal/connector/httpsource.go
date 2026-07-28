@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/pradhanbv/emathp/internal/obs"
 )
 
 // HTTPSource is a connector.Source backed by a real HTTP mock (mocksf,
@@ -72,6 +74,9 @@ func (s *HTTPSource) fetchPage(ctx context.Context, req FetchRequest, offset int
 	}
 	if offset == 0 && req.ETag != "" {
 		httpReq.Header.Set("If-None-Match", req.ETag)
+	}
+	if traceID := obs.TraceIDFrom(ctx); traceID != "" {
+		httpReq.Header.Set("X-Trace-Id", traceID)
 	}
 
 	resp, err := s.client().Do(httpReq)

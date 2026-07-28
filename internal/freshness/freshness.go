@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pradhanbv/emathp/internal/connector"
+	"github.com/pradhanbv/emathp/internal/obs"
 	"github.com/pradhanbv/emathp/internal/ratelimit"
 )
 
@@ -78,7 +79,7 @@ func (s *Source) Fetch(ctx context.Context, req connector.FetchRequest) ([]conne
 		if !s.RateLimit.Allow(s.Connector) {
 			return nil, connector.FetchMeta{}, &ratelimit.ExhaustedError{Connector: s.Connector}
 		}
-		return s.Inner.Fetch(ctx, req)
+		return s.timedFetch(ctx, req)
 	}
 
 	key := cacheKey(req)
@@ -102,7 +103,7 @@ func (s *Source) Fetch(ctx context.Context, req connector.FetchRequest) ([]conne
 		return nil, connector.FetchMeta{}, &ratelimit.ExhaustedError{Connector: s.Connector}
 	}
 
-	rows, meta, err := s.Inner.Fetch(ctx, req)
+	rows, meta, err := s.timedFetch(ctx, req)
 	if err != nil {
 		return nil, connector.FetchMeta{}, err
 	}
@@ -122,6 +123,16 @@ func (s *Source) Fetch(ctx context.Context, req connector.FetchRequest) ([]conne
 	s.Cache.entries[key] = &entry{rows: rows, etag: meta.ETag, fetchedAt: now}
 	s.Cache.mu.Unlock()
 	return rows, connector.FetchMeta{}, nil
+}
+
+// timedFetch calls Inner.Fetch and records connector_request_duration_seconds
+// regardless of outcome - a timeout or a connector error is still a request
+// that took time, and is exactly the case observability needs to surface.
+func (s *Source) timedFetch(ctx context.Context, req connector.FetchRequest) ([]connector.Row, connector.FetchMeta, error) {
+	start := time.Now()
+	rows, meta, err := s.Inner.Fetch(ctx, req)
+	obs.Observe("connector_request_duration_seconds", map[string]string{"connector": s.Connector}, time.Since(start).Seconds())
+	return rows, meta, err
 }
 
 // cacheKey signs an outbound fetch by table, requested columns, and bound

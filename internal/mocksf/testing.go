@@ -14,6 +14,8 @@ type TestServer struct {
 
 func (ts *TestServer) CallCount() int { return ts.mock.CallCount() }
 
+func (ts *TestServer) LastRequest() ReceivedRequest { return ts.mock.LastRequest() }
+
 // Start spins up a mock in-process over real HTTP, closed automatically
 // at test cleanup.
 func Start(t *testing.T, opts ...Option) *TestServer {

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,9 @@ type Server struct {
 	delay     time.Duration
 	etag      string
 	callCount atomic.Int64
+
+	mu         sync.Mutex
+	lastHeader http.Header
 }
 
 type Option func(*Server)
@@ -104,6 +108,23 @@ func New(opts ...Option) *Server {
 
 func (s *Server) CallCount() int { return int(s.callCount.Load()) }
 
+// ReceivedRequest is the headers-only snapshot LastRequest returns - a
+// full *http.Request isn't safe to retain past the handler that received
+// it, and every test that needs this only ever wants a header value.
+type ReceivedRequest struct {
+	Header http.Header
+}
+
+// LastRequest returns the most recently received request's headers - zero
+// value if no request has arrived yet. Used to prove trace ID propagation
+// (Cycle 12): the gateway's outbound X-Trace-Id should match the trace_id
+// it handed back to its own caller.
+func (s *Server) LastRequest() ReceivedRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return ReceivedRequest{Header: s.lastHeader}
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{table}", s.handleTable)
@@ -112,6 +133,10 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	s.callCount.Add(1)
+
+	s.mu.Lock()
+	s.lastHeader = r.Header.Clone()
+	s.mu.Unlock()
 
 	if s.delay > 0 {
 		time.Sleep(s.delay)

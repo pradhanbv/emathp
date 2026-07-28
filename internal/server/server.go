@@ -28,6 +28,7 @@ import (
 	"github.com/pradhanbv/emathp/internal/exec"
 	"github.com/pradhanbv/emathp/internal/freshness"
 	"github.com/pradhanbv/emathp/internal/identity"
+	"github.com/pradhanbv/emathp/internal/obs"
 	"github.com/pradhanbv/emathp/internal/plan"
 	"github.com/pradhanbv/emathp/internal/plancache"
 	"github.com/pradhanbv/emathp/internal/policy"
@@ -73,19 +74,27 @@ type outcome struct {
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	// Every request gets a trace id up front, before anything can fail -
+	// even a BAD_REQUEST response should be traceable. Carried via context
+	// (Cycle 12) rather than threaded through every function signature, so
+	// it can reach the connector SDK's outbound HTTP request without every
+	// intermediate call needing to know about tracing.
+	traceID := obs.NewTraceID()
+	ctx := obs.WithTraceID(r.Context(), traceID)
+
 	var req QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeOutcome(w, errorOutcome(http.StatusBadRequest, "BAD_REQUEST", err.Error()))
+		writeOutcome(w, errorOutcome(traceID, http.StatusBadRequest, "BAD_REQUEST", err.Error()))
 		return
 	}
 
 	principal, err := identity.ResolveFromHeader(r.Header.Get("Authorization"), s.deps.Identity)
 	if err != nil {
-		writeOutcome(w, errorOutcome(http.StatusServiceUnavailable, "PRINCIPAL_UNRESOLVED", err.Error()))
+		writeOutcome(w, errorOutcome(traceID, http.StatusServiceUnavailable, "PRINCIPAL_UNRESOLVED", err.Error()))
 		return
 	}
 	if len(principal.Roles) == 0 {
-		writeOutcome(w, errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", "principal has no roles"))
+		writeOutcome(w, errorOutcome(traceID, http.StatusForbidden, "ENTITLEMENT_DENIED", "principal has no roles"))
 		return
 	}
 	// v1 simplification: fixtures only ever produce one role per
@@ -94,24 +103,24 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	role := principal.Roles[0]
 
 	if r.Header.Get("Accept") == "application/x-ndjson" {
-		s.runStream(w, r.Context(), req, principal, role)
+		s.runStream(w, ctx, req, principal, role)
 		return
 	}
 
 	if r.Header.Get("Prefer") == "respond-async" {
-		id := s.startAsync(req, principal, role)
+		id := s.startAsync(ctx, req, principal, role)
 		writeOutcome(w, outcome{
 			Status: http.StatusAccepted,
 			Body: QueryResponse{
 				RateLimitStatus: map[string]string{},
-				TraceID:         "trace-stub",
+				TraceID:         traceID,
 				PollURL:         "/v1/jobs/" + id,
 			},
 		})
 		return
 	}
 
-	writeOutcome(w, s.run(r.Context(), req, principal, role))
+	writeOutcome(w, s.run(ctx, req, principal, role))
 }
 
 // errConnectorMissing signals a table's connector prefix has no entry in
@@ -215,10 +224,12 @@ func classifyError(err error, defaultStatus int, defaultCode string) (status int
 // envelope. Shared by the synchronous handler and the async job goroutine
 // so neither path can drift from the other's behaviour.
 func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.Principal, role string) outcome {
+	traceID := obs.TraceIDFrom(ctx)
+
 	p, sources, err := s.buildAndRoute(req, principal, role)
 	if err != nil {
 		status, code := classifyError(err, http.StatusBadRequest, "UNSUPPORTED_PREDICATE")
-		return errorOutcome(status, code, err.Error())
+		return errorOutcome(traceID, status, code, err.Error())
 	}
 
 	timeout := parseTimeout(req.Timeout)
@@ -236,14 +247,14 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 		if errors.As(err, &exhausted) {
 			message = fmt.Sprintf("rate limit exhausted for connector %q; retry after the window resets or use Prefer: respond-async", exhausted.Connector)
 		}
-		o := errorOutcome(status, code, message)
+		o := errorOutcome(traceID, status, code, message)
 		if code == "RATE_LIMIT_EXHAUSTED" {
 			o.Headers = map[string]string{"Retry-After": "1"}
 		}
 		return o
 	}
 
-	return resultOutcome(result, summarizeFreshness(sources))
+	return resultOutcome(traceID, result, summarizeFreshness(sources))
 }
 
 // runStream is buildAndRoute+exec.Run shaped as a single NDJSON terminal
@@ -261,7 +272,7 @@ func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req Query
 		defer cancel()
 	}
 
-	frame := Frame{IsTerminal: true, TraceID: "trace-stub"}
+	frame := Frame{IsTerminal: true, TraceID: obs.TraceIDFrom(ctx)}
 
 	p, sources, err := s.buildAndRoute(req, principal, role)
 	if err == nil {
@@ -365,16 +376,21 @@ type asyncJob struct {
 
 var jobSeq atomic.Int64
 
-func (s *Server) startAsync(req QueryRequest, principal identity.Principal, role string) string {
+func (s *Server) startAsync(ctx context.Context, req QueryRequest, principal identity.Principal, role string) string {
 	id := fmt.Sprintf("job-%d", jobSeq.Add(1))
 	job := &asyncJob{}
 	s.jobs.Store(id, job)
 
+	// The background goroutine gets a fresh Background() context, detached
+	// from the originating request's cancellation - a real system would
+	// use a bounded background context with its own timeout budget
+	// (ADR-009); this MVP just runs to completion. The trace id travels
+	// forward regardless, since it's a value carried by the context, not
+	// tied to the request's lifetime the way cancellation is.
+	bgCtx := obs.WithTraceID(context.Background(), obs.TraceIDFrom(ctx))
+
 	go func() {
-		// Detached from the originating request's context - a real
-		// system would use a bounded background context with its own
-		// timeout budget (ADR-009); this MVP just runs to completion.
-		o := s.run(context.Background(), req, principal, role)
+		o := s.run(bgCtx, req, principal, role)
 		job.mu.Lock()
 		job.done = true
 		job.out = o
@@ -425,7 +441,7 @@ func rowsToAny(columns []string, rows []map[string]string) [][]any {
 	return out
 }
 
-func resultOutcome(result *exec.Result, fresh freshnessSummary) outcome {
+func resultOutcome(traceID string, result *exec.Result, fresh freshnessSummary) outcome {
 	rows := rowsToAny(result.Columns, result.Rows)
 
 	var meta *Meta
@@ -446,18 +462,18 @@ func resultOutcome(result *exec.Result, fresh freshnessSummary) outcome {
 			Rows:            rows,
 			FreshnessMS:     &freshnessMS,
 			RateLimitStatus: map[string]string{"sf": "ok"},
-			TraceID:         "trace-stub",
+			TraceID:         traceID,
 			Meta:            meta,
 		},
 	}
 }
 
-func errorOutcome(status int, code, message string) outcome {
+func errorOutcome(traceID string, status int, code, message string) outcome {
 	return outcome{
 		Status: status,
 		Body: QueryResponse{
 			RateLimitStatus: map[string]string{},
-			TraceID:         "trace-stub",
+			TraceID:         traceID,
 			Error:           &ErrorBody{Code: code, Message: message},
 		},
 	}

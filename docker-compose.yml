@@ -1,7 +1,8 @@
-# Three profiles, three commands (see README):
+# Four profiles, four commands (see README):
 #   docker compose --profile core --profile mocks up -d
 #   go test ./...
 #   docker compose --profile testing run k6
+#   docker compose --profile core --profile mocks --profile observability up -d
 # Not TDD'd (IMPLEMENTATION_PLAN.md ground rule 4) - compose wiring is
 # infrastructure, not behavior a test proves.
 services:
@@ -30,7 +31,11 @@ services:
     profiles: ["core"]
     ports:
       - "8080:8080"
-    command: ["--sf-url", "http://mocksf:8081", "--zd-url", "http://mockzd:8082"]
+    # --otlp-endpoint always points at jaeger, even when the observability
+    # profile isn't running - the exporter connects lazily (see
+    # obs.InitTracing), so an absent jaeger just means periodic background
+    # export-failure log lines, never a startup failure or blocked request.
+    command: ["--sf-url", "http://mocksf:8081", "--zd-url", "http://mockzd:8082", "--otlp-endpoint", "jaeger:4318"]
 
   k6:
     image: grafana/k6:latest
@@ -38,3 +43,26 @@ services:
     volumes:
       - ./k6:/scripts:ro
     entrypoint: ["k6", "run", "-e", "BASE_URL=http://gateway:8080", "/scripts/load.js"]
+
+  # Jaeger's all-in-one image accepts OTLP/HTTP directly (port 4318) and
+  # serves the trace UI on 16686 - no separate OTel Collector needed for a
+  # single gateway instance.
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    profiles: ["observability"]
+    ports:
+      - "16686:16686" # UI - open this and search by trace_id
+      - "4318:4318"   # OTLP/HTTP receiver
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  # Scrapes the gateway's real /metrics endpoint (internal/server.go) -
+  # visit http://localhost:9090/graph and query
+  # connector_request_duration_seconds.
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["observability"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro

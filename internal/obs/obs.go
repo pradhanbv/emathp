@@ -1,15 +1,12 @@
-// Package obs holds the metrics this prototype's security claims depend
-// on being observable, plus trace ID propagation (Cycle 12). A minimal
-// in-memory counter/registry stands in for real Prometheus instrumentation
-// and OpenTelemetry context propagation; the metric identity and semantics
-// (what must stay zero, what's expected to move, what should show up on
-// the far side of a connector call) are real now.
+// Package obs holds the metrics this prototype's security claims depend on
+// being observable (this file), the real Prometheus histogram GET /metrics
+// exposes (prometheus.go), and trace context propagation (tracing.go). The
+// in-memory counter/registry below stands in for a full metrics backend
+// where no test needs bucketed histograms - just "was a sample recorded,
+// under this name and label set."
 package obs
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -95,31 +92,4 @@ func metricKey(name string, labels map[string]string) string {
 		fmt.Fprintf(&b, ",%s=%s", k, labels[k])
 	}
 	return b.String()
-}
-
-// traceIDKey is an unexported context key type so obs's trace ID can't
-// collide with another package's context value.
-type traceIDKey struct{}
-
-// WithTraceID attaches id to ctx - called once, at the HTTP boundary,
-// before the request pipeline starts, so every downstream call (exec, the
-// connector SDK) can recover the same id without threading it through
-// every function signature.
-func WithTraceID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, traceIDKey{}, id)
-}
-
-// TraceIDFrom recovers the trace id WithTraceID attached, or "" if none
-// was ever attached (e.g. a unit test calling a connector directly).
-func TraceIDFrom(ctx context.Context) string {
-	id, _ := ctx.Value(traceIDKey{}).(string)
-	return id
-}
-
-// NewTraceID generates a fresh id - random, not a request counter, so
-// trace ids don't leak how many requests a process has handled.
-func NewTraceID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
 }

@@ -13,6 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/pradhanbv/emathp/internal/connector"
 	"github.com/pradhanbv/emathp/internal/obs"
 	"github.com/pradhanbv/emathp/internal/ratelimit"
@@ -125,13 +128,32 @@ func (s *Source) Fetch(ctx context.Context, req connector.FetchRequest) ([]conne
 	return rows, connector.FetchMeta{}, nil
 }
 
-// timedFetch calls Inner.Fetch and records connector_request_duration_seconds
-// regardless of outcome - a timeout or a connector error is still a request
-// that took time, and is exactly the case observability needs to surface.
+// timedFetch calls Inner.Fetch inside its own "connector.fetch" span - the
+// child span a trace viewer renders as the time spent waiting on the
+// connector, separate from the gateway's own planning/policy work - and
+// records connector_request_duration_seconds regardless of outcome: a
+// timeout or a connector error is still a request that took time, and is
+// exactly the case observability needs to surface.
 func (s *Source) timedFetch(ctx context.Context, req connector.FetchRequest) ([]connector.Row, connector.FetchMeta, error) {
+	ctx, span := obs.Tracer.Start(ctx, "connector.fetch", trace.WithAttributes(
+		attribute.String("connector", s.Connector),
+		attribute.String("table", req.Table),
+	))
+	defer span.End()
+
 	start := time.Now()
 	rows, meta, err := s.Inner.Fetch(ctx, req)
-	obs.Observe("connector_request_duration_seconds", map[string]string{"connector": s.Connector}, time.Since(start).Seconds())
+	elapsed := time.Since(start)
+
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+		span.RecordError(err)
+	}
+
+	obs.Observe("connector_request_duration_seconds", map[string]string{"connector": s.Connector}, elapsed.Seconds())
+	obs.ConnectorRequestDuration.WithLabelValues(s.Connector, outcome).Observe(elapsed.Seconds())
+
 	return rows, meta, err
 }
 

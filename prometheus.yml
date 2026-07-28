@@ -1,0 +1,9 @@
+# Scrape config for the `prometheus` compose service (observability
+# profile) - polls the gateway's real GET /metrics endpoint.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: gateway
+    static_configs:
+      - targets: ["gateway:8080"]

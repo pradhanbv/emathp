@@ -23,6 +23,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/pradhanbv/emathp/internal/catalog"
 	"github.com/pradhanbv/emathp/internal/connector"
 	"github.com/pradhanbv/emathp/internal/exec"
@@ -60,6 +64,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/query", s.handleQuery)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.handlePoll)
+	mux.Handle("GET /metrics", promhttp.Handler())
 	return mux
 }
 
@@ -74,26 +79,38 @@ type outcome struct {
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
-	// Every request gets a trace id up front, before anything can fail -
-	// even a BAD_REQUEST response should be traceable. Carried via context
-	// (Cycle 12) rather than threaded through every function signature, so
-	// it can reach the connector SDK's outbound HTTP request without every
-	// intermediate call needing to know about tracing.
-	traceID := obs.NewTraceID()
-	ctx := obs.WithTraceID(r.Context(), traceID)
+	// Every request gets a real span up front, before anything can fail -
+	// even a BAD_REQUEST response should be traceable, and its trace id is
+	// the response's trace_id. This is the ONE "gateway.query" span for
+	// the whole request - run()/runStream() don't start their own, they
+	// just use this ctx, so every child span (connector.fetch, deep inside
+	// exec) nests under a span that genuinely exists. Earlier versions of
+	// this minted a synthetic, never-recorded "parent" id so the trace id
+	// was known before any span existed; Jaeger (rightly) flagged that
+	// parent as invalid, because from its perspective it was - the id
+	// existed nowhere. A real span, ended on every exit path (including
+	// handed off to the async goroutine below, which ends it when the
+	// query actually finishes), doesn't have that problem.
+	ctx, span := obs.Tracer.Start(r.Context(), "gateway.query")
+	traceID := span.SpanContext().TraceID().String()
 
 	var req QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		span.RecordError(err)
+		span.End()
 		writeOutcome(w, errorOutcome(traceID, http.StatusBadRequest, "BAD_REQUEST", err.Error()))
 		return
 	}
 
 	principal, err := identity.ResolveFromHeader(r.Header.Get("Authorization"), s.deps.Identity)
 	if err != nil {
+		span.RecordError(err)
+		span.End()
 		writeOutcome(w, errorOutcome(traceID, http.StatusServiceUnavailable, "PRINCIPAL_UNRESOLVED", err.Error()))
 		return
 	}
 	if len(principal.Roles) == 0 {
+		span.End()
 		writeOutcome(w, errorOutcome(traceID, http.StatusForbidden, "ENTITLEMENT_DENIED", "principal has no roles"))
 		return
 	}
@@ -101,13 +118,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// principal. Multi-role composition (union of grants, most
 	// restrictive mask wins, etc.) is unmodeled.
 	role := principal.Roles[0]
-
-	if r.Header.Get("Accept") == "application/x-ndjson" {
-		s.runStream(w, ctx, req, principal, role)
-		return
-	}
+	span.SetAttributes(attribute.String("tenant", principal.Tenant), attribute.String("role", role))
 
 	if r.Header.Get("Prefer") == "respond-async" {
+		// startAsync's goroutine takes ownership of ending this span, once
+		// the query it's about to run actually finishes - not here, where
+		// the query hasn't started yet.
 		id := s.startAsync(ctx, req, principal, role)
 		writeOutcome(w, outcome{
 			Status: http.StatusAccepted,
@@ -117,6 +133,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				PollURL:         "/v1/jobs/" + id,
 			},
 		})
+		return
+	}
+	defer span.End()
+
+	if r.Header.Get("Accept") == "application/x-ndjson" {
+		s.runStream(w, ctx, req, principal, role)
 		return
 	}
 
@@ -233,13 +255,18 @@ func classifyError(err error, defaultStatus int, defaultCode string) (status int
 
 // run executes the full pipeline and shapes the result as the plain JSON
 // envelope. Shared by the synchronous handler and the async job goroutine
-// so neither path can drift from the other's behaviour.
+// so neither path can drift from the other's behaviour. Both callers
+// (handleQuery directly, or startAsync's goroutine) already have a real
+// "gateway.query" span attached to ctx and own ending it - run() just adds
+// to it via the span already in context, rather than starting its own.
 func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.Principal, role string) outcome {
+	span := trace.SpanFromContext(ctx)
 	traceID := obs.TraceIDFrom(ctx)
 
 	p, sources, params, err := s.buildAndRoute(req, principal, role)
 	if err != nil {
 		status, code := classifyError(err, http.StatusBadRequest, "UNSUPPORTED_PREDICATE")
+		span.RecordError(err)
 		return errorOutcome(traceID, status, code, err.Error())
 	}
 
@@ -262,6 +289,7 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 		if code == "RATE_LIMIT_EXHAUSTED" {
 			o.Headers = map[string]string{"Retry-After": "1"}
 		}
+		span.RecordError(err)
 		return o
 	}
 
@@ -276,6 +304,8 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 // classification run() uses, reported in Frame.Error instead of a source
 // name, since it isn't attributable to one connector the way a timeout is.
 func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req QueryRequest, principal identity.Principal, role string) {
+	span := trace.SpanFromContext(ctx)
+
 	timeout := parseTimeout(req.Timeout)
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -297,6 +327,7 @@ func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req Query
 
 	if err != nil {
 		frame.Partial = true
+		span.RecordError(err)
 		var timedOut *exec.SourceTimeoutError
 		if errors.As(err, &timedOut) {
 			frame.Sources = map[string]SourceStatus{timedOut.Connector: {Error: "SOURCE_TIMEOUT"}}
@@ -392,15 +423,21 @@ func (s *Server) startAsync(ctx context.Context, req QueryRequest, principal ide
 	job := &asyncJob{}
 	s.jobs.Store(id, job)
 
+	// span is the real "gateway.query" span handleQuery started - this
+	// goroutine, not handleQuery, ends it, since the query it measures
+	// hasn't run yet at the point handleQuery returns 202.
+	span := trace.SpanFromContext(ctx)
+
 	// The background goroutine gets a fresh Background() context, detached
 	// from the originating request's cancellation - a real system would
 	// use a bounded background context with its own timeout budget
-	// (ADR-009); this MVP just runs to completion. The trace id travels
-	// forward regardless, since it's a value carried by the context, not
-	// tied to the request's lifetime the way cancellation is.
-	bgCtx := obs.WithTraceID(context.Background(), obs.TraceIDFrom(ctx))
+	// (ADR-009); this MVP just runs to completion. Every span run() causes
+	// (e.g. connector.fetch) still nests under the real span above, via
+	// its trace/span id carried forward - see DetachTraceContext.
+	bgCtx := obs.DetachTraceContext(ctx)
 
 	go func() {
+		defer span.End()
 		o := s.run(bgCtx, req, principal, role)
 		job.mu.Lock()
 		job.done = true

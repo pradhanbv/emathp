@@ -256,11 +256,12 @@ func genRows(n int) []connector.Row {
 			region = "APAC"
 		}
 		rows[i] = connector.Row{
-			"id":     fmt.Sprintf("a%06d", i),
-			"name":   fmt.Sprintf("Account %d", i),
-			"email":  fmt.Sprintf("user%d@example.com", i),
-			"region": region,
-			"status": "open",
+			"id":          fmt.Sprintf("a%06d", i),
+			"name":        fmt.Sprintf("Account %d", i),
+			"email":       fmt.Sprintf("user%d@example.com", i),
+			"region":      region,
+			"status":      "open",
+			"external_id": fmt.Sprintf("ext-%06d", i),
 		}
 	}
 	return rows

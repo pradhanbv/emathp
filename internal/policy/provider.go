@@ -105,3 +105,21 @@ func (p *Provider) MasksFor(role, table string) (Masks, error) {
 	}
 	return out, nil
 }
+
+// ObjectDenied is Layer 1 (DESIGN.md ADR-002): may role touch table at
+// all, checked at admission before planning even starts. Source ACLs
+// can't express this - they know nothing about our product's surface -
+// so it can't be delegated downward; an unknown role denies by default
+// (fail closed) rather than being treated as having no restrictions.
+func (p *Provider) ObjectDenied(role, table string) bool {
+	rp, ok := p.roles[role]
+	if !ok {
+		return true
+	}
+	for _, t := range rp.Objects.Deny {
+		if t == table {
+			return true
+		}
+	}
+	return false
+}

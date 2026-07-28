@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	"github.com/pradhanbv/emathp/internal/connector"
+	"github.com/pradhanbv/emathp/internal/obs"
 	"github.com/pradhanbv/emathp/internal/plan"
 )
 
@@ -54,6 +55,17 @@ func Run(ctx context.Context, p *plan.Plan, source connector.Source) (*Result, e
 		return nil, err
 	}
 
+	// The verification filter (ADR-002): the plan-time invariant only
+	// catches a predicate that never made it into the plan. It can't
+	// catch a connector that declared a predicate ENFORCED and then
+	// ignored it - that plan is perfectly valid, the lie is only visible
+	// in the rows that came back. Re-apply every PUSHED security
+	// predicate locally; any row that fails it means the connector's
+	// real behaviour diverged from its declared capability.
+	if err := verifyPushedSecurityPredicates(rows, filters); err != nil {
+		return nil, err
+	}
+
 	rows = applyLocalFilters(rows, filters)
 
 	outCols := p.OutputColumns()
@@ -87,6 +99,33 @@ func securityPredicateNeedsColumn(filters []*plan.Filter, column string) bool {
 		}
 	}
 	return false
+}
+
+// verifyPushedSecurityPredicates re-checks every security predicate that
+// was pushed to the connector (meaning the catalog declared it ENFORCED).
+// A trustworthy connector drops zero rows on this re-check; any row that
+// fails it means the predicate "appears pushed, does nothing" - the
+// realistic failure isn't vendor dishonesty, it's our own connector
+// sending the wrong query param and the source silently ignoring it.
+func verifyPushedSecurityPredicates(rows []connector.Row, filters []*plan.Filter) error {
+	for _, f := range filters {
+		if f.Pred.Origin != plan.SecurityOrigin || f.Site != plan.Pushed {
+			continue
+		}
+		want := unquote(f.Pred.Value)
+		violations := 0
+		for _, r := range rows {
+			if r[f.Pred.Column] != want {
+				violations++
+			}
+		}
+		if violations > 0 {
+			obs.EnforcedPredicateViolations.Add(int64(violations))
+			return fmt.Errorf("%w: connector declared %q enforced but returned %d row(s) violating it",
+				plan.ErrEntitlementDenied, f.Pred.Column, violations)
+		}
+	}
+	return nil
 }
 
 func applyLocalFilters(rows []connector.Row, filters []*plan.Filter) []connector.Row {

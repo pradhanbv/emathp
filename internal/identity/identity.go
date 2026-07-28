@@ -4,7 +4,10 @@
 // another tenant must not grant access to it.
 package identity
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // claims is the unverified JWT payload shape. tenant_id is deliberately
 // never read into a Principal.Tenant - see Resolve.
@@ -19,9 +22,10 @@ type claims struct {
 }
 
 type Principal struct {
-	Tenant string
-	Sub    string
-	Roles  []string
+	Tenant     string
+	Sub        string
+	Roles      []string
+	Attributes map[string]string
 }
 
 // Resolve derives a Principal from raw unverified claims JSON. Signature
@@ -41,20 +45,43 @@ func Resolve(raw string, registry *Registry) (Principal, error) {
 
 	roles := make([]string, 0, len(c.Groups))
 	seen := make(map[string]bool, len(c.Groups))
+	attrs := make(map[string]string)
 	for _, g := range c.Groups {
 		role, ok := reg.GroupRoles[g]
-		if !ok || seen[role] {
-			continue
+		if ok && !seen[role] {
+			seen[role] = true
+			roles = append(roles, role)
 		}
-		seen[role] = true
-		roles = append(roles, role)
+		// Simplification: attribute provenance is per-group here, not
+		// per-attribute from its authoritative owning system (ADR-011
+		// allows region to come from a CRM, say, rather than the IdP).
+		// Real per-attribute resolution is control-plane infrastructure
+		// this prototype doesn't build; the property worth keeping is
+		// that attributes are resolved server-side, never read from the
+		// token body, same as roles.
+		for k, v := range reg.GroupAttrs[g] {
+			attrs[k] = v
+		}
 	}
 
 	_ = c.TenantID // never read for tenant derivation - see package doc
 
 	return Principal{
-		Tenant: reg.Tenant, // from the verified issuer only
-		Sub:    c.Sub,
-		Roles:  roles,
+		Tenant:     reg.Tenant, // from the verified issuer only
+		Sub:        c.Sub,
+		Roles:      roles,
+		Attributes: attrs,
 	}, nil
+}
+
+// ResolveFromHeader strips the "Bearer " prefix from an Authorization
+// header and resolves the remainder as raw claims. The prototype's tokens
+// are unverified JSON claims, not signed JWTs (see package doc) - this is
+// the seam where real signature verification would slot in.
+func ResolveFromHeader(authHeader string, registry *Registry) (Principal, error) {
+	raw, ok := strings.CutPrefix(authHeader, "Bearer ")
+	if !ok {
+		return Principal{}, ErrPrincipalUnresolved
+	}
+	return Resolve(raw, registry)
 }

@@ -5,7 +5,8 @@ package identity
 // timescales), stubbed here as an in-memory map.
 type IssuerRegistration struct {
 	Tenant     string
-	GroupRoles map[string]string // group ID -> role name
+	GroupRoles map[string]string            // group ID -> role name
+	GroupAttrs map[string]map[string]string // group ID -> resolved attributes (e.g. region)
 }
 
 type Registry struct {

@@ -17,9 +17,9 @@ type Gateway struct {
 	t   *testing.T
 }
 
-func Start(t *testing.T) *Gateway {
+func Start(t *testing.T, deps server.Deps) *Gateway {
 	t.Helper()
-	s := server.New()
+	s := server.New(deps)
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return &Gateway{srv: ts, t: t}

@@ -11,6 +11,7 @@ import (
 	"github.com/pradhanbv/emathp/internal/mocksf"
 	"github.com/pradhanbv/emathp/internal/plancache"
 	"github.com/pradhanbv/emathp/internal/policy"
+	"github.com/pradhanbv/emathp/internal/ratelimit"
 	"github.com/pradhanbv/emathp/internal/server"
 )
 
@@ -42,6 +43,7 @@ func testDepsWithCatalog(t *testing.T, sf *mocksf.TestServer, catalogDir string)
 		Policy:    pol,
 		Identity:  fixtures.IssuerRegistry(),
 		PlanCache: plancache.New(),
+		RateLimit: ratelimit.New(),
 		Sources: map[string]connector.Source{
 			"sf": connector.NewHTTPSource(sf.URL),
 		},

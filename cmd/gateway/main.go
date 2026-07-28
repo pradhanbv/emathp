@@ -10,6 +10,7 @@ import (
 	"github.com/pradhanbv/emathp/internal/identity/fixtures"
 	"github.com/pradhanbv/emathp/internal/plancache"
 	"github.com/pradhanbv/emathp/internal/policy"
+	"github.com/pradhanbv/emathp/internal/ratelimit"
 	"github.com/pradhanbv/emathp/internal/server"
 )
 
@@ -18,6 +19,7 @@ func main() {
 	catalogDir := flag.String("catalog", "testdata/catalog", "catalog fixture directory")
 	policyDir := flag.String("policy", "testdata/policy", "policy fixture directory")
 	sfURL := flag.String("sf-url", "http://localhost:8081", "Salesforce mock connector URL")
+	sfLimit := flag.Int("sf-limit", 0, "sf connector call budget for this process's lifetime (0 = unlimited)")
 	flag.Parse()
 
 	cat, err := catalog.Load(*catalogDir)
@@ -29,6 +31,11 @@ func main() {
 		log.Fatalf("load policy: %v", err)
 	}
 
+	limiter := ratelimit.New()
+	if *sfLimit > 0 {
+		limiter.SetLimit("sf", *sfLimit)
+	}
+
 	// The issuer registry is control-plane state that would come from the
 	// tenant registry in a real deployment; the fixtures package is the
 	// same one the test suite uses (see internal/identity/fixtures).
@@ -37,6 +44,7 @@ func main() {
 		Policy:    pol,
 		Identity:  fixtures.IssuerRegistry(),
 		PlanCache: plancache.New(),
+		RateLimit: limiter,
 		Sources: map[string]connector.Source{
 			"sf": connector.NewHTTPSource(*sfURL),
 		},

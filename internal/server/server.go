@@ -4,14 +4,20 @@
 // inserts the plan cache between policy resolution and Build, and moves
 // $principal.<attr> binding into exec.Run (after the cache lookup, per
 // ADR-003 - a plan shared across principals in the same role must never
-// have another principal's values written into it).
+// have another principal's values written into it). Cycle 8 adds the
+// rate-limit check and the Prefer: respond-async reroute, both built
+// around a single run() that both the sync and async paths call.
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/pradhanbv/emathp/internal/catalog"
 	"github.com/pradhanbv/emathp/internal/connector"
@@ -20,6 +26,7 @@ import (
 	"github.com/pradhanbv/emathp/internal/plan"
 	"github.com/pradhanbv/emathp/internal/plancache"
 	"github.com/pradhanbv/emathp/internal/policy"
+	"github.com/pradhanbv/emathp/internal/ratelimit"
 )
 
 // Deps are the gateway's dependencies, supplied by the caller rather than
@@ -31,11 +38,13 @@ type Deps struct {
 	Policy    *policy.Provider
 	Identity  *identity.Registry
 	PlanCache *plancache.Cache
+	RateLimit *ratelimit.Limiter
 	Sources   map[string]connector.Source // connector prefix (e.g. "sf") -> source
 }
 
 type Server struct {
 	deps Deps
+	jobs sync.Map // jobID string -> *asyncJob
 }
 
 func New(deps Deps) *Server { return &Server{deps: deps} }
@@ -43,23 +52,34 @@ func New(deps Deps) *Server { return &Server{deps: deps} }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/query", s.handleQuery)
+	mux.HandleFunc("GET /v1/jobs/{id}", s.handlePoll)
 	return mux
+}
+
+// outcome is a response envelope plus the HTTP status and any extra
+// headers it needs (Retry-After) - the shape run() produces so the sync
+// and async paths can share it without the async path needing an
+// http.ResponseWriter at all.
+type outcome struct {
+	Status  int
+	Body    QueryResponse
+	Headers map[string]string
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	var req QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "BAD_REQUEST", err.Error())
+		writeOutcome(w, errorOutcome(http.StatusBadRequest, "BAD_REQUEST", err.Error()))
 		return
 	}
 
 	principal, err := identity.ResolveFromHeader(r.Header.Get("Authorization"), s.deps.Identity)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "PRINCIPAL_UNRESOLVED", err.Error())
+		writeOutcome(w, errorOutcome(http.StatusServiceUnavailable, "PRINCIPAL_UNRESOLVED", err.Error()))
 		return
 	}
 	if len(principal.Roles) == 0 {
-		writeError(w, http.StatusForbidden, "ENTITLEMENT_DENIED", "principal has no roles")
+		writeOutcome(w, errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", "principal has no roles"))
 		return
 	}
 	// v1 simplification: fixtures only ever produce one role per
@@ -67,17 +87,37 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// restrictive mask wins, etc.) is unmodeled.
 	role := principal.Roles[0]
 
+	if r.Header.Get("Prefer") == "respond-async" {
+		id := s.startAsync(req, principal, role)
+		writeOutcome(w, outcome{
+			Status: http.StatusAccepted,
+			Body: QueryResponse{
+				RateLimitStatus: map[string]string{},
+				TraceID:         "trace-stub",
+				PollURL:         "/v1/jobs/" + id,
+			},
+		})
+		return
+	}
+
+	writeOutcome(w, s.run(r.Context(), req, principal, role))
+}
+
+// run executes the full pipeline: L1 object authz, plan cache lookup,
+// the fail-closed invariant, the rate-limit reservation, and exec (with
+// its own runtime verification filter). Shared by the synchronous
+// handler and the async job goroutine so neither path can drift from the
+// other's behaviour.
+func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.Principal, role string) outcome {
 	table, err := plan.ParseTable(req.SQL)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "UNSUPPORTED_PREDICATE", err.Error())
-		return
+		return errorOutcome(http.StatusBadRequest, "UNSUPPORTED_PREDICATE", err.Error())
 	}
 
 	// LAYER 1 - object-level authz, ours, pre-plan (ADR-002). Denied
 	// before we ever touch the catalog or build a plan.
 	if s.deps.Policy.ObjectDenied(role, table) {
-		writeError(w, http.StatusForbidden, "ENTITLEMENT_DENIED", "role may not access "+table)
-		return
+		return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", "role may not access "+table)
 	}
 
 	// Plan cache lookup (ADR-003): built fresh on a miss, reused on a hit.
@@ -86,35 +126,91 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// binding happens later, in exec.Run, against a read-only plan.
 	p, _, _, err := plancache.Resolve(s.deps.PlanCache, req.SQL, s.deps.Catalog, s.deps.Policy, principal.Tenant, role)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "UNSUPPORTED_PREDICATE", err.Error())
-		return
+		return errorOutcome(http.StatusBadRequest, "UNSUPPORTED_PREDICATE", err.Error())
 	}
 
 	// LAYER 2's fail-closed check. Runs on every request, including
 	// cache hits (ADR-002) - cheap, and a defence against a corrupted or
 	// tampered cache entry, not just a fresh-build sanity check.
 	if err := plan.AssertInvariant(p); err != nil {
-		writeError(w, http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
-		return
+		return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
 	}
 
-	source, ok := s.deps.Sources[connectorPrefix(table)]
+	connectorName := connectorPrefix(table)
+
+	// Rate limit reservation, after planning succeeds so a query that
+	// would fail for other reasons doesn't spend quota it was never
+	// going to use (matches the sequence in DESIGN.md Section 2.3).
+	if !s.deps.RateLimit.Allow(connectorName) {
+		o := errorOutcome(http.StatusTooManyRequests, "RATE_LIMIT_EXHAUSTED",
+			fmt.Sprintf("rate limit exhausted for connector %q; retry after the window resets or use Prefer: respond-async", connectorName))
+		o.Headers = map[string]string{"Retry-After": "1"}
+		return o
+	}
+
+	source, ok := s.deps.Sources[connectorName]
 	if !ok {
-		writeError(w, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", "no connector configured for "+table)
-		return
+		return errorOutcome(http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", "no connector configured for "+table)
 	}
 
-	result, err := exec.Run(r.Context(), p, source, principal.Attributes)
+	result, err := exec.Run(ctx, p, source, principal.Attributes)
 	if err != nil {
 		if errors.Is(err, plan.ErrEntitlementDenied) {
-			writeError(w, http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
-			return
+			return errorOutcome(http.StatusForbidden, "ENTITLEMENT_DENIED", err.Error())
 		}
-		writeError(w, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", err.Error())
+		return errorOutcome(http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", err.Error())
+	}
+
+	return resultOutcome(result)
+}
+
+// asyncJob is the in-memory record behind Prefer: respond-async. Not a
+// real job queue - no persistence, no retry, no cross-pod visibility -
+// the rubric point is the reroute path existing, per IMPLEMENTATION_PLAN.
+type asyncJob struct {
+	mu   sync.Mutex
+	done bool
+	out  outcome
+}
+
+var jobSeq atomic.Int64
+
+func (s *Server) startAsync(req QueryRequest, principal identity.Principal, role string) string {
+	id := fmt.Sprintf("job-%d", jobSeq.Add(1))
+	job := &asyncJob{}
+	s.jobs.Store(id, job)
+
+	go func() {
+		// Detached from the originating request's context - a real
+		// system would use a bounded background context with its own
+		// timeout budget (ADR-009); this MVP just runs to completion.
+		o := s.run(context.Background(), req, principal, role)
+		job.mu.Lock()
+		job.done = true
+		job.out = o
+		job.mu.Unlock()
+	}()
+
+	return id
+}
+
+func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
+	v, ok := s.jobs.Load(r.PathValue("id"))
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	writeResult(w, result)
+	job := v.(*asyncJob)
+	job.mu.Lock()
+	status := JobStatus{Done: job.done}
+	if job.done {
+		status.Result = &job.out.Body
+	}
+	job.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 func connectorPrefix(table string) string {
@@ -124,7 +220,7 @@ func connectorPrefix(table string) string {
 	return table
 }
 
-func writeResult(w http.ResponseWriter, result *exec.Result) {
+func resultOutcome(result *exec.Result) outcome {
 	rows := make([][]any, len(result.Rows))
 	for i, row := range result.Rows {
 		vals := make([]any, len(result.Columns))
@@ -135,25 +231,34 @@ func writeResult(w http.ResponseWriter, result *exec.Result) {
 	}
 
 	freshness := int64(0)
-	resp := QueryResponse{
-		Columns:         result.Columns,
-		Rows:            rows,
-		FreshnessMS:     &freshness,
-		RateLimitStatus: map[string]string{"sf": "ok"},
-		TraceID:         "trace-stub",
+	return outcome{
+		Status: http.StatusOK,
+		Body: QueryResponse{
+			Columns:         result.Columns,
+			Rows:            rows,
+			FreshnessMS:     &freshness,
+			RateLimitStatus: map[string]string{"sf": "ok"},
+			TraceID:         "trace-stub",
+		},
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func writeError(w http.ResponseWriter, status int, code, message string) {
-	resp := QueryResponse{
-		RateLimitStatus: map[string]string{},
-		TraceID:         "trace-stub",
-		Error:           &ErrorBody{Code: code, Message: message},
+func errorOutcome(status int, code, message string) outcome {
+	return outcome{
+		Status: status,
+		Body: QueryResponse{
+			RateLimitStatus: map[string]string{},
+			TraceID:         "trace-stub",
+			Error:           &ErrorBody{Code: code, Message: message},
+		},
+	}
+}
+
+func writeOutcome(w http.ResponseWriter, o outcome) {
+	for k, v := range o.Headers {
+		w.Header().Set(k, v)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(resp)
+	w.WriteHeader(o.Status)
+	_ = json.NewEncoder(w).Encode(o.Body)
 }

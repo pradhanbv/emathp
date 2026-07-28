@@ -5,6 +5,7 @@ package harness
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -64,4 +65,47 @@ func (g *Gateway) POST(path, body string, opts ...ReqOption) *Response {
 	_ = json.NewDecoder(resp.Body).Decode(&qr)
 
 	return &Response{Code: resp.StatusCode, Body: qr, Header: resp.Header}
+}
+
+// Query is the common-case convenience over POST: build the JSON body
+// from sql, attach persona's token.
+func (g *Gateway) Query(persona, sql string, opts ...ReqOption) *Response {
+	body := fmt.Sprintf(`{"sql":%q}`, sql)
+	allOpts := append([]ReqOption{Token(persona)}, opts...)
+	return g.POST("/v1/query", body, allOpts...)
+}
+
+// QueryWithHeader is Query plus one extra request header - e.g.
+// Prefer: respond-async.
+func (g *Gateway) QueryWithHeader(persona, sql, header, value string) *Response {
+	return g.Query(persona, sql, func(r *http.Request) {
+		r.Header.Set(header, value)
+	})
+}
+
+// PollResult is the /v1/jobs/{id} response an async query's PollURL
+// resolves to.
+type PollResult struct {
+	Code int
+	Done bool
+	Body server.QueryResponse
+}
+
+func (g *Gateway) Poll(path string) *PollResult {
+	g.t.Helper()
+
+	resp, err := http.Get(g.srv.URL + path)
+	if err != nil {
+		g.t.Fatalf("poll %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+
+	var status server.JobStatus
+	_ = json.NewDecoder(resp.Body).Decode(&status)
+
+	pr := &PollResult{Code: resp.StatusCode, Done: status.Done}
+	if status.Result != nil {
+		pr.Body = *status.Result
+	}
+	return pr
 }

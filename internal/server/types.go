@@ -17,6 +17,15 @@ type QueryResponse struct {
 	TraceID         string            `json:"trace_id"`
 	Meta            *Meta             `json:"meta,omitempty"`
 	Error           *ErrorBody        `json:"error,omitempty"`
+	PollURL         string            `json:"poll_url,omitempty"`
+}
+
+// JobStatus is the /v1/jobs/{id} poll response for an async query
+// (Prefer: respond-async). Async here is an in-memory map, not a real job
+// queue - the rubric point is the reroute path existing.
+type JobStatus struct {
+	Done   bool           `json:"done"`
+	Result *QueryResponse `json:"result,omitempty"`
 }
 
 type Meta struct {

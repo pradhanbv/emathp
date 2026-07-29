@@ -789,7 +789,19 @@ per-user delegated auth - both load-bearing here (ADR-002, Section 5).
 **Why not build everything.** 1,000 connectors against unversioned vendor APIs is not a
 six-month program - it is the whole company.
 
+**Deployment and versioning.** The Connector SDK is a wire contract (gRPC, or the plain
+HTTP+JSON shape the prototype's `HTTPSource` already speaks to its mocks), not a compiled-in
+language interface - a connector is its own deployable service, in whichever language fits,
+registered in the control-plane catalog. This is what makes "connectors are versioned" and fast
+onboarding (both required) actually true: a new or updated connector never requires rebuilding
+the gateway, and the promotion gate - the connector conformance suite, run against the deployed
+service through its public contract - is the same regardless of who authored the connector.
+
 **Consequences we accept.**
+- The wire-protocol boundary adds a network hop per connector call, a control-plane registry
+ tracking connector versions, and a per-connector deploy pipeline instead of one gateway
+ release train - real operational surface, accepted because it's what makes independent
+ connector onboarding and versioning possible at all.
 - Two connector tiers with different capability ceilings, visible in admin UX and in the
  catalog. Long-tail connectors advertise fewer `ENFORCED` predicates and therefore do
  more residual local filtering and have looser SLOs.
@@ -797,8 +809,11 @@ six-month program - it is the whole company.
  SDK boundary, which makes replacement possible - not free.
 - Per-connector cost accounting must span both tiers for the cost guardrails in Section 8.
 
-**Revisit if.** Vendor per-call pricing exceeds build cost at our volume; >25% of tenant
-queries hit long-tail connectors and suffer for it.
+**Revisit if.**
+- Vendor per-call pricing exceeds build cost at our volume; >25% of tenant queries hit
+ long-tail connectors and suffer for it.
+- Connector count and update cadence stay low enough (near the ~10-20 build tier) that the
+ RPC boundary is overhead without payoff - a compiled-in registration would be simpler.
 
 ---
 

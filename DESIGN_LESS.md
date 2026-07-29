@@ -484,13 +484,22 @@ and watermark support determine whether we hit SLOs at all - Salesforce, Zendesk
 GitHub, Google Workspace, Slack, Notion. **Buy** the long tail via a unified-API vendor behind
 our own Connector SDK interface, so the vendor is an implementation detail of one `Connector`.
 
-**Consequences we accept.** Two connector tiers with different capability ceilings, visible in
-admin UX and the catalog - long-tail connectors advertise fewer `ENFORCED` predicates and do
-more residual local filtering, with looser SLOs. Vendor pricing/limits/outages become ours,
-mitigated (not eliminated) by the SDK boundary.
+**Deployment and versioning.** The Connector SDK is a wire contract (gRPC or plain HTTP+JSON),
+not a compiled-in language interface - a connector is its own deployable service, in whichever
+language fits, registered in the control-plane catalog. That's what makes "connectors are
+versioned" and fast onboarding real: no gateway rebuild per connector, and the same conformance
+suite gates promotion regardless of who authored it.
+
+**Consequences we accept.** The wire-protocol boundary adds a network hop per call, a version
+registry, and a per-connector deploy pipeline instead of one release train - accepted because
+it's what makes independent onboarding and versioning possible. Two connector tiers with
+different capability ceilings, visible in admin UX and the catalog - long-tail connectors
+advertise fewer `ENFORCED` predicates and do more residual local filtering, with looser SLOs.
+Vendor pricing/limits/outages become ours, mitigated (not eliminated) by the SDK boundary.
 
 **Revisit if.** Vendor per-call pricing exceeds build cost at our volume; >25% of tenant
-queries hit long-tail connectors and suffer for it.
+queries hit long-tail connectors and suffer for it; connector count and update cadence stay
+low enough (near the ~10-20 build tier) that the RPC boundary is overhead without payoff.
 
 ---
 

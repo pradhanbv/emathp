@@ -32,14 +32,18 @@ reference material you can skip.
 6. `DESIGN.md` Section 12 - what I'm least sure of, and what would change my mind
 7. [The afterthought](#afterthought-the-conformance-gate-is-provenance-blind) below - what
    building it surfaced that the design hadn't anticipated, and where I'd take it next
+8. [Quickstart](#quickstart) below - stop reading and run it: the stack, the RLS/masking demo,
+   and every other claim reproducible in
+   [Recreate every claim yourself](#recreate-every-claim-yourself)
 
 ---
 
 ## MVP status at a glance
 
-The two tables below, as a picture. Same eleven ADRs, grouped by how real the prototype's
-version of each decision is - not by ADR number, since "partial" hides very different kinds
-of partial.
+The [Decision register](#decision-register) and
+[Deliberate divergences from DESIGN.md](#deliberate-divergences-from-designmd) tables below, as
+a picture. Same eleven ADRs, grouped by how real the prototype's version of each decision is -
+not by ADR number, since "partial" hides very different kinds of partial.
 
 ```mermaid
 flowchart TB
@@ -103,45 +107,30 @@ Section 12, item 5.
 
 ## Afterthought: the conformance gate is provenance-blind
 
-Not a claim the prototype set out to test, but the clearest thing building it surfaced.
-`TestLyingConnectorFailsClosed` never asks *who wrote the connector*. It asks whether the rows
-that came back still satisfy the predicate we believed we pushed. A connector fails that check
-identically whether a human wrote it, a vendor shipped it, or a code generator emitted it.
-ADR-002 states this as a principle - capabilities are "claims *we* make about a connector and
-prove with conformance tests, never values a connector self-reports" - but implementing it is
-what makes the consequence concrete: **the connector's author is not a variable the safety
-argument depends on.**
+ADR-004 rejects building everything ("1,000 connectors against unversioned vendor APIs is not
+a six-month program") and rejects buying everything (unified-API vendors normalize away
+per-field pushdown and per-user delegated auth). An LLM drafting connectors against our own
+Connector SDK interface is a third option that could close that gap - the same 1,000+ app types,
+each speaking its own dialect (SOQL, GraphQL, REST, Elasticsearch DSL...), is exactly the
+translation-and-volume problem generation is suited to. It isn't disqualified on trust grounds:
+`TestLyingConnectorFailsClosed` proves the conformance gate never asks *who* wrote a connector,
+only whether it behaves - a generated one fails that check identically to a human-written one.
+I'd extend the THP brief with three concrete places to try it, in the order I'd attempt them:
 
-That reframes ADR-004. If the gate doesn't care about provenance, "build vs. buy" is missing a
-third option - a fine-tuned model drafting connectors against the Connector SDK, promoted only
-on passing the same suite. It competes with *buy*, not build, and on buy's specific weakness:
-unified-API vendors normalize away per-field pushdown and per-user delegated auth, the two
-properties ADR-002 and Section 5 lean on hardest. Three places it would fit, in the order I'd
-try them:
+1. **Capability discovery** - draft the `ENFORCED`/`ADVISORY` map from whatever documentation
+   exists - an OpenAPI spec in the tidy case, prose docs and business-workflow descriptions in
+   the more common one. Declarative output, not code, validated by the gate that already exists.
+   `testdata/catalog/sf.accounts.json` is a handful of hand-written lines for one table; the
+   authoring cost at n=1,000 connectors is visible from n=2.
+2. **Schema-drift triage** - diff spec versions, classify breaking vs. additive, draft the patch.
+   Attacks the cost ADR-004 calls decisive: "schema drift alone would consume the team."
+3. **Request translation** - plan -> SOQL/GraphQL/REST/ES DSL, placed *after* policy injection so
+   the model only ever executes a security decision already made, never makes one.
 
-1. **Capability discovery** - draft the `ENFORCED`/`ADVISORY` map from an API spec. The best
-   first target, because the output is declarative data rather than executable code and the
-   gate that validates it already exists. `testdata/catalog/sf.accounts.json` is a handful of
-   hand-written lines for one table; the per-connector authoring cost at n=1,000 is visible
-   from n=2.
-2. **Schema-drift triage** - diff spec versions, classify breaking vs. additive, draft the
-   patch. This attacks the cost ADR-004 treats as decisive: "schema drift alone would consume
-   the team."
-3. **Request translation** - plan -> SOQL/GraphQL/REST/ES DSL, placed *after* policy injection
-   and residual assignment so the model is handed dispositions already decided and never makes
-   a security decision itself.
-
-**What this prototype does and doesn't support.** Only item 1 has evidence here. Both mocks
-speak one generic HTTP shape (`internal/connector/httpsource.go`), so this build never faced
-dialect translation and never saw a schema change - items 2 and 3 are extrapolation from
-problems it didn't have to solve, not findings from ones it did.
-
-**And the honest catch.** The verification such a tier would need - asserting the generated
-query's predicate set exactly matches the plan's, metamorphic invariants over query pairs,
-differential validation against a fetch-everything control - is not LLM-specific. It would
-catch a hand-written connector's off-by-one just as readily. It doesn't exist here because at
-n=2 human review was doing that job implicitly and unmeasurably. The generation question
-surfaces a verification gap that already exists; it doesn't create one.
+How connectors actually get deployed and versioned - independent of who or what authors one -
+is a separate question from this suggestion, not a consequence of it: see ADR-004 in
+`DESIGN.md` and the corresponding row in
+[Deliberate divergences from DESIGN.md](#deliberate-divergences-from-designmd) below.
 
 ---
 
@@ -650,6 +639,7 @@ observable at two connectors on one node.
 | Redis-leased token buckets (ADR-006) | Single-node in-memory bucket | ADR-006 explains why this **does not survive horizontal scaling**: N pods means Nx the configured limit, and the failure mode is the connector banning our API key. |
 | Per-tenant KMS, crypto-shredding (ADR-010) | Not implemented | Nothing observable at one node. The valuable part of ADR-010 is the conflict between shredding and audit retention - a design insight a prototype can't demonstrate. |
 | Ephemeral DuckDB materialization (ADR-007) | In-memory Go hash join | Also sidesteps the tenant-encrypted temp storage ADR-007 requires. |
+| Connector SDK as a wire contract; independently deployable, versioned connectors (ADR-004) | `connector.Source` in-process Go interface (`HTTPSource`), compiled into the gateway binary | Real at n=2 - two Go types satisfying one in-process interface is simplest, and there's no onboard-without-rebuild story worth demonstrating with two connectors that never change mid-run. The RPC boundary only pays for itself once connectors are added or updated on their own schedule, independent of the gateway's release cycle. |
 
 **One thing the prototype taught us about the design.** A ~250-line Go planner handled the
 entire v1 SQL surface cleanly. That is weak but real evidence for `DESIGN.md` Section 12's first open

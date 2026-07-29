@@ -10,6 +10,7 @@ APIs on behalf of the calling user, under that user's own permissions.
 | [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md) | Every option considered and turned down across the eleven ADRs, with the strongest real case for each one and why it lost anyway. |
 | [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) | TDD cycle plan the prototype was built from |
 | This repo | Prototype: one cross-app query end-to-end - Salesforce JOIN Zendesk |
+| [Afterthought](#afterthought-the-conformance-gate-is-provenance-blind) *(section below)* | The one thing building the prototype surfaced that the design hadn't anticipated: the conformance gate never checks who *wrote* a connector - which opens a third option in ADR-004's build-vs-buy split. |
 
 **Scenario:** accounts JOIN tickets, with entitlement enforcement, rate-limit handling, and a
 freshness control.
@@ -39,6 +40,24 @@ curl -s localhost:8080/v1/query \
 ```
 
 Every response carries `freshness_ms`, `rate_limit_status`, and `trace_id`.
+
+---
+
+## Ten-minute reviewer path
+
+If you only have ten minutes, read in this order - everything else in this README is
+reference material you can skip.
+
+1. [The decision register](#decision-register) below - eleven decisions, what each rejected,
+   what was built
+2. `DESIGN.md` Section 0 - five decisions, three I'd reverse, the one number to measure
+3. `go test ./... -run 'LyingConnector|PlanCacheDoesNotLeak' -v` - the two security claims
+4. `DESIGN.md` ADR-002 and its two diagrams - how policy becomes plan nodes
+5. [The measurement table](#measured-the-number-the-design-is-least-sure-about) below - the
+   assumption the capacity model rests on
+6. `DESIGN.md` Section 12 - what I'm least sure of, and what would change my mind
+7. [The afterthought](#afterthought-the-conformance-gate-is-provenance-blind) below - what
+   building it surfaced that the design hadn't anticipated, and where I'd take it next
 
 ---
 
@@ -455,17 +474,6 @@ not just repeats - worth pointing out if `result_cache_requests_total` comes up.
 real and observable; the trace shows *where the time inside one request actually went*, and that
 a cross-app join really does fan out to two connectors under one root span - the same claim
 Section 5's capacity model makes numerically, here shown as spans a reviewer can click on.
-
----
-
-## Ten-minute reviewer path
-
-1. The decision register above - eleven decisions, what each rejected, what was built
-2. `DESIGN.md` Section 0 - five decisions, three I'd reverse, the one number to measure
-3. `go test ./... -run 'LyingConnector|PlanCacheDoesNotLeak' -v` - the two security claims
-4. `DESIGN.md` ADR-002 and its two diagrams - how policy becomes plan nodes
-5. The measurement table above - the assumption the capacity model rests on
-6. `DESIGN.md` Section 12 - what I'm least sure of, and what would change my mind
 
 ---
 

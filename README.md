@@ -17,6 +17,134 @@ freshness control.
 
 ---
 
+## Ten-minute reviewer path
+
+If you only have ten minutes, read in this order - everything else in this README is
+reference material you can skip.
+
+1. [The decision register](#decision-register) below - eleven decisions, what each rejected,
+   what was built
+2. `DESIGN.md` Section 0 - five decisions, three I'd reverse, the one number to measure
+3. `go test ./... -run 'LyingConnector|PlanCacheDoesNotLeak' -v` - the two security claims
+4. `DESIGN.md` ADR-002 and its two diagrams - how policy becomes plan nodes
+5. [The measurement table](#measured-the-number-the-design-is-least-sure-about) below - the
+   assumption the capacity model rests on
+6. `DESIGN.md` Section 12 - what I'm least sure of, and what would change my mind
+7. [The afterthought](#afterthought-the-conformance-gate-is-provenance-blind) below - what
+   building it surfaced that the design hadn't anticipated, and where I'd take it next
+
+---
+
+## MVP status at a glance
+
+The two tables below, as a picture. Same eleven ADRs, grouped by how real the prototype's
+version of each decision is - not by ADR number, since "partial" hides very different kinds
+of partial.
+
+```mermaid
+flowchart TB
+    subgraph built["BUILT AND VERIFIED — real code, real tests, real HTTP round trips"]
+        direction LR
+        PLAN["Go planner + capability<br/>classification<br/><i>spike evidence for ADR-001</i>"]
+        RLS["RLS/CLS injection, plan-time<br/>invariant, runtime verification<br/>filter (ADR-002)"]
+        CACHE["Parameterized plan cache,<br/>role-isolated (ADR-003)"]
+        JOIN["Semi-join rewrite —<br/>505→17 calls, 29.7x (ADR-007)"]
+        TENANT["Tenant from verified <code>iss</code>,<br/>never from claim (ADR-011)"]
+        OBS["Real Prometheus histogram +<br/>real OTel trace, connector<br/>spans nested under query span"]
+        RCACHE["Result cache keyed by principal,<br/>not just table+columns+filters<br/><i>ADR-002 addendum; real<br/>result_cache_requests_total metric</i>"]
+    end
+
+    subgraph partial["PARTIAL — real mechanism, deliberately narrowed scope"]
+        direction LR
+        FRESH["Freshness: rungs 1 &amp; 4 +<br/><code>max_staleness</code> (ADR-005)<br/><i>rungs 2–3 not built</i>"]
+        RATE["Rate limits: single-node bucket,<br/>429, async reroute (ADR-006)<br/><i>no Redis lease, no fair queue</i>"]
+        STREAM["NDJSON + <code>SOURCE_TIMEOUT</code><br/>terminal frame (ADR-009)<br/><i>thin coverage, at risk</i>"]
+        POLICY["Policy: <code>PolicyProvider</code> stub<br/>returns residuals from JSON<br/><i>injection real, OPA mocked</i>"]
+        JWT["Identity: issuer→tenant<br/>derivation is real<br/><i>signature verification mocked</i>"]
+    end
+
+    subgraph mocked["MOCKED OR NOT BUILT — infrastructure a reviewer can assume"]
+        direction LR
+        CONN["Salesforce + Zendesk<br/>connectors (ADR-004)<br/><i>mocksf / mockzd, not real APIs</i>"]
+        SIDECAR["Calcite sidecar,<br/>Substrait IR (ADR-001)<br/><i>deferred to M1 spike</i>"]
+        DUCK["Ephemeral DuckDB<br/>materialization (ADR-007)<br/><i>in-memory Go hash join instead</i>"]
+        LIFE["Tenant lifecycle API<br/>(ADR-008) — not implemented"]
+        KMS["Per-tenant KMS,<br/>crypto-shred (ADR-010)<br/>— not implemented"]
+    end
+
+    subgraph open["OPEN QUESTION — not decided, not just unbuilt"]
+        direction LR
+        LIMITOFFSET["LIMIT / OFFSET<br/>listed in the SQL surface (§1.4),<br/>silently ignored today<br/><i>ADR-007: pushdown vs. truncation-only</i>"]
+        RTL["RESULT_TOO_LARGE<br/>guardrail specified in ADR-007,<br/>never implemented<br/><i>the sharper risk — a skewed join<br/>can exhaust memory today</i>"]
+    end
+
+    classDef builtStyle fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef partialStyle fill:#fef9c3,stroke:#ca8a04,color:#713f12
+    classDef mockedStyle fill:#f3f4f6,stroke:#6b7280,color:#1f2937
+    classDef openStyle fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    class PLAN,RLS,CACHE,JOIN,TENANT,OBS,RCACHE builtStyle
+    class FRESH,RATE,STREAM,POLICY,JWT partialStyle
+    class CONN,SIDECAR,DUCK,LIFE,KMS mockedStyle
+    class LIMITOFFSET,RTL openStyle
+```
+
+**What it proves.** The green lane is exactly the four tests in the "What this prototype
+proves" table below, plus the observability work: mechanisms a reviewer would otherwise have
+to take on faith. The grey lane is every ADR whose unbuilt half is infrastructure - a JVM
+sidecar, a KMS call, a Terraform-replacing API - never a security or correctness mechanism.
+That split is deliberate, not a shortfall: see "Two patterns" below (Decision register
+section). The blue lane is a different kind of gap than either - not a deliberate scope cut
+like the grey lane (nothing here was decided against), and not a narrowed-but-real mechanism
+like the yellow lane: it's a hole in the v1 SQL surface itself, surfaced by review rather than
+designed around, and left open on purpose rather than guessed at - see `DESIGN.md` ADR-007 and
+Section 12, item 5.
+
+---
+
+## Afterthought: the conformance gate is provenance-blind
+
+Not a claim the prototype set out to test, but the clearest thing building it surfaced.
+`TestLyingConnectorFailsClosed` never asks *who wrote the connector*. It asks whether the rows
+that came back still satisfy the predicate we believed we pushed. A connector fails that check
+identically whether a human wrote it, a vendor shipped it, or a code generator emitted it.
+ADR-002 states this as a principle - capabilities are "claims *we* make about a connector and
+prove with conformance tests, never values a connector self-reports" - but implementing it is
+what makes the consequence concrete: **the connector's author is not a variable the safety
+argument depends on.**
+
+That reframes ADR-004. If the gate doesn't care about provenance, "build vs. buy" is missing a
+third option - a fine-tuned model drafting connectors against the Connector SDK, promoted only
+on passing the same suite. It competes with *buy*, not build, and on buy's specific weakness:
+unified-API vendors normalize away per-field pushdown and per-user delegated auth, the two
+properties ADR-002 and Section 5 lean on hardest. Three places it would fit, in the order I'd
+try them:
+
+1. **Capability discovery** - draft the `ENFORCED`/`ADVISORY` map from an API spec. The best
+   first target, because the output is declarative data rather than executable code and the
+   gate that validates it already exists. `testdata/catalog/sf.accounts.json` is a handful of
+   hand-written lines for one table; the per-connector authoring cost at n=1,000 is visible
+   from n=2.
+2. **Schema-drift triage** - diff spec versions, classify breaking vs. additive, draft the
+   patch. This attacks the cost ADR-004 treats as decisive: "schema drift alone would consume
+   the team."
+3. **Request translation** - plan -> SOQL/GraphQL/REST/ES DSL, placed *after* policy injection
+   and residual assignment so the model is handed dispositions already decided and never makes
+   a security decision itself.
+
+**What this prototype does and doesn't support.** Only item 1 has evidence here. Both mocks
+speak one generic HTTP shape (`internal/connector/httpsource.go`), so this build never faced
+dialect translation and never saw a schema change - items 2 and 3 are extrapolation from
+problems it didn't have to solve, not findings from ones it did.
+
+**And the honest catch.** The verification such a tier would need - asserting the generated
+query's predicate set exactly matches the plan's, metamorphic invariants over query pairs,
+differential validation against a fetch-everything control - is not LLM-specific. It would
+catch a hand-written connector's off-by-one just as readily. It doesn't exist here because at
+n=2 human review was doing that job implicitly and unmeasurably. The generation question
+surfaces a verification gap that already exists; it doesn't create one.
+
+---
+
 ## Quickstart
 
 ```bash
@@ -39,7 +167,26 @@ curl -s localhost:8080/v1/query \
  -d '{"sql":"SELECT id, name, email, region FROM sf.accounts","max_staleness":"60s"}' | jq
 ```
 
-Every response carries `freshness_ms`, `rate_limit_status`, and `trace_id`.
+Every response carries `freshness_ms`, `rate_limit_status`, and `trace_id`. Everything else
+runnable - rate-limit handling, freshness control, the connector SDK, the two submission
+screenshots - is consolidated in
+[Recreate every claim yourself](#recreate-every-claim-yourself) below, rather than scattered
+across the sections that motivate each one.
+
+---
+
+## Recreate every claim yourself
+
+Every claim in this README you can run rather than take on faith, gathered in one place - the
+THP's three minimal expectations first (entitlement, rate-limit, freshness), then the connector
+SDK's own mechanics, then the two screenshots the submission asks for. All of it assumes the
+Quickstart stack above is already running, except where a subsection says otherwise.
+
+### Recreate: entitlement enforcement (RLS/CLS)
+
+Already shown in Quickstart above - the same query as two identities, one restricted to their
+region with email masked, one not. Not repeated here to avoid duplicating the exact commands;
+scroll up if you jumped straight to this section.
 
 ### Recreate: async reroute
 
@@ -161,23 +308,184 @@ request is a request" made concrete. The connector still saw a call and the rate
 still moved, even though no new bytes came back. `TestMaxStalenessServesCache` proves states 1-2
 in-process; `TestETagRevalidationSpendsBudget` proves state 3's budget accounting.
 
----
+### Recreate: connector SDK mechanics (pagination, ETag, the lying connector)
 
-## Ten-minute reviewer path
+Everything below is a real HTTP round trip against `cmd/mocksf` (built from `go build -o
+mocksf ./cmd/mocksf`), not a unit test asserting internal state - showing the behavior beats
+describing it.
 
-If you only have ten minutes, read in this order - everything else in this README is
-reference material you can skip.
+Start it with the defaults (250 rows, page-size 100, `status` enforced - `cmd/mocksf/main.go`
+always sets that last one regardless of flags):
 
-1. [The decision register](#decision-register) below - eleven decisions, what each rejected,
-   what was built
-2. `DESIGN.md` Section 0 - five decisions, three I'd reverse, the one number to measure
-3. `go test ./... -run 'LyingConnector|PlanCacheDoesNotLeak' -v` - the two security claims
-4. `DESIGN.md` ADR-002 and its two diagrams - how policy becomes plan nodes
-5. [The measurement table](#measured-the-number-the-design-is-least-sure-about) below - the
-   assumption the capacity model rests on
-6. `DESIGN.md` Section 12 - what I'm least sure of, and what would change my mind
-7. [The afterthought](#afterthought-the-conformance-gate-is-provenance-blind) below - what
-   building it surfaced that the design hadn't anticipated, and where I'd take it next
+```
+$ ./mocksf &
+```
+
+**Pagination** - 250 rows requested at `page-size=100` come back as three pages, the last one
+short, each carrying an explicit `has_more` rather than the client having to guess from a
+row count:
+
+```
+$ curl -s "http://localhost:8081/accounts?fields=id&offset=0"   | jq '{count: (.rows | length), has_more}'
+{ "count": 100, "has_more": true }
+$ curl -s "http://localhost:8081/accounts?fields=id&offset=100" | jq '{count: (.rows | length), has_more}'
+{ "count": 100, "has_more": true }
+$ curl -s "http://localhost:8081/accounts?fields=id&offset=200" | jq '{count: (.rows | length), has_more}'
+{ "count": 50, "has_more": false }
+```
+
+`go test ./internal/connector/... -run TestConnectorPaginationAndETag -v`:
+
+```
+=== RUN   TestConnectorPaginationAndETag
+--- PASS: TestConnectorPaginationAndETag (0.00s)
+```
+
+`connector.HTTPSource.Fetch` hides this pagination entirely - it made one call to `exec`,
+three calls to the mock, matching the call-count assertion in the test.
+
+**ETag / `If-None-Match` -> 304** - a conditional re-request with the ETag the mock just
+issued gets a 304, not a re-fetch of the full body:
+
+```
+$ ETAG=$(curl -sI "http://localhost:8081/accounts" | grep -i '^etag' | tr -d '\r' | sed 's/.*: //')
+$ echo $ETAG
+7eaf965187fa89ec
+$ curl -s -o /dev/null -w "%{http_code}\n" -H "If-None-Match: $ETAG" "http://localhost:8081/accounts"
+304
+```
+
+**An enforced predicate actually filters** - `status` is declared `ENFORCED` by default, and
+a value no row has returns zero rows, not the whole table:
+
+```
+$ curl -s "http://localhost:8081/accounts?fields=id,status&status=closed" | jq '.rows | length'
+0
+```
+
+**The lying connector** - `--lie-about region` declares `region` `ENFORCED` (so our planner
+would push a security predicate to it) and then ignores the filter it claims to apply. This
+needs a second mock instance with different flags, so stop the first one before starting it -
+same port, same "address already in use" failure as the Docker one earlier if you don't:
+
+```
+$ kill %1   # or: pkill -f mocksf - stop the instance started above, it's still on :8081
+$ mocksf --rows 10 --lie-about region &
+$ curl -s "http://localhost:8081/accounts?fields=id,region&region=nonexistent-region" | jq '.rows | length'
+10
+```
+
+Ten rows for a value nothing matches is exactly the failure `TestLyingConnectorFailsClosed`
+(Cycle 6) exists to catch - the plan-time invariant has no way to see this, because the
+predicate *was* legitimately pushed to a connector that claimed to enforce it. Only the
+runtime verification filter, re-applying the predicate locally after fetch, notices the row
+count didn't drop to zero.
+
+### Recreate: the observability screenshots
+
+A real Prometheus endpoint and a real trace, not in-process approximations of either. Full
+step-by-step instructions for taking both submission screenshots are below; this part explains
+what's actually real and which test proves it, so the walkthrough isn't taken on faith either.
+
+**The metrics.** `GET /metrics` on the gateway is a genuine `prometheus/client_golang` registry,
+not the in-memory `obs.Observe`/`obs.Gather` pair the test suite also uses (that one exists so
+tests can assert "a sample was recorded" without a real registry in the loop - both are fed from
+the same call sites, so neither can drift from what actually happened). Two metrics live there:
+
+- `connector_request_duration_seconds` - a proper histogram (buckets, `_sum`, `_count`), labeled
+  by `connector` and `outcome`, plus the Go runtime metrics the client library exposes for free.
+  Proved real by `TestConnectorDurationMetric` (`test/acceptance/obs_test.go`).
+- `result_cache_requests_total{connector,outcome}` - a counter, `outcome` = `hit` (served from
+  the freshness/result cache, no outbound call) or `miss` (a live or conditional fetch was
+  made). `result_cache_hit_ratio` is derived from this via PromQL `rate()`, not stored directly -
+  see `DESIGN.md`'s ADR-002 addendum for why. Proved real by `TestResultCacheHitRatioMetric`, and
+  its cache-key correctness (principal isolation, not just table+columns+filters) by
+  `TestFreshnessCacheIsolatedByPrincipal`.
+
+**The trace.** `trace_id` in every response (and the `X-Trace-Id` header the connector receives)
+*is* a real OpenTelemetry trace id, not a random string that merely looks like one - the gateway
+starts a `gateway.query` span per request and a child `connector.fetch` span per connector call
+(`internal/freshness`), exported over OTLP/HTTP to Jaeger's all-in-one image. For the cross-app
+join, the same trace shows *two* `connector.fetch` children (build side, then each probe chunk)
+under one `gateway.query` span - the semi-join's call reduction, visible as spans, not just a
+log line. `TestTraceIDPropagates` proves the id `sf` actually receives on `X-Trace-Id` is the
+same one the gateway returns to its caller, independent of whether a collector is even running -
+tracing degrades gracefully to a no-op tracer when `--otlp-endpoint` is unset (the default for
+`go test`, and for the plain `go run ./cmd/gateway` quickstart), so the id is still real and
+still propagated, just not exported anywhere.
+
+#### Getting the two screenshots
+
+Both screenshots come off the same running stack. Start it once, generate traffic, take both.
+
+**Step 1 - start everything, including the observability profile.**
+
+```bash
+docker compose --profile core --profile mocks --profile observability up -d --build
+```
+
+This starts the gateway, both mocks, Prometheus (scraping the gateway every 5s, `prometheus.yml`),
+and Jaeger's all-in-one image (UI on `16686`, OTLP intake on `4318`, wired via
+`--otlp-endpoint jaeger:4318` in the gateway's compose command - present even when this profile
+isn't running, since the exporter connects lazily and an absent Jaeger just logs, never blocks).
+Give it a few seconds, then confirm the gateway is up:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" localhost:8080/metrics # expect 200
+```
+
+**Step 2 - generate traffic to graph and trace.** A few single-source queries (for the metrics
+graph and a real hit/miss ratio) and one cross-app join (for a trace worth screenshotting - two
+`connector.fetch` children instead of one):
+
+```bash
+for i in $(seq 1 5); do
+  curl -s localhost:8080/v1/query \
+    -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+    -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' > /dev/null
+done
+
+cat > /tmp/join.json <<'EOF'
+{"sql":"SELECT a.name, t.subject FROM sf.accounts a JOIN zd.tickets t ON t.organization_id = a.external_id WHERE t.status = 'open'"}
+EOF
+curl -s localhost:8080/v1/query \
+  -H "Authorization: Bearer $(cat testdata/tokens/root.jwt)" \
+  -d @/tmp/join.json | jq -r .trace_id
+```
+
+Keep the printed `trace_id` from that last command - you'll paste it into Jaeger in Step 4.
+(Using a file for the join query sidesteps shell-quoting issues with the nested single quotes
+around `'open'` - a one-line `curl -d '...'` with embedded quotes is easy to mistype in a way
+that silently truncates the SQL before the `JOIN`, which looks like a working query but returns
+the wrong thing. The `max_staleness` on the loop queries means the 2nd-5th are real cache hits,
+not just repeats - worth pointing out if `result_cache_requests_total` comes up.)
+
+**Step 3 - Prometheus screenshot.**
+
+1. Open `http://localhost:9090/graph` in a browser.
+2. Query `connector_request_duration_seconds_count`, press *Execute*, switch to the *Graph* tab.
+   You should see series labeled by `connector` and `outcome`, stepping up with Step 2's traffic.
+   (Swap in `result_cache_requests_total` to graph hit/miss instead - both are real series.)
+3. Widen the time range (top right) if the default window is too tight to show the steps.
+4. Screenshot the graph tab. This is the metrics screenshot - real connector call volume,
+   scraped from the gateway's own `/metrics`, not a number typed into a doc.
+
+**Step 4 - Jaeger screenshot.**
+
+1. Open `http://localhost:16686` in a browser.
+2. Paste the join query's `trace_id` from Step 2 directly into the search box at the top (or:
+   set *Service* to `emathp-gateway`, click *Find Traces*, and pick the most recent one - it'll
+   be the join, since it's the last query issued).
+3. Click into the trace. You should see a waterfall: one `gateway.query` span at the top, with
+   **two** `connector.fetch` children nested under it (the join's build-side fetch and its
+   probe-side fetch), each with its own duration.
+4. Screenshot the waterfall. This is the trace screenshot - the semi-join's two-connector
+   fanout, visible as spans with real durations, not a log line asserting it happened.
+
+**What the pair proves together.** The metrics show call volume (and now cache hit/miss) are
+real and observable; the trace shows *where the time inside one request actually went*, and that
+a cross-app join really does fan out to two connectors under one root span - the same claim
+Section 5's capacity model makes numerically, here shown as spans a reviewer can click on.
 
 ---
 
@@ -350,115 +658,6 @@ call. The design was updated to say so rather than the prototype being written t
 
 ---
 
-## MVP status at a glance
-
-The two tables above, as a picture. Same eleven ADRs, grouped by how real the prototype's
-version of each decision is - not by ADR number, since "partial" hides very different kinds
-of partial.
-
-```mermaid
-flowchart TB
-    subgraph built["BUILT AND VERIFIED — real code, real tests, real HTTP round trips"]
-        direction LR
-        PLAN["Go planner + capability<br/>classification<br/><i>spike evidence for ADR-001</i>"]
-        RLS["RLS/CLS injection, plan-time<br/>invariant, runtime verification<br/>filter (ADR-002)"]
-        CACHE["Parameterized plan cache,<br/>role-isolated (ADR-003)"]
-        JOIN["Semi-join rewrite —<br/>505→17 calls, 29.7x (ADR-007)"]
-        TENANT["Tenant from verified <code>iss</code>,<br/>never from claim (ADR-011)"]
-        OBS["Real Prometheus histogram +<br/>real OTel trace, connector<br/>spans nested under query span"]
-        RCACHE["Result cache keyed by principal,<br/>not just table+columns+filters<br/><i>ADR-002 addendum; real<br/>result_cache_requests_total metric</i>"]
-    end
-
-    subgraph partial["PARTIAL — real mechanism, deliberately narrowed scope"]
-        direction LR
-        FRESH["Freshness: rungs 1 &amp; 4 +<br/><code>max_staleness</code> (ADR-005)<br/><i>rungs 2–3 not built</i>"]
-        RATE["Rate limits: single-node bucket,<br/>429, async reroute (ADR-006)<br/><i>no Redis lease, no fair queue</i>"]
-        STREAM["NDJSON + <code>SOURCE_TIMEOUT</code><br/>terminal frame (ADR-009)<br/><i>thin coverage, at risk</i>"]
-        POLICY["Policy: <code>PolicyProvider</code> stub<br/>returns residuals from JSON<br/><i>injection real, OPA mocked</i>"]
-        JWT["Identity: issuer→tenant<br/>derivation is real<br/><i>signature verification mocked</i>"]
-    end
-
-    subgraph mocked["MOCKED OR NOT BUILT — infrastructure a reviewer can assume"]
-        direction LR
-        CONN["Salesforce + Zendesk<br/>connectors (ADR-004)<br/><i>mocksf / mockzd, not real APIs</i>"]
-        SIDECAR["Calcite sidecar,<br/>Substrait IR (ADR-001)<br/><i>deferred to M1 spike</i>"]
-        DUCK["Ephemeral DuckDB<br/>materialization (ADR-007)<br/><i>in-memory Go hash join instead</i>"]
-        LIFE["Tenant lifecycle API<br/>(ADR-008) — not implemented"]
-        KMS["Per-tenant KMS,<br/>crypto-shred (ADR-010)<br/>— not implemented"]
-    end
-
-    subgraph open["OPEN QUESTION — not decided, not just unbuilt"]
-        direction LR
-        LIMITOFFSET["LIMIT / OFFSET<br/>listed in the SQL surface (§1.4),<br/>silently ignored today<br/><i>ADR-007: pushdown vs. truncation-only</i>"]
-        RTL["RESULT_TOO_LARGE<br/>guardrail specified in ADR-007,<br/>never implemented<br/><i>the sharper risk — a skewed join<br/>can exhaust memory today</i>"]
-    end
-
-    classDef builtStyle fill:#dcfce7,stroke:#16a34a,color:#14532d
-    classDef partialStyle fill:#fef9c3,stroke:#ca8a04,color:#713f12
-    classDef mockedStyle fill:#f3f4f6,stroke:#6b7280,color:#1f2937
-    classDef openStyle fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
-    class PLAN,RLS,CACHE,JOIN,TENANT,OBS,RCACHE builtStyle
-    class FRESH,RATE,STREAM,POLICY,JWT partialStyle
-    class CONN,SIDECAR,DUCK,LIFE,KMS mockedStyle
-    class LIMITOFFSET,RTL openStyle
-```
-
-**What it proves.** The green lane is exactly the four tests in the "What this prototype
-proves" table above, plus the observability work: mechanisms a reviewer would otherwise have
-to take on faith. The grey lane is every ADR whose unbuilt half is infrastructure - a JVM
-sidecar, a KMS call, a Terraform-replacing API - never a security or correctness mechanism.
-That split is deliberate, not a shortfall: see "Two patterns" above. The blue lane is a
-different kind of gap than either - not a deliberate scope cut like the grey lane (nothing
-here was decided against), and not a narrowed-but-real mechanism like the yellow lane: it's a
-hole in the v1 SQL surface itself, surfaced by review rather than designed around, and left
-open on purpose rather than guessed at - see `DESIGN.md` ADR-007 and Section 12, item 5.
-
----
-
-## Afterthought: the conformance gate is provenance-blind
-
-Not a claim the prototype set out to test, but the clearest thing building it surfaced.
-`TestLyingConnectorFailsClosed` never asks *who wrote the connector*. It asks whether the rows
-that came back still satisfy the predicate we believed we pushed. A connector fails that check
-identically whether a human wrote it, a vendor shipped it, or a code generator emitted it.
-ADR-002 states this as a principle - capabilities are "claims *we* make about a connector and
-prove with conformance tests, never values a connector self-reports" - but implementing it is
-what makes the consequence concrete: **the connector's author is not a variable the safety
-argument depends on.**
-
-That reframes ADR-004. If the gate doesn't care about provenance, "build vs. buy" is missing a
-third option - a fine-tuned model drafting connectors against the Connector SDK, promoted only
-on passing the same suite. It competes with *buy*, not build, and on buy's specific weakness:
-unified-API vendors normalize away per-field pushdown and per-user delegated auth, the two
-properties ADR-002 and Section 5 lean on hardest. Three places it would fit, in the order I'd
-try them:
-
-1. **Capability discovery** - draft the `ENFORCED`/`ADVISORY` map from an API spec. The best
-   first target, because the output is declarative data rather than executable code and the
-   gate that validates it already exists. `testdata/catalog/sf.accounts.json` is a handful of
-   hand-written lines for one table; the per-connector authoring cost at n=1,000 is visible
-   from n=2.
-2. **Schema-drift triage** - diff spec versions, classify breaking vs. additive, draft the
-   patch. This attacks the cost ADR-004 treats as decisive: "schema drift alone would consume
-   the team."
-3. **Request translation** - plan -> SOQL/GraphQL/REST/ES DSL, placed *after* policy injection
-   and residual assignment so the model is handed dispositions already decided and never makes
-   a security decision itself.
-
-**What this prototype does and doesn't support.** Only item 1 has evidence here. Both mocks
-speak one generic HTTP shape (`internal/connector/httpsource.go`), so this build never faced
-dialect translation and never saw a schema change - items 2 and 3 are extrapolation from
-problems it didn't have to solve, not findings from ones it did.
-
-**And the honest catch.** The verification such a tier would need - asserting the generated
-query's predicate set exactly matches the plan's, metamorphic invariants over query pairs,
-differential validation against a fetch-everything control - is not LLM-specific. It would
-catch a hand-written connector's off-by-one just as readily. It doesn't exist here because at
-n=2 human review was doing that job implicitly and unmeasurably. The generation question
-surfaces a verification gap that already exists; it doesn't create one.
-
----
-
 ## Fixture notes
 
 Two fixtures are deliberately hostile or pessimistic. Both look like modelling errors if you
@@ -493,184 +692,3 @@ Dockerfile docker-compose.yml prometheus.yml
 `SCHEMA_DRIFT`, `PRINCIPAL_UNRESOLVED`, `RESIDENCY_VIOLATION`
 
 Every message names what to do, not just what broke. Full table in `DESIGN.md` Section 7.
-
-## Observability
-
-A real Prometheus endpoint and a real trace, not in-process approximations of either. Full
-step-by-step instructions for taking both submission screenshots are below; this part explains
-what's actually real and which test proves it, so the walkthrough isn't taken on faith either.
-
-**The metrics.** `GET /metrics` on the gateway is a genuine `prometheus/client_golang` registry,
-not the in-memory `obs.Observe`/`obs.Gather` pair the test suite also uses (that one exists so
-tests can assert "a sample was recorded" without a real registry in the loop - both are fed from
-the same call sites, so neither can drift from what actually happened). Two metrics live there:
-
-- `connector_request_duration_seconds` - a proper histogram (buckets, `_sum`, `_count`), labeled
-  by `connector` and `outcome`, plus the Go runtime metrics the client library exposes for free.
-  Proved real by `TestConnectorDurationMetric` (`test/acceptance/obs_test.go`).
-- `result_cache_requests_total{connector,outcome}` - a counter, `outcome` = `hit` (served from
-  the freshness/result cache, no outbound call) or `miss` (a live or conditional fetch was
-  made). `result_cache_hit_ratio` is derived from this via PromQL `rate()`, not stored directly -
-  see `DESIGN.md`'s ADR-002 addendum for why. Proved real by `TestResultCacheHitRatioMetric`, and
-  its cache-key correctness (principal isolation, not just table+columns+filters) by
-  `TestFreshnessCacheIsolatedByPrincipal`.
-
-**The trace.** `trace_id` in every response (and the `X-Trace-Id` header the connector receives)
-*is* a real OpenTelemetry trace id, not a random string that merely looks like one - the gateway
-starts a `gateway.query` span per request and a child `connector.fetch` span per connector call
-(`internal/freshness`), exported over OTLP/HTTP to Jaeger's all-in-one image. For the cross-app
-join, the same trace shows *two* `connector.fetch` children (build side, then each probe chunk)
-under one `gateway.query` span - the semi-join's call reduction, visible as spans, not just a
-log line. `TestTraceIDPropagates` proves the id `sf` actually receives on `X-Trace-Id` is the
-same one the gateway returns to its caller, independent of whether a collector is even running -
-tracing degrades gracefully to a no-op tracer when `--otlp-endpoint` is unset (the default for
-`go test`, and for the plain `go run ./cmd/gateway` quickstart), so the id is still real and
-still propagated, just not exported anywhere.
-
-### Getting the two screenshots
-
-Both screenshots come off the same running stack. Start it once, generate traffic, take both.
-
-**Step 1 - start everything, including the observability profile.**
-
-```bash
-docker compose --profile core --profile mocks --profile observability up -d --build
-```
-
-This starts the gateway, both mocks, Prometheus (scraping the gateway every 5s, `prometheus.yml`),
-and Jaeger's all-in-one image (UI on `16686`, OTLP intake on `4318`, wired via
-`--otlp-endpoint jaeger:4318` in the gateway's compose command - present even when this profile
-isn't running, since the exporter connects lazily and an absent Jaeger just logs, never blocks).
-Give it a few seconds, then confirm the gateway is up:
-
-```bash
-curl -s -o /dev/null -w "%{http_code}\n" localhost:8080/metrics # expect 200
-```
-
-**Step 2 - generate traffic to graph and trace.** A few single-source queries (for the metrics
-graph and a real hit/miss ratio) and one cross-app join (for a trace worth screenshotting - two
-`connector.fetch` children instead of one):
-
-```bash
-for i in $(seq 1 5); do
-  curl -s localhost:8080/v1/query \
-    -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
-    -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' > /dev/null
-done
-
-cat > /tmp/join.json <<'EOF'
-{"sql":"SELECT a.name, t.subject FROM sf.accounts a JOIN zd.tickets t ON t.organization_id = a.external_id WHERE t.status = 'open'"}
-EOF
-curl -s localhost:8080/v1/query \
-  -H "Authorization: Bearer $(cat testdata/tokens/root.jwt)" \
-  -d @/tmp/join.json | jq -r .trace_id
-```
-
-Keep the printed `trace_id` from that last command - you'll paste it into Jaeger in Step 4.
-(Using a file for the join query sidesteps shell-quoting issues with the nested single quotes
-around `'open'` - a one-line `curl -d '...'` with embedded quotes is easy to mistype in a way
-that silently truncates the SQL before the `JOIN`, which looks like a working query but returns
-the wrong thing. The `max_staleness` on the loop queries means the 2nd-5th are real cache hits,
-not just repeats - worth pointing out if `result_cache_requests_total` comes up.)
-
-**Step 3 - Prometheus screenshot.**
-
-1. Open `http://localhost:9090/graph` in a browser.
-2. Query `connector_request_duration_seconds_count`, press *Execute*, switch to the *Graph* tab.
-   You should see series labeled by `connector` and `outcome`, stepping up with Step 2's traffic.
-   (Swap in `result_cache_requests_total` to graph hit/miss instead - both are real series.)
-3. Widen the time range (top right) if the default window is too tight to show the steps.
-4. Screenshot the graph tab. This is the metrics screenshot - real connector call volume,
-   scraped from the gateway's own `/metrics`, not a number typed into a doc.
-
-**Step 4 - Jaeger screenshot.**
-
-1. Open `http://localhost:16686` in a browser.
-2. Paste the join query's `trace_id` from Step 2 directly into the search box at the top (or:
-   set *Service* to `emathp-gateway`, click *Find Traces*, and pick the most recent one - it'll
-   be the join, since it's the last query issued).
-3. Click into the trace. You should see a waterfall: one `gateway.query` span at the top, with
-   **two** `connector.fetch` children nested under it (the join's build-side fetch and its
-   probe-side fetch), each with its own duration.
-4. Screenshot the waterfall. This is the trace screenshot - the semi-join's two-connector
-   fanout, visible as spans with real durations, not a log line asserting it happened.
-
-**What the pair proves together.** The metrics show call volume (and now cache hit/miss) are
-real and observable; the trace shows *where the time inside one request actually went*, and that
-a cross-app join really does fan out to two connectors under one root span - the same claim
-Section 5's capacity model makes numerically, here shown as spans a reviewer can click on.
-
----
-
-## Evidence: the connector SDK against a real mock (Cycle 5)
-
-Everything below is a real HTTP round trip against `cmd/mocksf` (built from `go build -o
-mocksf ./cmd/mocksf`), not a unit test asserting internal state. The point is the same one
-Section 9 makes about the trace screenshot: showing the behavior beats describing it.
-
-Start it with the defaults (250 rows, page-size 100, `status` enforced - `cmd/mocksf/main.go`
-always sets that last one regardless of flags):
-
-```
-$ ./mocksf &
-```
-
-**Pagination** - 250 rows requested at `page-size=100` come back as three pages, the last one
-short, each carrying an explicit `has_more` rather than the client having to guess from a
-row count:
-
-```
-$ curl -s "http://localhost:8081/accounts?fields=id&offset=0"   | jq '{count: (.rows | length), has_more}'
-{ "count": 100, "has_more": true }
-$ curl -s "http://localhost:8081/accounts?fields=id&offset=100" | jq '{count: (.rows | length), has_more}'
-{ "count": 100, "has_more": true }
-$ curl -s "http://localhost:8081/accounts?fields=id&offset=200" | jq '{count: (.rows | length), has_more}'
-{ "count": 50, "has_more": false }
-```
-
-`go test ./internal/connector/... -run TestConnectorPaginationAndETag -v`:
-
-```
-=== RUN   TestConnectorPaginationAndETag
---- PASS: TestConnectorPaginationAndETag (0.00s)
-```
-
-`connector.HTTPSource.Fetch` hides this pagination entirely - it made one call to `exec`,
-three calls to the mock, matching the call-count assertion in the test.
-
-**ETag / `If-None-Match` -> 304** - a conditional re-request with the ETag the mock just
-issued gets a 304, not a re-fetch of the full body:
-
-```
-$ ETAG=$(curl -sI "http://localhost:8081/accounts" | grep -i '^etag' | tr -d '\r' | sed 's/.*: //')
-$ echo $ETAG
-7eaf965187fa89ec
-$ curl -s -o /dev/null -w "%{http_code}\n" -H "If-None-Match: $ETAG" "http://localhost:8081/accounts"
-304
-```
-
-**An enforced predicate actually filters** - `status` is declared `ENFORCED` by default, and
-a value no row has returns zero rows, not the whole table:
-
-```
-$ curl -s "http://localhost:8081/accounts?fields=id,status&status=closed" | jq '.rows | length'
-0
-```
-
-**The lying connector** - `--lie-about region` declares `region` `ENFORCED` (so our planner
-would push a security predicate to it) and then ignores the filter it claims to apply. This
-needs a second mock instance with different flags, so stop the first one before starting it -
-same port, same "address already in use" failure as the Docker one earlier if you don't:
-
-```
-$ kill %1   # or: pkill -f mocksf - stop the instance started above, it's still on :8081
-$ mocksf --rows 10 --lie-about region &
-$ curl -s "http://localhost:8081/accounts?fields=id,region&region=nonexistent-region" | jq '.rows | length'
-10
-```
-
-Ten rows for a value nothing matches is exactly the failure `TestLyingConnectorFailsClosed`
-(Cycle 6) exists to catch - the plan-time invariant has no way to see this, because the
-predicate *was* legitimately pushed to a connector that claimed to enforce it. Only the
-runtime verification filter, re-applying the predicate locally after fetch, notices the row
-count didn't drop to zero.

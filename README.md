@@ -271,6 +271,50 @@ open on purpose rather than guessed at - see `DESIGN.md` ADR-007 and Section 12,
 
 ---
 
+## Afterthought: the conformance gate is provenance-blind
+
+Not a claim the prototype set out to test, but the clearest thing building it surfaced.
+`TestLyingConnectorFailsClosed` never asks *who wrote the connector*. It asks whether the rows
+that came back still satisfy the predicate we believed we pushed. A connector fails that check
+identically whether a human wrote it, a vendor shipped it, or a code generator emitted it.
+ADR-002 states this as a principle - capabilities are "claims *we* make about a connector and
+prove with conformance tests, never values a connector self-reports" - but implementing it is
+what makes the consequence concrete: **the connector's author is not a variable the safety
+argument depends on.**
+
+That reframes ADR-004. If the gate doesn't care about provenance, "build vs. buy" is missing a
+third option - a fine-tuned model drafting connectors against the Connector SDK, promoted only
+on passing the same suite. It competes with *buy*, not build, and on buy's specific weakness:
+unified-API vendors normalize away per-field pushdown and per-user delegated auth, the two
+properties ADR-002 and Section 5 lean on hardest. Three places it would fit, in the order I'd
+try them:
+
+1. **Capability discovery** - draft the `ENFORCED`/`ADVISORY` map from an API spec. The best
+   first target, because the output is declarative data rather than executable code and the
+   gate that validates it already exists. `testdata/catalog/sf.accounts.json` is a handful of
+   hand-written lines for one table; the per-connector authoring cost at n=1,000 is visible
+   from n=2.
+2. **Schema-drift triage** - diff spec versions, classify breaking vs. additive, draft the
+   patch. This attacks the cost ADR-004 treats as decisive: "schema drift alone would consume
+   the team."
+3. **Request translation** - plan -> SOQL/GraphQL/REST/ES DSL, placed *after* policy injection
+   and residual assignment so the model is handed dispositions already decided and never makes
+   a security decision itself.
+
+**What this prototype does and doesn't support.** Only item 1 has evidence here. Both mocks
+speak one generic HTTP shape (`internal/connector/httpsource.go`), so this build never faced
+dialect translation and never saw a schema change - items 2 and 3 are extrapolation from
+problems it didn't have to solve, not findings from ones it did.
+
+**And the honest catch.** The verification such a tier would need - asserting the generated
+query's predicate set exactly matches the plan's, metamorphic invariants over query pairs,
+differential validation against a fetch-everything control - is not LLM-specific. It would
+catch a hand-written connector's off-by-one just as readily. It doesn't exist here because at
+n=2 human review was doing that job implicitly and unmeasurably. The generation question
+surfaces a verification gap that already exists; it doesn't create one.
+
+---
+
 ## Fixture notes
 
 Two fixtures are deliberately hostile or pessimistic. Both look like modelling errors if you

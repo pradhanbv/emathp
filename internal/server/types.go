@@ -47,13 +47,15 @@ type ErrorBody struct {
 // point is the timeout-to-partial-result path existing, not genuine
 // row-by-row streaming (see IMPLEMENTATION_PLAN.md Cycle 11).
 type Frame struct {
-	IsTerminal bool                    `json:"is_terminal,omitempty"`
-	Partial    bool                    `json:"partial,omitempty"`
-	TraceID    string                  `json:"trace_id,omitempty"`
-	Columns    []string                `json:"columns,omitempty"`
-	Rows       [][]any                 `json:"rows,omitempty"`
-	Sources    map[string]SourceStatus `json:"sources,omitempty"`
-	Error      *ErrorBody              `json:"error,omitempty"`
+	IsTerminal      bool                    `json:"is_terminal,omitempty"`
+	Partial         bool                    `json:"partial,omitempty"`
+	TraceID         string                  `json:"trace_id,omitempty"`
+	Columns         []string                `json:"columns,omitempty"`
+	Rows            [][]any                 `json:"rows,omitempty"`
+	FreshnessMS     *int64                  `json:"freshness_ms"`
+	RateLimitStatus map[string]string       `json:"rate_limit_status"`
+	Sources         map[string]SourceStatus `json:"sources,omitempty"`
+	Error           *ErrorBody              `json:"error,omitempty"`
 }
 
 // SourceStatus reports one connector's outcome within a partial Frame -

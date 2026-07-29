@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -294,7 +295,26 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 		return o
 	}
 
-	return resultOutcome(traceID, result, summarizeFreshness(sources))
+	return resultOutcome(traceID, result, summarizeFreshness(sources), rateLimitStatus(s.deps.RateLimit, sources))
+}
+
+// rateLimitStatus reports each queried connector's remaining budget - the
+// same Limiter state TestRateLimitExhausted's 429 path already enforces,
+// now surfaced on the success path instead of a hardcoded placeholder.
+// "unlimited" for a connector with no configured budget (Limiter.Remaining
+// returns -1 for that case); otherwise the exact remaining call count, read
+// after this request's own fetch already spent its token so it reflects
+// current state, not a stale snapshot from before the call.
+func rateLimitStatus(rl *ratelimit.Limiter, sources map[string]connector.Source) map[string]string {
+	status := make(map[string]string, len(sources))
+	for name := range sources {
+		if remaining := rl.Remaining(name); remaining < 0 {
+			status[name] = "unlimited"
+		} else {
+			status[name] = strconv.Itoa(remaining)
+		}
+	}
+	return status
 }
 
 // runStream is buildAndRoute+exec.Run shaped as a single NDJSON terminal
@@ -318,6 +338,16 @@ func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req Query
 
 	p, sources, params, err := s.buildAndRoute(req, principal, role)
 	if err == nil {
+		// sources is populated as soon as admission and routing succeed,
+		// independent of whether the fetch itself succeeds - DESIGN.md
+		// ADR-009/Section 7 promise the terminal frame "always carries"
+		// freshness_ms and rate_limit_status, timeout or not, since a
+		// SOURCE_TIMEOUT partial result is exactly the case a caller most
+		// needs to know which connector was rate-limited or already stale.
+		fresh := summarizeFreshness(sources)
+		frame.FreshnessMS = &fresh.AgeMS
+		frame.RateLimitStatus = rateLimitStatus(s.deps.RateLimit, sources)
+
 		var result *exec.Result
 		result, err = exec.Run(ctx, p, sources, principal.Attributes, params)
 		if err == nil {
@@ -490,7 +520,7 @@ func rowsToAny(columns []string, rows []map[string]string) [][]any {
 	return out
 }
 
-func resultOutcome(traceID string, result *exec.Result, fresh freshnessSummary) outcome {
+func resultOutcome(traceID string, result *exec.Result, fresh freshnessSummary, rlStatus map[string]string) outcome {
 	rows := rowsToAny(result.Columns, result.Rows)
 
 	var meta *Meta
@@ -510,7 +540,7 @@ func resultOutcome(traceID string, result *exec.Result, fresh freshnessSummary) 
 			Columns:         result.Columns,
 			Rows:            rows,
 			FreshnessMS:     &freshnessMS,
-			RateLimitStatus: map[string]string{"sf": "ok"},
+			RateLimitStatus: rlStatus,
 			TraceID:         traceID,
 			Meta:            meta,
 		},

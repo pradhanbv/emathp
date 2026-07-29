@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/pradhanbv/emathp/internal/mocksf"
+	"github.com/pradhanbv/emathp/internal/mockzd"
 	"github.com/pradhanbv/emathp/test/acceptance/harness"
 )
 
@@ -49,4 +50,36 @@ func TestAsyncReroute(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return gw.Poll(res.Body.PollURL).Done
 	}, 5*time.Second, 100*time.Millisecond)
+}
+
+// TestRateLimitStatusNamesQueriedConnector proves rate_limit_status reports
+// the connector(s) a query actually touched, not a hardcoded "sf" - a
+// zd-only query must never claim anything about sf, a connector it never
+// called this request.
+func TestRateLimitStatusNamesQueriedConnector(t *testing.T) {
+	zd := mockzd.Start(t, mockzd.Tickets(5, "open"))
+	gw := harness.Start(t, testDepsZD(t, zd))
+
+	res := gw.Query("support", "SELECT id FROM zd.tickets")
+
+	require.Equal(t, 200, res.Code)
+	require.Contains(t, res.Body.RateLimitStatus, "zd")
+	require.NotContains(t, res.Body.RateLimitStatus, "sf")
+}
+
+// TestRateLimitStatusReflectsRemainingBudget proves the reported status is
+// live budget, not a static "ok" that never moves - it must fall as calls
+// spend the configured limit, the same Limiter state TestRateLimitExhausted's
+// 429 path already enforces but the response envelope never surfaced.
+func TestRateLimitStatusReflectsRemainingBudget(t *testing.T) {
+	sf := mocksf.Start(t, mocksf.Rows(5))
+	deps := testDeps(t, sf)
+	deps.RateLimit.SetLimit("sf", 5)
+	gw := harness.Start(t, deps)
+
+	first := gw.Query("support", simpleSQL)
+	require.Equal(t, "4", first.Body.RateLimitStatus["sf"])
+
+	second := gw.Query("support", simpleSQL)
+	require.Equal(t, "3", second.Body.RateLimitStatus["sf"])
 }

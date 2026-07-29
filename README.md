@@ -41,6 +41,126 @@ curl -s localhost:8080/v1/query \
 
 Every response carries `freshness_ms`, `rate_limit_status`, and `trace_id`.
 
+### Recreate: async reroute
+
+`Prefer: respond-async` (previously only provable by reading `TestAsyncReroute`). It doesn't
+require actually exhausting a connector's budget first - the header reroutes to the in-memory job
+queue on request, the same path a client would fall back to after a `429 RATE_LIMIT_EXHAUSTED`
+(see the next section for that path itself).
+
+```bash
+POLL_URL=$(curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -H "Prefer: respond-async" \
+ -d '{"sql":"SELECT id FROM sf.accounts"}' | jq -r .poll_url)
+echo "$POLL_URL"
+# /v1/jobs/job-1
+
+curl -s "localhost:8080$POLL_URL" | jq
+# {
+#   "done": true,
+#   "result": {
+#     "columns": ["id"],
+#     "rows": [...],
+#     "freshness_ms": 0,
+#     "rate_limit_status": {"sf": "unlimited"},
+#     "trace_id": "..."
+#   }
+# }
+```
+
+If `done` is `false` on the first poll, the job hasn't finished yet - re-run the second `curl`.
+The async job is an in-memory map with no real queue (`internal/server/server.go`'s `asyncJob`),
+so this resolves near-instantly against a mock; the poll contract itself is what
+`TestAsyncReroute` proves with `require.Eventually`.
+
+### Recreate: rate-limit exhaustion
+
+`docker-compose.yml`'s `gateway` service runs with no `--sf-limit`/`--zd-limit` flag, i.e.
+unlimited - the flag exists (`cmd/gateway/main.go`) but the default stack never sets it, so a
+`429` never happens against the plain quickstart. Run a second gateway locally instead, pointed
+at the same two mocks (their ports are already exposed to the host by `docker-compose.yml`),
+with a budget low enough to hit:
+
+```bash
+docker compose --profile mocks up -d   # just the two mocks - the compose gateway can stay up too
+go run ./cmd/gateway --addr :8090 --sf-url http://localhost:8081 --zd-url http://localhost:8082 --sf-limit 3 &
+
+for i in 1 2 3 4; do
+  curl -s -D - -o /dev/null localhost:8090/v1/query \
+    -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+    -d '{"sql":"SELECT id FROM sf.accounts"}' | grep -iE "^HTTP|Retry-After"
+done
+kill %1   # stop the gateway instance started above
+```
+
+```
+HTTP/1.1 200 OK
+HTTP/1.1 200 OK
+HTTP/1.1 200 OK
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+```
+
+A budget of 3 lets exactly 3 calls through - `rate_limit_status.sf` in each body counts down
+`"2"` -> `"1"` -> `"0"` across them - and the 4th gets `429` + `Retry-After: 1` + an `error.code`
+of `RATE_LIMIT_EXHAUSTED` naming the connector and suggesting `Prefer: respond-async`. The same
+`429` `TestRateLimitExhausted` proves in-process.
+
+### Recreate: freshness control
+
+Same query, same principal, `max_staleness` set. Three states, not two - and which one a "first"
+call actually shows you depends on whether the gateway process already has a cache entry for this
+exact `(principal, table, columns, filters)` signature, since that cache lives for the process's
+whole lifetime, not per-request. Against a gateway you haven't touched yet you'll see the first
+two; against a long-lived one (the Docker stack, or one you've already been experimenting
+against) you may land straight on the third instead of the first - that's not a bug, see below.
+
+**1. Cold** - nothing cached yet, so `meta` is absent entirely (`resultOutcome` only sets it when
+a cache hit, a revalidation, or a join applies):
+
+```bash
+curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' | jq '{freshness_ms, meta}'
+# { "freshness_ms": 0, "meta": null }
+```
+
+**2. Warm** - the same call again, immediately, within the 60s window - served from memory, `sf`
+never touched:
+
+```bash
+curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' | jq '{freshness_ms, meta}'
+# { "freshness_ms": 24, "meta": {"cache_hit": true} }
+```
+
+`freshness_ms` here is however many milliseconds elapsed between the two curls - small and
+non-zero, not a fixed number.
+
+**3. Stale, but unchanged** - `max_staleness` isn't part of the cache key (only table/columns/
+filters/principal are), so the *same* entry from step 1-2 can be re-asked against a shorter
+budget once enough real time has passed. Wait past the previous entry's age, then ask with a
+tight `max_staleness`:
+
+```bash
+sleep 2
+curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"1s"}' | jq '{freshness_ms, meta}'
+# { "freshness_ms": 0, "meta": {"revalidated": true} }
+```
+
+This is the state you land on by accident if you just re-run step 1 after the entry has aged past
+60s on a gateway you've already exercised - the cache issues a conditional `If-None-Match` instead
+of a plain fetch, `sf`'s data hasn't actually changed, and it comes back `304`. `cache_hit` is
+omitted (`omitempty`, and it's `false` here - this wasn't served from memory, a real conditional
+request went out) while `revalidated: true` is the point worth noticing: ADR-005's "a conditional
+request is a request" made concrete. The connector still saw a call and the rate-limit budget
+still moved, even though no new bytes came back. `TestMaxStalenessServesCache` proves states 1-2
+in-process; `TestETagRevalidationSpendsBudget` proves state 3's budget accounting.
+
 ---
 
 ## Ten-minute reviewer path

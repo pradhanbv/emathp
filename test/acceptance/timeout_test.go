@@ -35,4 +35,32 @@ func TestSourceTimeoutPartialResults(t *testing.T) {
 	require.True(t, last.Partial)
 	require.Equal(t, "SOURCE_TIMEOUT", last.Sources["zd"].Error)
 	require.NotEmpty(t, last.TraceID)
+
+	// DESIGN.md ADR-009 and Section 7 promise the terminal frame "always
+	// carries" freshness_ms and rate_limit_status - not just on success. A
+	// SOURCE_TIMEOUT partial result is exactly the case a caller most needs
+	// this: which connector was rate-limited or already stale, not just
+	// which one timed out.
+	require.NotNil(t, last.FreshnessMS)
+	require.Contains(t, last.RateLimitStatus, "zd")
+}
+
+// TestStreamSuccessCarriesFreshnessAndRateLimitStatus proves the "always
+// carries" half of DESIGN.md's terminal-frame promise on the non-timeout
+// path too - freshness_ms and rate_limit_status aren't special-cased to the
+// partial-result path.
+func TestStreamSuccessCarriesFreshnessAndRateLimitStatus(t *testing.T) {
+	zd := mockzd.Start(t, mockzd.Tickets(5, "open"))
+	gw := harness.Start(t, testDepsZD(t, zd))
+
+	res := gw.QueryStream("support", "SELECT id FROM zd.tickets", "")
+
+	frames := res.NDJSON()
+	require.NotEmpty(t, frames)
+
+	last := frames[len(frames)-1]
+	require.True(t, last.IsTerminal)
+	require.False(t, last.Partial)
+	require.NotNil(t, last.FreshnessMS)
+	require.Contains(t, last.RateLimitStatus, "zd")
 }

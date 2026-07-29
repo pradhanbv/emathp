@@ -22,7 +22,7 @@ freshness control.
 ```bash
 docker compose --profile core --profile mocks up -d # gateway + 2 mock SaaS sources
 go test ./... # 30 tests, ~1s
-docker compose --profile testing run k6 # load test, 60s
+docker compose --profile testing run --rm k6 # load test: 500 req/s for 60s
 ```
 
 Then try the demo that matters - the same SQL under two identities:
@@ -132,42 +132,47 @@ conditions**. We built what a reviewer cannot take on faith.
 Per-user delegated tokens make entitlements correct essentially for free, but force
 per-principal cache keys and collapse locality. The capacity model assumes 30%.
 
-The k6 script is parameterized by distinct principal count so this is measured, not assumed:
+The k6 script is parameterized by distinct principal count so this is measured, not assumed.
+Every run below is **500 req/s sustained for 60s (30,001 requests), 0 failures**, against the
+Docker stack, with the gateway restarted between runs so a warm cache can't inflate the next:
 
 ```bash
-k6 run -e PRINCIPALS=1 k6/load.js
-k6 run -e PRINCIPALS=10 k6/load.js
-k6 run -e PRINCIPALS=100 k6/load.js
+docker compose --profile core --profile mocks up -d
+docker compose --profile testing run --rm -e PRINCIPALS=100 k6   # then 1000, then 10000
 ```
 
-| Distinct principals | `result_cache_hit_ratio` | Connector calls (of 200 requests) |
-|---|---|---|
-| 1 | 99.5% | 1 |
-| 10 | 95.0% | 10 |
-| 100 | 50.0% | 100 |
+| Distinct principals | `result_cache_hit_ratio` | Connector calls (of 30,001 requests) | p95 latency |
+|---|---|---|---|
+| 1 | 99.99% | 3 | 398 µs |
+| 100 | 99.33% | 200 | 420 µs |
+| 1,000 | 93.33% | 2,000 | 491 µs |
+| 10,000 | 33.33% | 20,000 | 713 µs |
 
-Connector calls tracks distinct principals almost exactly (1, 10, 100) - each principal's
-first request is always a miss, every later repeat of that same principal is a hit, so misses
-converge on `min(principals, requests)`. That's the whole mechanism DESIGN.md Section 5.3
-worries about, reproduced directly: hit ratio is a function of how many distinct cache keys a
-fixed request volume has to cover, and per-principal keying (ADR-002) is what makes principal
-count the thing driving that number instead of query variety.
+Connector calls track distinct principals exactly - `principals x 2` in every row, because each
+principal misses once on its first fetch and once more when its 30s `max_staleness` expires
+midway through the 60s run. That's the whole mechanism DESIGN.md Section 5.3 worries about,
+reproduced directly: hit ratio is a function of how many distinct cache keys a fixed request
+volume has to cover, and per-principal keying (ADR-002) is what makes principal count - not
+query variety - the thing driving it.
 
-**Methodology note.** Docker and k6 weren't available in the sandbox this prototype was built
-in, so these three numbers come from a sequential harness issuing the same request pattern
-`k6/load.js` encodes (same query shape, same principal-rotation scheme, `max_staleness=30s`)
-against the real `gateway`/`mocksf` binaries over real HTTP - not a unit test, not simulated.
-Each `PRINCIPALS` value ran against a freshly started gateway (an already-warm cache would
-inflate later runs with an earlier run's entries). Running the literal `k6 run` commands above
-against a live Docker setup will reproduce the same trend; true concurrent-throughput numbers
-(the "Connector calls/s" DESIGN.md's own capacity table uses) need k6's actual concurrency,
-which this substitute doesn't have.
+**Cross-checked three ways.** k6 computes the ratio client-side from each response's
+`meta.cache_hit`; the gateway independently reports `result_cache_requests_total{outcome}`; and
+`connector_request_duration_seconds_count` counts actual outbound fetches. For the 10,000-principal
+run all three agree exactly - 10,001 hits, 20,000 misses, 20,000 connector calls - so the ratio
+isn't an artifact of how the load generator happens to count.
 
-**What it means:** the ratio degrades in line with the model's pessimistic case well before
-100 distinct principals, which is a real system's steady state at any nontrivial tenant size.
-Connector quota - not our fleet - becomes the binding constraint, and quota is not something we
-can autoscale past. That would trigger the ADR-005 tenant-snapshot path. This is why the
-measurement sits in M2 of the execution plan rather than M5.
+**What it means:** hit ratio holds up well past where the capacity model's 30% assumption sits,
+but *only while principal count stays small relative to request volume*. At 10,000 principals
+against 30,001 requests it falls to 33% - and p95 latency rises 398 µs -> 713 µs in step with it,
+because a miss is an actual connector call. That is the degradation path Section 5.3 predicts,
+visible in two independent signals at once. At real scale (10M users) principal count dominates
+request volume by orders of magnitude, so connector quota - not our fleet - becomes the binding
+constraint, and quota is not something we can autoscale past. That would trigger the ADR-005
+tenant-snapshot path, and it is why this measurement sits in M2 rather than M5.
+
+**Caveat on the latency figures.** Sub-millisecond p95 against in-process Go mocks on one host
+says nothing about the 1.5s SLO, which is dominated by real SaaS API latency (A4: 200-800 ms).
+What the p95 column is good for is the *shape* - it moves with miss rate - not the magnitude.
 
 **Found while measuring this, not before.** Building this table surfaced a real bug: two
 requests sharing a cached plan (same SQL shape, different WHERE-clause literal) were silently

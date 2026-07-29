@@ -22,3 +22,22 @@ var ConnectorRequestDuration = promauto.NewHistogramVec(
 	},
 	[]string{"connector", "outcome"},
 )
+
+// ResultCacheRequests is the raw signal result_cache_hit_ratio derives from
+// (DESIGN.md Section 9): outcome="hit" means internal/freshness served
+// stored rows with no outbound call; outcome="miss" means a live or
+// conditional fetch was made, whether or not it came back 304. The ratio
+// itself is a PromQL rate() over this counter, not a value tracked
+// in-process - that lets a dashboard, an alert, and the Section 5.3
+// principal-count measurement each pick their own window over one signal.
+// No principal label here even though the cache key it mirrors does carry
+// one (freshness.go's cacheKey) - a per-principal label on a Prometheus
+// series is a cardinality explosion at 10M users the in-memory cache key
+// doesn't pay, since a map key isn't a metric time series.
+var ResultCacheRequests = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "result_cache_requests_total",
+		Help: "Freshness/result-cache lookups by connector and outcome (hit|miss). result_cache_hit_ratio = rate(hit) / rate(hit+miss).",
+	},
+	[]string{"connector", "outcome"},
+)

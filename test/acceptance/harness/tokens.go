@@ -19,8 +19,9 @@ var tokensDir = func() string {
 }()
 
 var personaFile = map[string]string{
-	"support": "dana.jwt", // hostile on purpose: asserts tenant_id t_evilcorp
-	"admin":   "root.jwt",
+	"support":  "dana.jwt", // hostile on purpose: asserts tenant_id t_evilcorp
+	"admin":    "root.jwt",
+	"support2": "erin.jwt", // same role+region as dana (group 8f3c-4d21), different sub - proves cache isolation is about principal, not role
 }
 
 // tokenFor reads a real fixture token - raw unverified claims JSON, not a

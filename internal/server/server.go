@@ -223,6 +223,7 @@ func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, r
 			Cache:        s.deps.Freshness,
 			RateLimit:    s.deps.RateLimit,
 			Connector:    name,
+			Principal:    principal.Tenant + "|" + principal.Sub,
 			MaxStaleness: maxStaleness,
 		}
 	}

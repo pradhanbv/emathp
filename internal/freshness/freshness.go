@@ -22,12 +22,20 @@ import (
 )
 
 // Cache holds the last fetched rows per distinct outbound request
-// signature (table + columns + bound filter values), shared across all
-// principals and requests for the gateway process's lifetime. That's safe
-// because the signature is taken from the fully-bound FetchRequest exec
-// actually sends - two principals whose pushed filter values differ (e.g.
-// a per-region RLS predicate that got pushed) never collide on the same
-// key.
+// signature (principal + table + columns + bound filter values), shared
+// across all requests for the gateway process's lifetime. Principal has to
+// be part of that signature, not just table/columns/filters: our own
+// RLS/CLS don't need it, since a residual filter re-applies on every read
+// regardless of cache state - but source-side sharing rules (DESIGN.md
+// ADR-002 "layer 3") apply under the calling principal's own delegated
+// token, and can differ per user for an identical query independent of
+// anything our own policy computes (e.g. Salesforce record-ownership
+// sharing, which is per-user, not per-role). A cache keyed on the fetch
+// signature alone would silently let one principal's fetch serve rows a
+// different principal's own source-side grant would never have returned -
+// a leak through the cache that neither the plan-time invariant nor the
+// runtime verification filter can see, because neither ever inspects the
+// cache.
 type Cache struct {
 	mu      sync.Mutex
 	entries map[string]*entry
@@ -70,6 +78,7 @@ type Source struct {
 	Cache        *Cache
 	RateLimit    *ratelimit.Limiter
 	Connector    string
+	Principal    string        // tenant_id + "|" + principal sub - see Cache's doc comment
 	MaxStaleness time.Duration // 0 = no caching, always live
 
 	CacheHit    bool
@@ -85,7 +94,7 @@ func (s *Source) Fetch(ctx context.Context, req connector.FetchRequest) ([]conne
 		return s.timedFetch(ctx, req)
 	}
 
-	key := cacheKey(req)
+	key := cacheKey(req, s.Principal)
 	now := s.Cache.now()
 
 	s.Cache.mu.Lock()
@@ -97,10 +106,12 @@ func (s *Source) Fetch(ctx context.Context, req connector.FetchRequest) ([]conne
 		if age <= s.MaxStaleness {
 			s.CacheHit = true
 			s.AgeMS = age.Milliseconds()
+			recordResultCacheOutcome(s.Connector, "hit")
 			return e.rows, connector.FetchMeta{}, nil
 		}
 		req.ETag = e.etag
 	}
+	recordResultCacheOutcome(s.Connector, "miss")
 
 	if !s.RateLimit.Allow(s.Connector) {
 		return nil, connector.FetchMeta{}, &ratelimit.ExhaustedError{Connector: s.Connector}
@@ -157,10 +168,12 @@ func (s *Source) timedFetch(ctx context.Context, req connector.FetchRequest) ([]
 	return rows, meta, err
 }
 
-// cacheKey signs an outbound fetch by table, requested columns, and bound
-// filter values - the same signature two calls need to share for one to
-// safely serve the other's cached rows.
-func cacheKey(req connector.FetchRequest) string {
+// cacheKey signs an outbound fetch by principal, table, requested columns,
+// and bound filter values (DESIGN.md ADR-002's result-cache key addendum) -
+// the same signature two calls need to share for one to safely serve the
+// other's cached rows. principal must be part of it: see Cache's doc
+// comment for why table/columns/filters alone isn't enough.
+func cacheKey(req connector.FetchRequest, principal string) string {
 	cols := append([]string(nil), req.Columns...)
 	sort.Strings(cols)
 
@@ -171,11 +184,21 @@ func cacheKey(req connector.FetchRequest) string {
 	sort.Strings(keys)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s|%s|", req.Table, strings.Join(cols, ","))
+	fmt.Fprintf(&b, "%s|%s|%s|", principal, req.Table, strings.Join(cols, ","))
 	for _, k := range keys {
 		vals := append([]string(nil), req.Filters[k]...)
 		sort.Strings(vals)
 		fmt.Fprintf(&b, "%s=%s,", k, strings.Join(vals, "+"))
 	}
 	return b.String()
+}
+
+// recordResultCacheOutcome feeds both the in-memory registry (what tests
+// assert against) and the real Prometheus counter (what /metrics exposes)
+// from the one call site that actually knows the outcome - the same
+// dual-emission pattern timedFetch uses for connector_request_duration_seconds,
+// so neither copy can drift from what actually happened.
+func recordResultCacheOutcome(connectorName, outcome string) {
+	obs.Observe("result_cache_requests_total", map[string]string{"connector": connectorName, "outcome": outcome}, 1)
+	obs.ResultCacheRequests.WithLabelValues(connectorName, outcome).Inc()
 }

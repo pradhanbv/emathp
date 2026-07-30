@@ -83,3 +83,24 @@ func TestRateLimitStatusReflectsRemainingBudget(t *testing.T) {
 	second := gw.Query("support", simpleSQL)
 	require.Equal(t, "3", second.Body.RateLimitStatus["sf"])
 }
+
+// TestSourceRateLimitMapsToRateLimitExhausted proves a 429 from the SOURCE
+// itself (mocksf.RateLimit, entirely independent of our own
+// ratelimit.Limiter, which is left unconfigured here so it can't be the
+// cause) is reported as RATE_LIMIT_EXHAUSTED with the source's own
+// Retry-After passed through - not silently misclassified as
+// CONNECTOR_AUTH_FAILED, which is what happened before this test existed:
+// the source's 429 was wrapped in a plain error, never matched
+// ratelimit.ExhaustedError, and fell through to classifyError's default.
+func TestSourceRateLimitMapsToRateLimitExhausted(t *testing.T) {
+	sf := mocksf.Start(t, mocksf.Rows(5), mocksf.RateLimit(1))
+	gw := harness.Start(t, testDeps(t, sf))
+
+	first := gw.Query("support", simpleSQL)
+	require.Equal(t, 200, first.Code, "first call should be within the source's own budget")
+
+	second := gw.Query("support", simpleSQL)
+	require.Equal(t, 429, second.Code)
+	require.Equal(t, "RATE_LIMIT_EXHAUSTED", second.Body.Error.Code)
+	require.NotEmpty(t, second.Header.Get("Retry-After"))
+}

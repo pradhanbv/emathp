@@ -67,3 +67,17 @@ type ColumnUnavailableError struct {
 func (e *ColumnUnavailableError) Error() string {
 	return fmt.Sprintf("connector: column %q unavailable", e.Column)
 }
+
+// RateLimitedError signals the source itself rejected a call with its own
+// rate limit (HTTP 429) - distinct from ratelimit.ExhaustedError, which is
+// our own bucket saying no *before* a call goes out. Both surface to the
+// caller as RATE_LIMIT_EXHAUSTED, but this preserves the source's own
+// Retry-After value instead of guessing one.
+type RateLimitedError struct {
+	Table      string
+	RetryAfter string
+}
+
+func (e *RateLimitedError) Error() string {
+	return fmt.Sprintf("connector: source rate limited fetching %q, retry after %s", e.Table, e.RetryAfter)
+}

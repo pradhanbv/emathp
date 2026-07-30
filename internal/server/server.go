@@ -233,25 +233,37 @@ func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, r
 }
 
 // classifyError maps an error from buildAndRoute or exec.Run to an HTTP
-// status and response code. defaultStatus/defaultCode apply to whatever
-// doesn't match a recognized type - callers pass a different default
-// depending on which stage the error came from (buildAndRoute's default is
-// a query-shape problem; exec.Run's is a connector problem), since a bare
-// type switch can't otherwise tell the two apart.
-func classifyError(err error, defaultStatus int, defaultCode string) (status int, code string) {
+// status, response code, and Retry-After value (empty if not applicable).
+// defaultStatus/defaultCode apply to whatever doesn't match a recognized
+// type - callers pass a different default depending on which stage the
+// error came from (buildAndRoute's default is a query-shape problem;
+// exec.Run's is a connector problem), since a bare type switch can't
+// otherwise tell the two apart.
+//
+// Two distinct causes both map to RATE_LIMIT_EXHAUSTED: our own bucket
+// saying no before a call goes out (ratelimit.ExhaustedError, no inherent
+// retry time in this prototype's non-refilling budget, so "1" is a
+// placeholder), and the source itself rejecting the call with its own 429
+// (connector.RateLimitedError, which carries the source's real Retry-After
+// - conflating the two by falling through to a generic default is exactly
+// the bug this type exists to prevent).
+func classifyError(err error, defaultStatus int, defaultCode string) (status int, code string, retryAfter string) {
 	var exhausted *ratelimit.ExhaustedError
+	var rateLimited *connector.RateLimitedError
 	var timedOut *exec.SourceTimeoutError
 	switch {
+	case errors.As(err, &rateLimited):
+		return http.StatusTooManyRequests, "RATE_LIMIT_EXHAUSTED", rateLimited.RetryAfter
 	case errors.As(err, &exhausted):
-		return http.StatusTooManyRequests, "RATE_LIMIT_EXHAUSTED"
+		return http.StatusTooManyRequests, "RATE_LIMIT_EXHAUSTED", "1"
 	case errors.As(err, &timedOut):
-		return http.StatusGatewayTimeout, "SOURCE_TIMEOUT"
+		return http.StatusGatewayTimeout, "SOURCE_TIMEOUT", ""
 	case errors.Is(err, plan.ErrEntitlementDenied):
-		return http.StatusForbidden, "ENTITLEMENT_DENIED"
+		return http.StatusForbidden, "ENTITLEMENT_DENIED", ""
 	case errors.Is(err, errConnectorMissing):
-		return http.StatusBadGateway, "CONNECTOR_AUTH_FAILED"
+		return http.StatusBadGateway, "CONNECTOR_AUTH_FAILED", ""
 	default:
-		return defaultStatus, defaultCode
+		return defaultStatus, defaultCode, ""
 	}
 }
 
@@ -267,9 +279,13 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 
 	p, sources, params, err := s.buildAndRoute(req, principal, role)
 	if err != nil {
-		status, code := classifyError(err, http.StatusBadRequest, "UNSUPPORTED_PREDICATE")
+		status, code, retryAfter := classifyError(err, http.StatusBadRequest, "UNSUPPORTED_PREDICATE")
 		span.RecordError(err)
-		return errorOutcome(traceID, status, code, err.Error())
+		o := errorOutcome(traceID, status, code, err.Error())
+		if retryAfter != "" {
+			o.Headers = map[string]string{"Retry-After": retryAfter}
+		}
+		return o
 	}
 
 	timeout := parseTimeout(req.Timeout)
@@ -281,15 +297,19 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 
 	result, err := exec.Run(ctx, p, sources, principal.Attributes, params)
 	if err != nil {
-		status, code := classifyError(err, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED")
+		status, code, retryAfter := classifyError(err, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED")
 		message := err.Error()
 		var exhausted *ratelimit.ExhaustedError
-		if errors.As(err, &exhausted) {
+		var rateLimited *connector.RateLimitedError
+		switch {
+		case errors.As(err, &exhausted):
 			message = fmt.Sprintf("rate limit exhausted for connector %q; retry after the window resets or use Prefer: respond-async", exhausted.Connector)
+		case errors.As(err, &rateLimited):
+			message = fmt.Sprintf("source rate limit exhausted fetching %q; retry after the window resets or use Prefer: respond-async", rateLimited.Table)
 		}
 		o := errorOutcome(traceID, status, code, message)
-		if code == "RATE_LIMIT_EXHAUSTED" {
-			o.Headers = map[string]string{"Retry-After": "1"}
+		if retryAfter != "" {
+			o.Headers = map[string]string{"Retry-After": retryAfter}
 		}
 		span.RecordError(err)
 		return o
@@ -363,7 +383,7 @@ func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req Query
 		if errors.As(err, &timedOut) {
 			frame.Sources = map[string]SourceStatus{timedOut.Connector: {Error: "SOURCE_TIMEOUT"}}
 		} else {
-			_, code := classifyError(err, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED")
+			_, code, _ := classifyError(err, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED")
 			frame.Error = &ErrorBody{Code: code, Message: err.Error()}
 		}
 	}

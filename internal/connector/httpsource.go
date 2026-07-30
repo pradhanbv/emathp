@@ -107,7 +107,7 @@ func (s *HTTPSource) fetchPage(ctx context.Context, req FetchRequest, offset int
 		return nil, false, FetchMeta{}, &ColumnUnavailableError{Column: body.Field}
 
 	case http.StatusTooManyRequests:
-		return nil, false, FetchMeta{}, fmt.Errorf("connector: rate limited, retry after %s", resp.Header.Get("Retry-After"))
+		return nil, false, FetchMeta{}, &RateLimitedError{Table: req.Table, RetryAfter: resp.Header.Get("Retry-After")}
 
 	default:
 		return nil, false, FetchMeta{}, fmt.Errorf("connector: unexpected status %d", resp.StatusCode)

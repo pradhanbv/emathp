@@ -479,7 +479,7 @@ we build this.
 | Buy all (Merge/Nango/Paragon/Airbyte) | Unified-API vendors normalize to a lowest-common-denominator schema, rarely exposing per-field pushdown or per-user delegated auth - both load-bearing here. Buying everything means fetching wide and filtering locally, breaking quota *and* the entitlement model. |
 | **Hybrid, split by whether pushdown matters** ← chosen | - |
 
-**Decision. Build** (~10-20 connectors) where pushdown, delegated OAuth, rate-limit semantics,
+**Decision.** Build (~10-20 connectors) where pushdown, delegated OAuth, rate-limit semantics,
 and watermark support determine whether we hit SLOs at all - Salesforce, Zendesk, Jira,
 GitHub, Google Workspace, Slack, Notion. **Buy** the long tail via a unified-API vendor behind
 our own Connector SDK interface, so the vendor is an implementation detail of one `Connector`.
@@ -597,11 +597,16 @@ pushdown, so `sf.accounts JOIN sf.opportunities` gets the same treatment as a cr
    dir on tenant-encrypted ephemeral storage, reset after every query.
 
 **Consequences we accept.** Cross-app joins get their own SLO - **P95 < 4 s**, separate from
-the 1.5 s single-source target (folding them in would be dishonest measurement). Materialized
-volumes incur egress cost and a residency obligation federated execution avoids.
+the 1.5 s single-source target (folding them in would be dishonest measurement). An over-broad
+join is **rejected** (`RESULT_TOO_LARGE`), not spilled - though if the estimate would fit the
+async tier's larger in-memory limit (job runners aren't bound by the 1.5s/4s SLO, so more RAM,
+never disk), the rejection message suggests `Prefer: respond-async` instead; a cardinality too
+large even for that tier is still rejected either way. Materialized volumes incur egress cost
+and a residency obligation federated execution avoids.
 
 **Revisit if.** > 20% of joins fall back to materialization; memory rejections become a common
-support burden.
+support burden; async-tier rejections become common enough to justify a third, still-larger
+tier.
 
 **Open question: `LIMIT`/`OFFSET`.** Listed in the SQL surface (Section 1), not designed past
 the grammar, and not implemented - the prototype silently ignores either if present, a gap
@@ -733,6 +738,25 @@ one we mint, carrying a normalized claim contract every downstream component rea
 
 **Naming.** This is the **ingress identity broker** - distinct from the **egress token
 broker** of ADR-002, which mints SaaS credentials. Opposite directions; easy to conflate.
+
+**The full lifecycle, condensed.** Three phases; the two brokers never touch each other's data
+across any of them.
+
+1. **Onboarding** (once, control-plane timescale) - an admin registers the tenant (ADR-008),
+   registers its `iss` in the tenant registry, and configures the group→role mapping and
+   RLS/CLS policy.
+2. **Per-connector consent** (once per source, before first query) - the user (or an admin on
+   their behalf) completes a delegated OAuth consent with Salesforce/Zendesk directly; the
+   resulting refresh token lands in Vault, tenant-KEK-wrapped - never derived from the tenant
+   token, a wholly separate credential chain.
+3. **Query time** (per request) - the ingress broker verifies the tenant token and resolves
+   attributes from the tenant registry, handing the gateway a normalized internal token;
+   separately, the egress broker looks up that same stored refresh token to mint a short-TTL
+   access token scoped to that specific user, which the connector worker presents to the
+   source **as that user**, never as a generic service identity.
+
+The ingress broker only ever reads the tenant registry; the egress broker only ever reads
+Vault - neither's compromise exposes what the other holds.
 
 **Consequences we accept.** Authorization staleness becomes an explicit SLO (attribute cache
 TTL 60 s, published, alertable, with synchronous invalidation for urgent revocation) rather
@@ -956,10 +980,14 @@ I'd expect **ADR-001, ADR-004, ADR-005** to get reopened (I hold them weakly or 
 judgment calls with no data yet); I'd defend **ADR-002 and ADR-011** hard - both are security
 invariants, and relitigating them mid-build costs more than any design gain.
 
-**Team shape:** EM (1), Backend (3 - gateway+ratelimit / planner+policy / connector SDK),
-Infra (1), Security (1), QA (1), Product (0.5), DX (0.5). The backend split is by *seam*, not
-feature, so the `ENFORCED`/`ADVISORY` capability contract between planner and SDK has an owner
-on both sides from day one - it's the interface most likely to rot.
+**Team shape:** EM (1), Backend (3 - gateway+ratelimit / planner+policy / connector SDK +
+Egress Token Broker), Infra (1), Security (1), QA (1), Product (0.5), DX (0.5). The backend
+split is by *seam*, not feature, so the `ENFORCED`/`ADVISORY` capability contract between
+planner and SDK has an owner on both sides from day one - it's the interface most likely to
+rot. The Egress Token Broker gets the same two-sided treatment: Backend(3) builds and operates
+it, Security owns its threat-model review and specific controls (attestation, anomaly
+detection, kill switch) as a gate before it ships - it holds every tenant's SaaS credentials,
+a sharper version of the same seam.
 
 **Milestones:**
 

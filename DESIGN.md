@@ -291,7 +291,11 @@ rejected option, including the ones this section only summarizes, is in
 required capabilities are settled; the tool that provides them is not. Committing now would be
 a guess dressed as a decision.*
 
-**Required capabilities** (these are firm, and any candidate must provide all five):
+**Context.** We need parse -> validate -> capability-aware pushdown -> optional join
+reorder, and the plan must carry RLS/CLS structurally (ADR-002). Planning sits inside a
+500 ms P50 budget.
+
+**Required capabilities** (firm - any candidate must provide all five):
 
 1. Per-predicate pushdown verdicts against a declared capability map, distinguishing
    `ENFORCED` from `ADVISORY` (ADR-002 depends on this and nothing else here matters without it)
@@ -300,9 +304,23 @@ a guess dressed as a decision.*
 4. A serializable plan form, for the cache key and the audit trail (ADR-003)
 5. p99 planning under 30 ms for the v1 SQL surface
 
-**Default position, and how we would leave it.** Run Calcite in a pre-warmed JVM sidecar and
-talk to it over gRPC. Move only when a measurement says to. The spike's job is to confirm the
-five capabilities above are met and that planning latency is in budget - not to pick a favourite.
+**Options.**
+
+| Option | Case for | Why not chosen |
+|---|---|---|
+| **Trino / Starburst** | Mature federation, huge connector library, real cost-based optimizer, and a `SystemAccessControl` SPI that has provided `getRowFilters` and `getColumnMask` since release 331 (2020) - plus a first-class OPA access-control plugin that returns mask expressions from Rego. Row/column security is genuinely solved here. | Targets JDBC/object-storage sources, not SaaS REST APIs - the connector model, catalog-scoped credentials, and shared-worker-pool isolation all fight this design (A1, per-tenant economics). |
+| **Steampipe / Postgres FDW** | Exactly this product category - SQL over SaaS APIs via foreign data wrappers, and it already exists | Single-tenant by construction, with no per-predicate `ENFORCED`/`ADVISORY` contract - the primitive ADR-002 is built on. |
+| **Apache DataFusion (Rust)** | Extensible rule-based optimizer, native Substrait, no JVM, no GC, no network hop | **Closest runner-up** - rejected on team-capability grounds, not technical merit; a defensible reversal (Section 12). |
+| **Go-native parser (vitess / pg_query_go / tidb)** | Single runtime, no hop | Gives an AST, not an optimizer - we'd own capability-aware pushdown and residual-predicate correctness ourselves, the security-critical part (ADR-002). |
+| **Calcite in-process via GraalVM native-image** | No hop, no JVM warmup | Native-image's closed-world compilation conflicts with Calcite's reflection - but only if the *executor* needs it too. An open spike question, not a settled rejection. |
+| **Apache Spark** | - | Batch scheduler - never a candidate at a 500 ms P50 budget. |
+
+**Decision (leading candidate - not yet fixed).** Calcite as an out-of-process sidecar, gRPC
+transport, **Substrait** plan IR, fronted by a parameterized plan cache (ADR-003). Run it in a
+pre-warmed JVM and move only when a measurement says to - the spike's job is to confirm the five
+required capabilities above are met and planning latency is in budget, not to pick a favourite.
+The prototype ships with an in-process Go planner instead: sufficient for the v1 surface, and
+itself evidence for the **Go-native parser** row above.
 
 **Attribution before migration.** "Switch to DataFusion" is not one decision, it is two with very
 different costs. Swapping the sidecar's runtime removes GC from the tail but **keeps the hop**;
@@ -339,28 +357,7 @@ pods with a warm spare make cold start a non-issue. The JVM ecosystem has severa
 warmup mitigations if that assumption turns out to be wrong; we would evaluate them then rather
 than design around them now.
 
-**Decided by:** end of M1, by the planner owner, on spike evidence. The prototype ships with an
-in-process Go planner, which is sufficient for the v1 surface and is itself evidence for
-candidate 3 below.
-
-**Context.** We need parse -> validate -> capability-aware pushdown -> optional join
-reorder, and the plan must carry RLS/CLS structurally (ADR-002). Planning sits inside a
-500 ms P50 budget.
-
-**Options.**
-
-| Option | Case for | Why not chosen |
-|---|---|---|
-| **Trino / Starburst** | Mature federation, huge connector library, real cost-based optimizer, and a `SystemAccessControl` SPI that has provided `getRowFilters` and `getColumnMask` since release 331 (2020) - plus a first-class OPA access-control plugin that returns mask expressions from Rego. Row/column security is genuinely solved here. | Targets JDBC/object-storage sources, not SaaS REST APIs - the connector model, catalog-scoped credentials, and shared-worker-pool isolation all fight this design (A1, per-tenant economics). |
-| **Steampipe / Postgres FDW** | Exactly this product category - SQL over SaaS APIs via foreign data wrappers, and it already exists | Single-tenant by construction, with no per-predicate `ENFORCED`/`ADVISORY` contract - the primitive ADR-002 is built on. |
-| **Apache DataFusion (Rust)** | Extensible rule-based optimizer, native Substrait, no JVM, no GC, no network hop | **Closest runner-up** - rejected on team-capability grounds, not technical merit; a defensible reversal (Section 12). |
-| **Go-native parser (vitess / pg_query_go / tidb)** | Single runtime, no hop | Gives an AST, not an optimizer - we'd own capability-aware pushdown and residual-predicate correctness ourselves, the security-critical part (ADR-002). |
-| **Calcite in-process via GraalVM native-image** | No hop, no JVM warmup | Native-image's closed-world compilation conflicts with Calcite's reflection - but only if the *executor* needs it too. An open spike question, not a settled rejection. |
-| **Apache Spark** | - | Batch scheduler - never a candidate at a 500 ms P50 budget. |
-
-**Leading candidate** (not yet a decision): Calcite as an out-of-process sidecar, gRPC
-transport, **Substrait** plan IR, fronted by a parameterized plan cache (ADR-003). The
-consequences below are what we would be accepting if the spike confirms it.
+**Decided by:** end of M1, by the planner owner, on spike evidence.
 
 **Consequences we accept.**
 - Two runtimes in the build, the image, and the on-call rotation. Real recurring cost - and one
@@ -538,14 +535,17 @@ non-zero count means the connector's behaviour has diverged from its declared ca
 we fail closed rather than serve. Cheap for equality predicates.
 
 **"Lying connector" understates the common case, which is our own code.** A vendor is unlikely
-to misrepresent its API. What is likely: our connector sends `?region=EMEA` where the API
-expects `?filter[region]=EMEA`, and most REST frameworks **silently ignore unknown query
-parameters** and return the unfiltered set. Also common - a filter honoured alone but dropped
-in combination with another parameter, null or case semantics differing from our assumption,
-or a minor API version changing behaviour without erroring. In every case the symptom is
-identical: an RLS filter that appears pushed, does nothing, and leaks the full table with a
-200. Verification is therefore an assertion that the predicate we believe we pushed actually
-took effect - closer to a bounds check than to a trust control.
+to misrepresent its API. What is likely is one of these, all equally plausible:
+
+- Our connector sends `?region=EMEA` where the API expects `?filter[region]=EMEA`, and most
+  REST frameworks **silently ignore unknown query parameters** and return the unfiltered set.
+- A filter is honoured alone but dropped when combined with another parameter.
+- Null or case semantics differ from our assumption.
+- A minor API version changes behaviour without erroring.
+
+In every case the symptom is identical: an RLS filter that appears pushed, does nothing, and
+leaks the full table with a 200. Verification is therefore an assertion that the predicate we
+believe we pushed actually took effect - closer to a bounds check than to a trust control.
 
 **The cost is a column width, not a row count.** Verification adds the predicate column to a
 projection of rows we were already fetching. When pushdown works, that is a few bytes per row.
@@ -569,12 +569,15 @@ every column referenced by a local predicate or mask, and the join keys - then t
 `Project` trims back. This applies to `ENFORCED` predicates too, because the verification
 filter re-applies them locally. Sampling is not an option: verifying a fraction of requests
 means a lying connector succeeds on the remainder. Two failure modes follow, and both fail
-closed: (a) the user's own source token cannot read the predicate column - Salesforce
-field-level security can hide it - so neither filtering nor verification is possible, which is
-checked at connector onboarding by asserting every policy-referenced column is readable by the
-least-privileged role the policy applies to; (b) a masked column used in a predicate is
-fetched raw, filtered on raw, then masked on output - correct, but the unmasked value transits
-our memory and is logged as an instance of the same bounded weakness as the `ADVISORY` path.
+closed:
+
+- The user's own source token cannot read the predicate column - Salesforce field-level
+  security can hide it - so neither filtering nor verification is possible. Checked at
+  connector onboarding by asserting every policy-referenced column is readable by the
+  least-privileged role the policy applies to.
+- A masked column used in a predicate is fetched raw, filtered on raw, then masked on output -
+  correct, but the unmasked value transits our memory and is logged as an instance of the same
+  bounded weakness as the `ADVISORY` path.
 
 **The result cache key, precisely - and why it can't be looser.** "Keyed by principal" above
 is not a rounding-error simplification; the key must carry both tenant and principal, not just
@@ -720,22 +723,29 @@ and bind principal context at execution. Key:
  connector_capability_version, role_set_hash)
 ```
 
-**Why every component is load-bearing.** Parameterization solves the *value* dimension
-only. If a tenant adds a new column mask, the DAG is *structurally* wrong and binding
-fresh values will not save you - hence `policy_shape_hash`. Two roles with different
-policy structure need different plan shapes - hence `role_set_hash`. Connector capability
-changes alter which predicates are `ENFORCED`, invalidating pushdown verdicts - hence
-`connector_capability_version`. Policy writes in the control plane publish an invalidation
-event; we also bound staleness with a short TTL as a backstop against missed events.
+**Why every component is load-bearing.** Parameterization solves the *value* dimension only -
+each other component closes a gap that leaves open:
+
+- If a tenant adds a new column mask, the DAG is *structurally* wrong and binding fresh values
+  won't save you - hence `policy_shape_hash`.
+- Two roles with different policy structure need different plan shapes - hence `role_set_hash`.
+- Connector capability changes alter which predicates are `ENFORCED`, invalidating pushdown
+  verdicts - hence `connector_capability_version`.
+
+Policy writes in the control plane publish an invalidation event; we also bound staleness with
+a short TTL as a backstop against missed events.
 
 **What this cache is actually for - and what it is not.** No requirement asks for plan
 caching; it exists because ADR-001 put a JVM planner in the request path, and without
-amortization that choice cannot pay for itself. Ranked honestly: (1) **tail-latency
-containment** - GC pauses and pathological plans hit only the miss population; (2) **audit
-determinism** - a cached plan is a stable hashable artifact, and its hash in the audit trail
-proves what executed under which `policy_version`; (3) **fleet cost**, worth ~2-3x, not the
-order of magnitude an earlier draft claimed. It is *not* a meaningful mean-latency
-optimization: ~25 ms of a ~270 ms query is ~9%.
+amortization that choice cannot pay for itself. Ranked honestly:
+
+1. **Tail-latency containment** - GC pauses and pathological plans hit only the miss
+   population.
+2. **Audit determinism** - a cached plan is a stable hashable artifact, and its hash in the
+   audit trail proves what executed under which `policy_version`.
+3. **Fleet cost** - worth ~2-3x, not the order of magnitude an earlier draft claimed.
+
+It is *not* a meaningful mean-latency optimization: ~25 ms of a ~270 ms query is ~9%.
 
 **Topology.** Two tiers: a per-pod LRU (no RTT, but cold on every scale-out) backed by a
 shared Redis tier holding the serialized Substrait blobs (a few KB each, ~1 ms). Without the
@@ -775,7 +785,7 @@ An engineering lead's job is to answer whether we build this.
 
 **Options.** Build all, buy all (Merge / Nango / Paragon / Airbyte), hybrid.
 
-**Decision. Hybrid, split by whether pushdown matters.**
+**Decision.** Hybrid, split by whether pushdown matters.
 
 - **Build** (~10-20 connectors): the ones where predicate pushdown, delegated OAuth,
  per-endpoint rate-limit semantics, and watermark support determine whether we hit our
@@ -833,7 +843,7 @@ burning the rate-limit budget - the constraint that makes this hard.
  don't accept SQL, and update-timestamp watermarks are blind to **hard deletes**, so a
  deleted record stays visible in cache indefinitely.
 
-**Decision. A four-rung capability ladder, declared per connector in the catalog.**
+**Decision.** A four-rung capability ladder, declared per connector in the catalog.
 
 | Rung | Mechanism | Cost | Delete-safe |
 |---|---|---|---|
@@ -846,10 +856,13 @@ burning the rate-limit budget - the constraint that makes this hard.
 the same bucket as a data fetch and appears in `rate_limit_status`. Freshness that
 silently consumes quota is not freshness control; it is a quota leak with good PR.
 
-`max_staleness` semantics: within TTL -> serve cached, `freshness_ms` set. Outside TTL ->
-probe at the connector's best rung. Unchanged -> serve cached and reset TTL. Changed or
-rung-4 -> live fetch. If a probe would exceed budget -> `STALE_DATA` with the actual age, so
-the caller decides rather than us guessing.
+**`max_staleness` semantics:**
+- Within TTL -> serve cached, `freshness_ms` set.
+- Outside TTL -> probe at the connector's best rung.
+- Probe result unchanged -> serve cached and reset TTL.
+- Probe result changed, or the connector is rung-4 -> live fetch.
+- A probe that would exceed budget -> `STALE_DATA` with the actual age, so the caller decides
+  rather than us guessing.
 
 **Consequences we accept.**
 - Rung-3 and rung-4 connectors can serve data that omits deletions for up to the full-refresh
@@ -920,8 +933,8 @@ pushdown for same-source joins we do not exploit. Rejected for v1 because it wou
 capability model - and the connector SDK contract every connector must implement - carries a
 second, per-connector notion of "which join shapes can this source push down," on top of
 per-predicate pushdown. That is real scope for a model built to generalize across 1,000s of app
-types, most of which have no equivalent to SOQL subqueries at all. Revisit if a small set of
-same-source joins dominate query volume enough to justify a connector-specific fast path.
+types, most of which have no equivalent to SOQL subqueries at all. **Revisit if** a small set
+of same-source joins dominate query volume enough to justify a connector-specific fast path.
 
 1. **Federated on the fly (preferred).** Fetch the smaller side first, then push its join
  keys into the larger side as an `IN` predicate - a semi-join rewrite. Applies when the
@@ -955,20 +968,29 @@ this flips.
  single-source predicate-pushdown queries. Cross-app joins target **P95 < 4 s** and are
  reported as a separate SLI. Silently folding joins into the headline SLO would be
  dishonest measurement.
-- **"Spill to materialization" - which reading.** The requirement admits two. *Fall back from
- federated execution to a materialized intermediate*: yes, that is tier 2 above, and it is the
- reading we take. *Spill to disk when memory is exhausted mid-join*, in the database-systems
- sense: **no, deliberately.** Spilling inside a 1.5 s budget trades a fast failure for a slow
- one, and it creates an encrypted-temp-storage obligation for data that should never persist.
- ADR-001 decides *whether* to spill (the cardinality estimate that says semi-join will not
- work); this ADR decides *how* - and the answer to memory exhaustion is rejection, not disk.
+- **"Spill to materialization" - which reading.** The requirement admits two:
+  - *Fall back from federated execution to a materialized intermediate* - yes, that is tier 2
+    above, and it is the reading we take.
+  - *Spill to disk when memory is exhausted mid-join*, in the database-systems sense - **no,
+    deliberately.** Spilling inside a 1.5 s budget trades a fast failure for a slow one, and it
+    creates an encrypted-temp-storage obligation for data that should never persist. The
+    cardinality estimate that decides whether semi-join applies is computed by whatever
+    planner runtime ADR-001 settles on; this ADR decides what happens once that estimate says
+    spill to materialization - and the answer to memory exhaustion is rejection, not disk.
 - Memory guardrails mean a join over an over-broad predicate is **rejected**, not spilled:
- `RESULT_TOO_LARGE` with the offending cardinality estimate and a suggested narrowing.
+ `RESULT_TOO_LARGE` with the offending cardinality estimate and a suggested narrowing. If the
+ estimate would fit within the async tier's larger in-memory limit - job runners aren't bound
+ by the 1.5s/4s SLO, so they can be provisioned with more RAM, never disk - the message also
+ suggests `Prefer: respond-async` instead of a hard rejection. This only raises the ceiling, it
+ doesn't remove it: a cardinality too large even for the async tier is still rejected, and the
+ reroute is a suggestion the caller opts into, never an automatic switch of execution mode they
+ didn't ask for.
 - Materialization moves data into our compute layer: egress cost, and a residency
  obligation (Section 4.3) that federated execution avoids.
 
 **Revisit if.** > 20% of joins fall back to materialization; memory rejections become a
-common support burden.
+common support burden; async-tier rejections become common enough to justify a third,
+still-larger tier.
 
 **Open question: `LIMIT`/`OFFSET` - not yet designed past the grammar.** Section 1.4's SQL
 surface lists `LIMIT`/`OFFSET`; nothing past the grammar has been decided, and the prototype
@@ -1098,9 +1120,11 @@ as a complete, verifiable record of *what happened*, while the ability to re-ass
 with a named individual is destroyed. This satisfies both obligations; it is a deliberate
 choice and it is the kind of thing an auditor will ask about.
 
-**Also on off-boarding.** Cancel in-flight jobs, drain async queues, invalidate plan and
-result caches, revoke connector OAuth grants, and emit a completion attestation with
-timestamps for each step.
+**Also on off-boarding:**
+- Cancel in-flight jobs and drain async queues.
+- Invalidate plan and result caches.
+- Revoke connector OAuth grants.
+- Emit a completion attestation with timestamps for each step.
 
 **Consequences we accept.** The audit key domain is a residual data footprint after
 shredding. We document exactly what it retains. Break-glass access to it requires two-person
@@ -1123,7 +1147,7 @@ entire entitlement chain is trustworthy.
 |---|---|
 | **Read `tenant_id`, `roles`, `region` straight from the token** | **Security defect.** See below - this is the tempting default and it is wrong. |
 | **Direct federation** - register each tenant's IdP, derive tenant from `iss`, resolve attributes ourselves | Viable and simpler; every downstream component must then tolerate per-IdP claim quirks forever. Kept as the fallback for tenants who require it. |
-| **Ingress token exchange (RFC 8693)** <- CHOSEN | Chosen. |
+| **Ingress token exchange (RFC 8693)** <- CHOSEN | Selected - see Decision below; the one option giving every downstream component (OPA, planner, audit) a single normalized claim contract regardless of the customer's IdP. |
 | mTLS / client certificates | Wrong ergonomics for end users; no attribute carriage. |
 
 **Decision.** Admission is three distinct steps, followed by an exchange.
@@ -1165,6 +1189,70 @@ resolve from different systems.
 **Naming.** This is the **ingress identity broker**. It is distinct from the **egress token
 broker** of ADR-002, which mints SaaS credentials. Two trust domains, opposite directions,
 and conflating them in review is easy - hence the explicit naming.
+
+**The full lifecycle, made concrete.** The two brokers never touch each other's data, and
+that separation is easiest to see across the whole flow at once - from tenant onboarding,
+through the per-connector consent that actually establishes a user's source-side credential,
+to the two independent lookups a single query triggers at execution time:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Admin
+    actor Q as Query User
+    participant TID as Tenant IdP
+    participant CP as Control Plane<br/>(tenant registry + policy store)
+    participant SOA as Source OAuth<br/>(Salesforce/Zendesk consent)
+    participant SEC as Secrets<br/>(Vault, tenant KEK)
+    participant G as Gateway
+    participant I as Identity Broker
+    participant B as Egress Token Broker
+    participant CW as Connector Worker
+    participant S as Source API
+
+    rect rgb(238, 242, 255)
+    Note over A,CP: ONBOARDING - once, control-plane timescale
+    A->>CP: register tenant (namespace, KMS key, residency tag) - ADR-008
+    CP-->>A: control-plane access granted
+    A->>CP: register tenant's iss (issuer -> tenant mapping) - ADR-011
+    A->>CP: configure group->role mapping, RLS/CLS policy - ADR-002
+    end
+
+    rect rgb(254, 249, 195)
+    Note over Q,SEC: PER-CONNECTOR CONSENT - once per source, before first query
+    Q->>SOA: delegated OAuth consent (or admin, on Q's behalf)
+    SOA-->>SEC: Q's own refresh token stored, tenant-KEK-wrapped - ADR-002
+    end
+
+    rect rgb(236, 253, 245)
+    Note over Q,S: QUERY TIME - per request
+    Q->>TID: authenticate (existing tenant login)
+    TID-->>Q: OIDC token (iss, sub, groups)
+    Q->>G: POST /v1/query + OIDC token
+    G->>I: verify signature (JWKS pinned per iss)
+    I->>CP: derive tenant from verified iss - never from a claim
+    I->>CP: resolve roles + attributes from group->role mapping
+    CP-->>I: tenant_id, role_set, attributes
+    I-->>G: internal token - normalized claims (ADR-011)
+    G->>G: L1/L2 policy checks (ADR-002)
+    G->>CW: dispatch fetch, principal = Q, connector = sf
+    CW->>B: mint short-TTL token for (principal=Q, connector=sf, purpose=read)
+    B->>SEC: fetch Q's own refresh token - the same one stored in the consent phase
+    SEC-->>B: Q's refresh token
+    B-->>CW: short-TTL access token scoped to Q - memory only, never logged
+    Note over CW,S: CW calls the source AS Q, using Q's own delegated<br/>grant - never a generic service identity
+    CW->>S: query + PUSHED_ENFORCED predicates, bearer = Q's token
+    S->>S: vendor applies its OWN sharing rules for Q specifically - L3
+    S-->>CW: rows visible to Q at source
+    CW-->>G: rows
+    end
+```
+
+The two brokers read from two different stores and never overlap: the Identity Broker only
+ever reads the Control Plane (tenant registry, role/attribute mapping); the Egress Token
+Broker only ever reads Secrets (the refresh token a user's own consent established). Neither
+one's failure or compromise exposes what the other holds - which is the concrete version of
+"two trust domains, opposite directions" above.
 
 **Consequences we accept.**
 - **Authorization staleness becomes an explicit SLO** rather than an accident of token
@@ -1489,7 +1577,7 @@ is a cost overrun and a capacity problem at the same time.
 | Role | FTE | Primary ownership |
 |---|---|---|
 | Engineering Manager | 1 | Delivery, cross-team dependencies, vendor negotiation (ADR-004) |
-| Backend | 3 | (1) Gateway + rate limiting (2) Planner + policy compilation (3) Connector SDK + connectors |
+| Backend | 3 | (1) Gateway + rate limiting (2) Planner + policy compilation (3) Connector SDK + connectors + Egress Token Broker |
 | Infrastructure | 1 | Terraform, Helm, Argo, autoscaling, DR |
 | Security | 1 | Threat model, key lifecycle, off-boarding, pen-test readiness |
 | QA | 1 | Conformance suite, load testing, chaos |
@@ -1498,7 +1586,12 @@ is a cost overrun and a capacity problem at the same time.
 
 **Staffing note.** The backend split is deliberately by *seam*, not by feature, so the
 capability contract between planner and SDK (ADR-002's `ENFORCED`/`ADVISORY` distinction)
-has an owner on both sides from day one. It is the interface most likely to rot.
+has an owner on both sides from day one. It is the interface most likely to rot. The Egress
+Token Broker gets the same two-sided treatment: Backend(3) builds and operates it, Security
+owns its threat-model review and the specific controls ADR-002 names - workload attestation,
+anomaly detection, the kill switch - as a gate before it ships, not an afterthought. It is the
+one component holding every tenant's SaaS credentials, which makes it a sharper version of the
+same kind of seam.
 
 ### 10.2 Milestones
 
@@ -1563,7 +1656,7 @@ operative clause; if these diverge, this one is correct.*
 
 | ADR | Requirement (verbatim) | Why it exists | Rejected (for the final design) | Built (prototype) |
 |---|---|---|---|---|
-| **001** Planner **(PROPOSED)** | *"Query Planner: capability discovery, predicate/column pushdown, join plan, cost/freshness hints, spill to materialization when necessary."* (the *decision to* spill; the mechanism is ADR-007) | Something must turn SQL into a capability-aware pushdown plan; the choice fixes runtime, latency floor, and plan IR. **Deliberately left open** - the required capabilities are fixed, the tool is chosen by measurement in M1. | Trino; DataFusion; Steampipe/FDW; Go-native parser; GraalVM-native Calcite; Spark | **n/a** - prototype uses an in-process Go planner, which is itself spike evidence |
+| **001** Planner **(PROPOSED)** | *"Query Planner: capability discovery, predicate/column pushdown, join plan, cost/freshness hints, spill to materialization when necessary."* (the cardinality estimate feeding this comes from whatever planner ADR-001 settles on; the spill decision and its mechanism are both ADR-007) | Something must turn SQL into a capability-aware pushdown plan; the choice fixes runtime, latency floor, and plan IR. **Deliberately left open** - the required capabilities are fixed, the tool is chosen by measurement in M1. | Trino; DataFusion; Steampipe/FDW; Go-native parser; GraalVM-native Calcite; Spark | **n/a** - prototype uses an in-process Go planner, which is itself spike evidence |
 | **002** Entitlements | *"enforce least-privilege access; row/column-level security (RLS/CLS) based on source permissions and tenant policy"*; *"Document how policies are compiled into query plans."* | The brief's hardest requirement; three layers, partial evaluation, `ENFORCED`/`ADVISORY`, and verification all fall out of it. | Post-filter in Go; inject into compiled Substrait; OPA as blob store; Zanzibar/OpenFGA; Cedar | **Mostly** - injection, invariant, verification real; OPA + delegated OAuth mocked |
 | **003** Plan cache | *(no direct requirement - nearest is "cache hit ratios" under sizing math)* | Anything derived from policy and then cached inherits the policy's version; a naive plan cache is therefore a privilege-escalation vector. Also amortizes planning **if** ADR-001 stays expensive. | No cache; key on SQL text alone; key on `(sql, user)` | **Yes** |
 | **004** Build vs buy | *"Connector SDK: capability model (tables/fields/ops/limits), auth/token refresh, pagination, concurrency contracts, standardized error codes."*; *"you may reference merge.dev/categories"* | 1000s of app types cannot be hand-built in six months; splitting by whether pushdown determines the SLO is the call the brief invites. | Build all; buy all (Merge/Nango/Airbyte) | **No** - both connectors mocked |

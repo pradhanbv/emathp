@@ -1078,17 +1078,17 @@ this one is correct.*
 
 | ADR | Requirement (trimmed) | Rejected (for the final design) | Built (prototype) |
 |---|---|---|---|
-| **001** Planner (PROPOSED) | Capability discovery, pushdown, join plan, spill decision | Trino; DataFusion; Steampipe/FDW; Go-native parser; GraalVM Calcite; Velox; Spark | **n/a** - in-process Go planner is itself spike evidence |
-| **002** Entitlements | RLS/CLS from source perms + tenant policy; document plan compilation | Post-filter in Go; inject into Substrait; OPA as blob store; Zanzibar; Cedar; sampled verification; pushing security predicates to `ADVISORY` | **Mostly** - injection, invariant, verification real; OPA + delegated OAuth mocked |
-| **003** Plan + result cache | *(no direct requirement)* | No cache; key on SQL text; key on `(sql, user)`; result cache per-pod only, or sticky routing | **Partial** - plan cache yes, result cache's shared tier designed only |
-| **004** Build vs buy | Capability model, auth/refresh, pagination, error codes | Build all; buy all | **No** - both connectors mocked |
-| **005** Freshness | Avoid stale data; per-query staleness hints; honor rate limits | Centralized CDC/lake; `MAX(updated_at)` probes | **Partial** - rungs 1 &amp; 4 + `max_staleness` |
-| **006** Rate limits | Token buckets/concurrency pools; head-of-line avoidance | In-memory per-pod buckets; Redis on every decision; Envoy ratelimit | **Partial** - single-node bucket, 429, async reroute |
-| **007** Joins | Federated vs. materialization; spill when necessary | Naive dual full fetch; container-per-join DuckDB; ClickHouse; disk spill; native same-source pushdown | **Partial** - semi-join yes, DuckDB no |
+| **001** Planner (PROPOSED) | Capability discovery, pushdown, join plan, spill decision | • Trino<br>• DataFusion<br>• Steampipe/FDW<br>• Go-native parser<br>• GraalVM Calcite<br>• Velox<br>• Spark | **n/a** - in-process Go planner is itself spike evidence |
+| **002** Entitlements | RLS/CLS from source perms + tenant policy; document plan compilation | • Post-filter in Go<br>• Inject into Substrait<br>• OPA as blob store<br>• Zanzibar<br>• Cedar<br>• Sampled verification<br>• Pushing security predicates to `ADVISORY` | **Mostly** - injection, invariant, verification real; OPA + delegated OAuth mocked |
+| **003** Plan + result cache | *(no direct requirement)* | • Plan cache: no cache<br>• Plan cache: key on SQL text alone<br>• Plan cache: key on `(sql, user)`<br>• Result cache: per-pod only, no shared tier<br>• Result cache: sticky routing without a shared store | **Partial** - plan cache yes, result cache's shared tier designed only |
+| **004** Build vs buy | Capability model, auth/refresh, pagination, error codes | • Build all<br>• Buy all | **No** - both connectors mocked |
+| **005** Freshness | Avoid stale data; per-query staleness hints; honor rate limits | • Centralized CDC/lake<br>• `MAX(updated_at)` probes | **Partial** - rungs 1 &amp; 4 + `max_staleness` |
+| **006** Rate limits | Token buckets/concurrency pools; head-of-line avoidance | • In-memory per-pod buckets<br>• Redis on every decision<br>• Envoy ratelimit | **Partial** - single-node bucket, 429, async reroute |
+| **007** Joins | Federated vs. materialization; spill when necessary | • Naive dual full fetch<br>• Container-per-join DuckDB<br>• ClickHouse<br>• Disk spill<br>• Native same-source pushdown | **Partial** - semi-join yes, DuckDB no |
 | **008** Tenant lifecycle | Multi/single-tenant, no code changes; instant off-boarding | `terraform apply` per tenant | **No** |
-| **009** Streaming | Timeouts and partial results for slow sources | Chunked transfer + status code; HTTP trailers | **At risk** |
-| **010** Crypto-shred | Per-tenant keys; automated shredding; audit trails | "Instantly destroy the KMS key"; shred audit under tenant key | **No** |
-| **011** Identity | OIDC AuthN, policy AuthZ; token → scopes/roles → RLS/CLS | Trust token claims; direct federation (kept as fallback); mTLS | **Partial** - issuer→tenant real, signature mocked |
+| **009** Streaming | Timeouts and partial results for slow sources | • Chunked transfer + status code<br>• HTTP trailers | **At risk** |
+| **010** Crypto-shred | Per-tenant keys; automated shredding; audit trails | • "Instantly destroy the KMS key"<br>• Shred audit under tenant key | **No** |
+| **011** Identity | OIDC AuthN, policy AuthZ; token → scopes/roles → RLS/CLS | • Trust token claims<br>• Direct federation (kept as fallback)<br>• mTLS | **Partial** - issuer→tenant real, signature mocked |
 
 **Two patterns.** ADR-003's plan-cache half is the only entry with no requirement behind it,
 fully built, while ADR-001 - the decision it partly serves - is not: its *latency* case

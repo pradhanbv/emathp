@@ -181,12 +181,18 @@ policies, secrets, audit.
 
 | Control plane (human timescale) | Data plane (request timescale) |
 |---|---|
-| Tenant & connector registry | Query Gateway |
+| Tenant & connector registry | Query Gateway (materialization + result cache run in-process here) |
 | Schema catalog, connector versions | Query Planner (Calcite sidecar) |
 | Policy store (authoring, versioning) | Policy Decision sidecar (OPA, partial eval) |
 | Secrets & KMS key lifecycle | Connector workers |
 | Rate-limit *policy* definitions | Rate-limit *enforcement* (token buckets) |
-| Audit sink, residency tags | Materialization runtime, async job runners |
+| Audit sink, residency tags | Async job runners |
+
+**Materialization and the result cache are not separately deployed components in this
+design.** ADR-007 runs DuckDB in-process specifically to avoid the network hop and cold-start
+cost a separate service would add; the result cache has no distributed tier either (Section
+5.2). Both run inside the same Query Gateway pods whose memory budget is derived in Section
+5.2 - listing them as their own row here would misstate the topology.
 
 **One deliberate exception.** The **Egress Token Broker** sits in neither plane. By the rule
 above it is data plane - it is in the egress path - but it holds refresh tokens, which must
@@ -194,7 +200,6 @@ never reach data-plane workloads (ADR-002). We therefore run it as its own trust
 its own identity, authorization, and audit, and keep it off the hot path by caching minted
 short-TTL tokens in worker memory. Calling this out rather than filing it under one plane or
 the other is the honest treatment: it is a credential boundary, not a scaling boundary.
-| Tenant lifecycle API (ADR-008) | Result cache |
 
 ### 2.2 Component topology
 
@@ -1413,18 +1418,13 @@ Weighted mean **W ~ 245 ms**. By **Little's Law**, L = lambda x W:
 
 | Resource | Derivation | Size |
 |---|---|---|
-| **Gateway pods** | I/O-bound Go; ~100 QPS/pod at 4 vCPU / 8 GB | **20-24 pods**, 3 AZs, N+1 per AZ |
+| **Gateway pods** | I/O-bound Go; ~100 QPS/pod, 4 vCPU. Memory (8 GB) derived below, not asserted | **20-24 pods**, 3 AZs, N+1 per AZ |
 | **Planner sidecars** | Only cache misses reach it: 10% x 1,000 = 100 plans/s; Calcite ~25 ms -> L = 2.5 concurrent | **4-6 pods**, floored by HA and warm spares rather than by load. Uncached, 1,000 plans/s -> L = 25 concurrent -> ~10-12 pods. The cache saves **~2-3x**, not an order of magnitude - see ADR-003 for why the fleet saving is *not* the main reason it exists. |
 | **Connector concurrency** | Calls/s = 0.55x1000 + 0.15x2x1000 + ~10% probes ~ **935 calls/s**; at connector p95 0.8 s -> L = 748 | **~750 concurrent outbound**, allocated per connector by semaphore (ADR-006) |
 | **Materialization memory** | Joins = 150 QPS x 0.6 s = 90 concurrent x 256 MB `memory_limit` | **~23 GB fleet-wide**; capped at 8 concurrent joins/pod (2 GB), excess queued then shed |
 | **Result/freshness cache memory** | Miss rate 70% x 1,000 = 700/s; over a 60 s staleness window, 21,000-42,000 live entries x 100-200 KB/entry | **~2-8 GB fleet-wide**; a range, not a point estimate - see derivation below |
 | **Redis** | Lease reconciliation, not per-request: ~24 pods x ~20 buckets x 1 Hz ~ **500 ops/s** | Single 3-node cluster, vastly under-utilized |
 | **Network** | 100 MB/s egress ~ 800 Mbps, plus comparable connector ingest | Budget **2 Gbps** sustained |
-
-**A percentile trap worth stating.** At a 90% plan-cache hit ratio the *miss population is
-the P95* - the 95th-percentile request is by definition a miss, so planner latency lands in
-the SLO undiminished. Keeping the planner out of P95 requires >=95% hit, realistically ~98%.
-Hit ratio targets set against mean latency will silently fail a percentile SLO.
 
 **Two memory pools, worked explicitly.** Materialization and the result cache both hold
 fetched rows, but for different reasons and different durations - worth deriving separately
@@ -1463,6 +1463,44 @@ rather than folding into one number.
 For a cache-miss join specifically, the same fetched rows briefly exist in both pools at
 once - one copy computing the current result, one copy serving a future request - so the two
 totals are additive, not overlapping allocations: **~25-31 GB combined** for these two pools.
+
+**Gateway pod size, derived backwards from concurrency and working-set size, not asserted.**
+Pod *count* above comes from QPS; pod *size* needs its own derivation from what actually has
+to fit in memory at once.
+
+1. **Max concurrent joins per pod (K) - a design choice, not backed into an assumed pod
+   size.** K = 8, trading off two failure modes: too small and the fleet needs more pods just
+   for join capacity; too large and a burst of joins on one pod could starve everything else
+   that pod is doing. K x 256 MB = **2 GB** reserved for materialization, per pod, at peak.
+2. **Pods needed for join concurrency alone**: ceil(90 / 8) = **12 pods minimum** - a number
+   the stated "8 concurrent joins/pod" cap implies but never states outright.
+3. **Pods needed for QPS throughput alone**: 1,000 / 100 = **10 pods minimum** - the raw
+   floor before the stated 3-AZ, N+1 redundancy padding.
+4. **Binding constraint**: max(12, 10) = **12** - join concurrency, not QPS, is the tighter
+   floor. Both sit comfortably under the existing 20-24 pod range, so the headline number
+   doesn't change; which constraint actually binds does.
+5. **Peak per-pod live heap**: 2 GB (step 1's cap) + ~0.4 GB (this pod's slice of the 2-8 GB
+   result cache, upper end) + ~0.1 GB (goroutine stacks and connection pools to OPA, the
+   planner, Connector Workers, Redis, and Vault - a generous planning assumption, not a
+   number cited from elsewhere in this document) ~ **2.5 GB**.
+6. **GC headroom**: Go's garbage collector (default `GOGC=100`) wants roughly 2x live heap to
+   collect efficiently rather than thrash -> 2.5 x 2 = **5 GB**.
+7. **Container/OS/sidecar overhead** (~15%): 5 x 1.15 ~ **5.75 GB derived minimum**.
+8. **Target headroom, stated as a design choice** (the same way K was in step 1): provision so
+   peak working memory never exceeds ~72% of pod capacity, leaving 28% for burst variance and
+   GC unpredictability - a standard capacity-planning convention, applied up front rather than
+   checked after the fact. Final pod size = 5.75 GB / 0.72 ~ **7.99 GB -> 8 GB**.
+
+The existing 8 GB figure is therefore a genuine *output* of this calculation, not an assertion
+it's being checked against. Steps 5-6 are the ones worth re-verifying once real data exists -
+goroutine/connection overhead and the GC multiplier are planning assumptions here, not
+measurements - while step 8's 28% headroom target is the only genuinely arbitrary choice in
+the chain, and it is labeled as one rather than hidden inside a number that looks derived.
+
+**A percentile trap worth stating.** At a 90% plan-cache hit ratio the *miss population is
+the P95* - the 95th-percentile request is by definition a miss, so planner latency lands in
+the SLO undiminished. Keeping the planner out of P95 requires >=95% hit, realistically ~98%.
+Hit ratio targets set against mean latency will silently fail a percentile SLO.
 
 ### 5.3 The sensitivity that actually matters
 

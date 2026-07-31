@@ -711,6 +711,11 @@ caches, revoke connector OAuth grants, emit a completion attestation.
 documented explicitly. Break-glass access to it requires two-person approval and is itself
 audited.
 
+**Revisit if.** A customer's auditor rejects the tokenization-based resolution as
+insufficient; break-glass access is invoked more than a handful of times a year (it should be
+exceptional, not routine); or KMS disable-latency in practice exceeds the "unreadable within
+seconds" claim.
+
 ---
 
 ### ADR-011 - Identity, tenant derivation, and attribute resolution

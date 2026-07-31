@@ -1130,6 +1130,11 @@ choice and it is the kind of thing an auditor will ask about.
 shredding. We document exactly what it retains. Break-glass access to it requires two-person
 approval and is itself audited.
 
+**Revisit if.** A customer's auditor rejects the tokenization-based resolution as
+insufficient; break-glass access to the audit key domain is invoked more than a handful of
+times a year (it should be exceptional, not routine); or KMS disable-latency in practice
+exceeds the "unreadable within seconds" claim this ADR makes.
+
 ---
 
 ### ADR-011 - Identity, tenant derivation, and principal attribute resolution

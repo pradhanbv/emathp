@@ -74,6 +74,7 @@ flowchart TB
         DUCK["Ephemeral DuckDB<br/>materialization (ADR-007)<br/><i>in-memory Go hash join instead</i>"]
         LIFE["Tenant lifecycle API<br/>(ADR-008) — not implemented"]
         KMS["Per-tenant KMS,<br/>crypto-shred (ADR-010)<br/>— not implemented"]
+        AUDIT["Audit trail<br/>(ADR-010) — not implemented<br/><i>no access log exists;<br/>nothing to review post-incident</i>"]
     end
 
     subgraph open["OPEN QUESTION — not decided, not just unbuilt"]
@@ -88,7 +89,7 @@ flowchart TB
     classDef openStyle fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
     class PLAN,RLS,CACHE,JOIN,TENANT,OBS,RCACHE builtStyle
     class FRESH,RATE,STREAM,POLICY,JWT partialStyle
-    class CONN,SIDECAR,DUCK,LIFE,KMS mockedStyle
+    class CONN,SIDECAR,DUCK,LIFE,KMS,AUDIT mockedStyle
     class LIMITOFFSET,RTL openStyle
 ```
 

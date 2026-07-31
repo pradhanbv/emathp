@@ -74,13 +74,13 @@ operative clause; if these diverge, this one is correct.*
 
 | ADR | Requirement (verbatim) | Why it exists | Rejected (for the final design) | Built (prototype) |
 |---|---|---|---|---|
-| [**001**](#adr-001---planner-runtime-and-placement) Planner **(PROPOSED)** | *"Query Planner: capability discovery, predicate/column pushdown, join plan, cost/freshness hints, spill to materialization when necessary."* (the cardinality estimate feeding this comes from whatever planner [ADR-001](#adr-001---planner-runtime-and-placement) settles on; the spill decision and its mechanism are both [ADR-007](#adr-007---join-strategy)) | Something must turn SQL into a capability-aware pushdown plan; the choice fixes runtime, latency floor, and plan IR. **Deliberately left open** - the required capabilities are fixed, the tool is chosen by measurement in M1. | • Trino<br>• DataFusion<br>• Steampipe/FDW<br>• Go-native parser<br>• GraalVM-native Calcite<br>• Spark | **n/a** - prototype uses an in-process Go planner, which is itself spike evidence |
+| [**001**](#adr-001---planner-runtime-and-placement) Planner **(PROPOSED)** | *"Query Planner: capability discovery, predicate/column pushdown, join plan, cost/freshness hints, spill to materialization when necessary."* (the cardinality estimate feeding this comes from whatever planner [ADR-001](#adr-001---planner-runtime-and-placement) settles on; the spill decision and its mechanism are both [ADR-007](#adr-007---join-strategy-a-four-tier-escalation-ladder)) | Something must turn SQL into a capability-aware pushdown plan; the choice fixes runtime, latency floor, and plan IR. **Deliberately left open** - the required capabilities are fixed, the tool is chosen by measurement in M1. | • Trino<br>• DataFusion<br>• Steampipe/FDW<br>• Go-native parser<br>• GraalVM-native Calcite<br>• Spark | **n/a** - prototype uses an in-process Go planner, which is itself spike evidence |
 | [**002**](#adr-002---entitlement-enforcement-mechanism-and-placement) Entitlements | *"enforce least-privilege access; row/column-level security (RLS/CLS) based on source permissions and tenant policy"*; *"Document how policies are compiled into query plans."* | The brief's hardest requirement; three layers, partial evaluation, `ENFORCED`/`ADVISORY`, and verification all fall out of it. | • Post-filter in Go<br>• Inject into compiled Substrait<br>• OPA as blob store<br>• Zanzibar/OpenFGA<br>• Cedar | **Mostly** - injection, invariant, verification real; OPA + delegated OAuth mocked |
 | [**003**](#adr-003---caching-plan-cache-and-result-cache) Plan + result cache | *(no direct requirement - nearest is "cache hit ratios" under sizing math)* | Anything derived from policy and then cached inherits the policy's version; a naive plan cache is therefore a privilege-escalation vector. Also amortizes planning **if** [ADR-001](#adr-001---planner-runtime-and-placement) stays expensive. | • Plan cache: no cache<br>• Plan cache: key on SQL text alone<br>• Plan cache: key on `(sql, user)`<br>• Result cache: per-pod only, no shared tier<br>• Result cache: sticky routing without a shared store | **Partial** - plan cache real; result cache's shared Redis tier designed, not built |
 | [**004**](#adr-004---connector-strategy-build-vs-buy) Build vs buy | *"Connector SDK: capability model (tables/fields/ops/limits), auth/token refresh, pagination, concurrency contracts, standardized error codes."*; *"you may reference merge.dev/categories"* | 1000s of app types cannot be hand-built in six months; splitting by whether pushdown determines the SLO is the call the brief invites. | • Build all<br>• Buy all (Merge/Nango/Airbyte) | **No** - both connectors mocked |
 | [**005**](#adr-005---freshness-watermark-capability-ladder) Freshness | *"avoid materially stale data vs. sources; allow per-query staleness hints"*; *"Freshness controls honoring rate limits"* | Freshness must not spend the quota queries need, and SaaS change-detection varies too widely for one mechanism. | • Centralized CDC / data lake<br>• `SELECT MAX(updated_at)` probes | **Partial** - rungs 1 & 4 + `max_staleness` |
 | [**006**](#adr-006---rate-limiting-and-multi-tenant-fairness) Rate limits | *"token buckets/concurrency pools per connector/tenant/user; backoff and budget allocation; async overflow path"*; *"head-of-line blocking avoidance"* | Quota is a hard external ceiling shared across tenants; one tenant must not spend another's budget or queue behind its own backlog. | • In-memory per-pod buckets<br>• Redis on every decision<br>• Envoy ratelimit | **Partial** - single-node bucket, 429, async reroute |
-| [**007**](#adr-007---join-strategy) Joins | *"Clearly document join strategy: federated on the fly vs. short-lived materialization."*; *"spill to materialization when necessary"* (mechanism) | Cross-app joins are the product's reason to exist but cannot be pushed to any single source. | • Container-per-join DuckDB<br>• ClickHouse<br>• Naive dual full fetch | **Partial** - semi-join yes, DuckDB no |
+| [**007**](#adr-007---join-strategy-a-four-tier-escalation-ladder) Joins | *"Clearly document join strategy: federated on the fly vs. short-lived materialization."*; *"spill to materialization when necessary"* (mechanism) | Cross-app joins are the product's reason to exist but cannot be pushed to any single source. | • Container-per-join DuckDB<br>• Naive dual full fetch<br>• Always-on shared ClickHouse cluster<br>• Spark-only from day one, skipping ClickHouse | **Partial** - semi-join yes; DuckDB, ClickHouse, and Spark tiers designed, none built |
 | [**008**](#adr-008---tenant-lifecycle-terraform-vs-control-plane-api) Tenant lifecycle | *"multi-tenant and single-tenant supported without code changes"*; *"org off-boarding triggers crypto-shred and job cancellation"* | Both deployment modes and instant off-boarding cannot hold if onboarding runs through `terraform apply`. | `terraform apply` per tenant | **No** |
 | [**009**](#adr-009---streaming-timeouts-and-partial-results) Streaming | *"support timeouts and partial results for slow sources"* | Once bytes are on the wire the HTTP status is committed, so partial results need a format that can report failure after success began. | • Chunked transfer + status code<br>• HTTP trailers | **At risk** |
 | [**010**](#adr-010---keys-crypto-shredding-and-the-audit-conflict) Crypto-shred | *"per-tenant keys; automated org off-boarding and crypto-shredding"*; *"audit logs, access trails"* | Off-boarding must render data unreadable immediately despite KMS destruction delays, which collides with the audit retention the same brief demands. | • "Instantly destroy the KMS key"<br>• Shred audit under the tenant key | **No** |
@@ -129,7 +129,7 @@ Covered by the design but not requiring a recorded decision.
 | Observability: OTel traces, Prometheus metrics, structured logs | [**Section 9**](#9-observability) |
 | Error vocabulary + `Retry-After` + async guidance | [**Section 7**](#7-error-vocabulary-and-ux) |
 | Six-month plan: team, milestones, acceptance criteria, risks, budget | [**Section 10**](#10-six-month-execution-plan) |
-| Bonus: cost levers, chaos plan, predicate-pushdown creativity | [Section 8.4](#84-cost-guardrails), [Section 10.2](#102-milestones) M6, [ADR-007](#adr-007---join-strategy) (semi-join rewrite) |
+| Bonus: cost levers, chaos plan, predicate-pushdown creativity | [Section 8.4](#84-cost-guardrails), [Section 10.2](#102-milestones) M6, [ADR-007](#adr-007---join-strategy-a-four-tier-escalation-ladder) (semi-join rewrite) |
 
 ---
 
@@ -183,18 +183,22 @@ policies, secrets, audit.
 
 | Control plane (human timescale) | Data plane (request timescale) |
 |---|---|
-| Tenant & connector registry | Query Gateway (materialization + result cache run in-process here) |
+| Tenant & connector registry | Query Gateway (tier 0-1 materialization + result cache run in-process here) |
 | Schema catalog, connector versions | Query Planner (Calcite sidecar) |
 | Policy store (authoring, versioning) | Policy Decision sidecar (OPA, partial eval) |
 | Secrets & KMS key lifecycle | Connector workers |
 | Rate-limit *policy* definitions | Rate-limit *enforcement* (token buckets) |
-| Audit sink, residency tags | Async job runners |
+| Audit sink, residency tags | Async job runners (tier 2: on-demand ClickHouse; tier 3: Spark serverless) |
 
-**Materialization and the result cache are not separately deployed components in this
-design.** ADR-007 runs DuckDB in-process specifically to avoid the network hop and cold-start
-cost a separate service would add; the result cache has no distributed tier either (Section
-5.2). Both run inside the same Query Gateway pods whose memory budget is derived in Section
-5.2 - listing them as their own row here would misstate the topology.
+**All four join tiers are data plane - the split below is about provisioning, not plane.**
+Tiers 0-1 (DuckDB, in-process) run inside the Query Gateway pods that are already in this table;
+they add no new row and no new fleet, because their memory is already part of the gateway pod
+budget Section 5.2 derives. Tiers 2-3 (ClickHouse, Spark) are real, separate compute, but
+provisioned on demand per escalated query rather than as a standing fleet - the async job runner
+spins one up only when a query actually escalates, then tears it down (ADR-007). That's why
+neither gets its own always-on row here either, but for the opposite reason: not because it's
+folded into the gateway pods, but because there's no persistent fleet to list. Either way, tiers
+2-3's resource footprint is genuinely outside Section 5.2's gateway pod sizing, not counted in it.
 
 **One deliberate exception.** The **Egress Token Broker** sits in neither plane. By the rule
 above it is data plane - it is in the egress path - but it holds refresh tokens, which must
@@ -1062,79 +1066,120 @@ knob trading utilization against Redis load.
 
 ---
 
-### ADR-007 - Join strategy
+### ADR-007 - Join strategy: a four-tier escalation ladder
 
 **Status:** Accepted | **Contested:** medium
 
-**Decision.** Two-tier, chosen by the planner from cardinality estimates and capability.
+**Decision.** Every join routes through one of four tiers, chosen by a cost-based estimate at
+plan time - the planner's cardinality/working-set estimate for that specific join, never table
+count, and never a runtime "try small, retry bigger on failure" loop.
 
-**This applies even when both tables share a connector.** The capability model expresses
-per-table predicate pushdown (`ENFORCED`/`ADVISORY` on `(table, column, op)`) and nothing about
-join pushdown, so `sf.accounts JOIN sf.opportunities` gets the identical treatment as a
-cross-app join - two independent scans, combined in the gateway. This leaves real capability on
-the table: Salesforce's own API (SOQL) supports relationship subqueries, a genuine native join
-pushdown for same-source joins we do not exploit. Rejected for v1 because it would mean the
-capability model - and the connector SDK contract every connector must implement - carries a
-second, per-connector notion of "which join shapes can this source push down," on top of
-per-predicate pushdown. That is real scope for a model built to generalize across 1,000s of app
-types, most of which have no equivalent to SOQL subqueries at all. **Revisit if** a small set
-of same-source joins dominate query volume enough to justify a connector-specific fast path.
+| Tier | What fits and what doesn't fit | How it solves it |
+|---|---|---|
+| **0. Single-table (no join)** | • Fits: every query with no join at all<br>• Doesn't fit: anything with two or more tables → tier 1 | • Straight connector fetch + pushdown, returned as the response<br>• No local engine invoked - nothing to combine, nothing to hold beyond one request |
+| **1. DuckDB (in-process, any join)** | • Fits: any join - 2-table today, N-way once the planner supports it - whose estimated working set stays within the gateway pod's shared memory budget<br>• Doesn't fit: estimate exceeds that budget → `RESULT_TOO_LARGE`, or if it would fit tier 2, suggest `Prefer: respond-async` | • Embedded DuckDB, explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset after every query<br>• The semi-join rewrite (below) decides how much data actually has to be loaded, which keeps most joins cheap enough to never need to escalate<br>• Nothing survives past the request - nothing to crypto-shred |
+| **2. ClickHouse (on-demand, async)** | • Fits: estimate exceeds the gateway-pod ceiling but stays within what one (larger) node can comfortably hold<br>• Doesn't fit: estimate exceeds what one node can hold, or the join genuinely needs distributed shuffle → tier 3 | • Fresh, single-tenant instance spun up per job, free to use its own local disk (spill/merge) since there's no latency SLO left to protect<br>• Whole instance destroyed after the job - nothing persists, so no separate per-tenant KMS key is needed at this tier |
+| **3. Spark serverless (async)** | • Fits: estimate exceeds single-node comfort - genuinely needs distributed shuffle<br>• Doesn't fit: nothing, technically - the only remaining limit is cost | • Managed serverless job (EMR Serverless / Databricks job clusters / Dataproc Serverless); ephemeral executors, one tenant per job<br>• Shuffle spill lives on ephemeral executor disk, destroyed at teardown; the job's output goes to Parquet on S3 with per-tenant SSE-KMS - the same mechanism ADR-010 uses everywhere else |
 
-1. **Federated on the fly (preferred).** Fetch the smaller side first, then push its join
- keys into the larger side as an `IN` predicate - a semi-join rewrite. Applies when the
- larger connector accepts an `IN` list of workable length. This is where predicate
- pushdown creativity pays: the join becomes a filter, and the second fetch shrinks
- by orders of magnitude.
- **The reduction equals join-key selectivity on the probe side, and nothing else.** In our
- worked fixture - 500 accounts, 50,000 open tickets, 1,200 of them matching - selectivity is
- 2.4%, so total calls fall 505 -> 17 (29.7x). At low selectivity the rewrite saves nothing and
- adds chunking overhead; with a large build side, chunk count alone can exceed straight
- pagination; and where a connector's quota is calls-per-second rather than bandwidth,
- chunking can be a net loss. The v1 decision rule uses build-vs-probe cardinality as a proxy
- for selectivity, which is exactly the wrong proxy in the low-selectivity case. Once the
- catalog carries statistics we would make it adaptive: probe the first chunk, measure the
- actual hit rate, and abandon the rewrite if it is poor.
+**Three resource boundaries, not four arbitrary tiers.** Tiers 0 and 1 share the gateway pod's
+memory budget (Section 5.2's ~23 GB materialization pool, ~8 GB pod size) - they run in the same
+process, not separately provisioned infrastructure. Tier 2 is bounded by whichever single node
+the on-demand ClickHouse instance is provisioned on, sized independently of gateway pods since it
+isn't sharing memory with request-handling. Tier 3 has no memory ceiling at all; cost is the only
+backstop.
 
-2. **Short-lived materialization (fallback).** **In-process DuckDB** with an explicit
- `memory_limit` and a temp directory on tenant-encrypted ephemeral storage, reset after
- every query.
+**Same-connector joins get no special treatment.** The capability model expresses per-table
+predicate pushdown (`ENFORCED`/`ADVISORY` on `(table, column, op)`) and nothing about join
+pushdown, so `sf.accounts JOIN sf.opportunities` gets the identical tier treatment as a
+cross-app join - two independent scans, combined at whichever tier the estimate lands on. This
+leaves real capability on the table: Salesforce's own API (SOQL) supports relationship
+subqueries, a genuine native join pushdown for same-source joins we do not exploit. Rejected for
+v1 because it would mean the capability model - and the connector SDK contract every connector
+must implement - carries a second, per-connector notion of "which join shapes can this source
+push down," on top of per-predicate pushdown. That is real scope for a model built to generalize
+across 1,000s of app types, most of which have no equivalent to SOQL subqueries at all.
+**Revisit if** a small set of same-source joins dominate query volume enough to justify a
+connector-specific fast path.
 
-**Why in-process and not a container per join.** Container cold start alone can consume the
-entire 1.5 s P95 budget. Rejected.
+**Tier 1's internal optimization: the semi-join rewrite.** Fetch the smaller side first, then
+push its join keys into the larger side as an `IN` predicate. Applies when the larger connector
+accepts an `IN` list of workable length. **The reduction equals join-key selectivity on the probe
+side, and nothing else.** In our worked fixture - 500 accounts, 50,000 open tickets, 1,200 of
+them matching - selectivity is 2.4%, so total calls fall 505 -> 17 (29.7x). At low selectivity
+the rewrite saves nothing and adds chunking overhead; with a large build side, chunk count alone
+can exceed straight pagination; and where a connector's quota is calls-per-second rather than
+bandwidth, chunking can be a net loss. The v1 decision rule uses build-vs-probe cardinality as a
+proxy for selectivity, which is exactly the wrong proxy in the low-selectivity case. Once the
+catalog carries statistics we would make it adaptive: probe the first chunk, measure the actual
+hit rate, and abandon the rewrite if it is poor.
 
-**Why DuckDB over ClickHouse.** ClickHouse is a server, with a lifecycle and a footprint,
-and we need a join engine we can create and destroy in milliseconds inside the request. If
-materialized volumes grow past single-node comfort, ClickHouse becomes the right answer and
-this flips.
+**Why in-process and not a container per join, for tier 1.** Container cold start alone can
+consume the entire 1.5 s P95 budget. Rejected.
+
+**Why ClickHouse over DuckDB for tier 2, and why on-demand rather than always-on.** ClickHouse
+is a server, with a lifecycle and a footprint that made it wrong for tier 1 - we need a join
+engine we can create and destroy in milliseconds inside the sync request. Tier 2 has no such
+constraint: async has no completion SLO, so a fresh instance's few-second startup cost is
+immaterial. On-demand, single-tenant instances - rather than one always-on shared cluster -
+sidestep two problems an always-on shared instance would create: multi-tenant contention (the
+same noisy-neighbor problem already found in the rate limiter, ADR-006) and a fixed provisioned
+cost that idles between jobs. It also makes crypto-shred trivial - see the tier table above and
+ADR-010.
+
+**Why Spark for tier 3, and not just a bigger ClickHouse node.** ClickHouse's cluster mode is
+built for scatter-gather aggregation; a genuine large-large distributed join needs `GLOBAL JOIN`
+(broadcast the smaller side to every shard), which degenerates back to "one side must fit
+everywhere" - the same assumption tier 1's semi-join already makes, just replicated. Spark's
+shuffle-based join is built for exactly the case ClickHouse struggles with: the working set
+scales by adding executors, not by fitting on one node.
 
 **Consequences we accept.**
 - **Joins get their own SLO.** The P95 < 1.5 s target is scoped by the requirements to
- single-source predicate-pushdown queries. Cross-app joins target **P95 < 4 s** and are
- reported as a separate SLI. Silently folding joins into the headline SLO would be
- dishonest measurement.
+ single-source predicate-pushdown queries. Cross-app joins on tiers 0-1 target **P95 < 4 s** and
+ are reported as a separate SLI; tiers 2-3 have no completion SLO at all, by design. Silently
+ folding joins into the headline SLO would be dishonest measurement.
 - **"Spill to materialization" - which reading.** The requirement admits two:
-  - *Fall back from federated execution to a materialized intermediate* - yes, that is tier 2
+  - *Fall back from federated execution to a materialized intermediate* - yes, that is tier 1
     above, and it is the reading we take.
   - *Spill to disk when memory is exhausted mid-join*, in the database-systems sense - **no,
-    deliberately.** Spilling inside a 1.5 s budget trades a fast failure for a slow one, and it
-    creates an encrypted-temp-storage obligation for data that should never persist. The
-    cardinality estimate that decides whether semi-join applies is computed by whatever
-    planner runtime ADR-001 settles on; this ADR decides what happens once that estimate says
-    spill to materialization - and the answer to memory exhaustion is rejection, not disk.
-- Memory guardrails mean a join over an over-broad predicate is **rejected**, not spilled:
- `RESULT_TOO_LARGE` with the offending cardinality estimate and a suggested narrowing. If the
- estimate would fit within the async tier's larger in-memory limit - job runners aren't bound
- by the 1.5s/4s SLO, so they can be provisioned with more RAM, never disk - the message also
- suggests `Prefer: respond-async` instead of a hard rejection. This only raises the ceiling, it
- doesn't remove it: a cardinality too large even for the async tier is still rejected, and the
- reroute is a suggestion the caller opts into, never an automatic switch of execution mode they
- didn't ask for.
-- Materialization moves data into our compute layer: egress cost, and a residency
- obligation (Section 4.3) that federated execution avoids.
+    deliberately, for tiers 0-1.** Spilling inside a 1.5 s/4 s budget trades a fast failure for a
+    slow one - the latency argument alone is sufficient here. The answer to memory exhaustion at
+    this level is rejection, not disk.
 
-**Revisit if.** > 20% of joins fall back to materialization; memory rejections become a
-common support burden; async-tier rejections become common enough to justify a third,
-still-larger tier.
+    **Tiers 2-3 have no completion SLO, so that latency argument doesn't carry over - and it
+    would be dishonest to reuse it there.** Tier 2 (ClickHouse) is in fact free to spill to its
+    own local disk mid-query - there's no SLO to protect, and it's a mature engine that already
+    solves temp-file lifecycle and crash-safe cleanup, so we aren't building that capability
+    ourselves. Tier 3 (Spark) goes further and writes real output to Parquet on S3. Neither
+    reintroduces the "second execution-engine capability" cost this ADR was originally avoiding,
+    because in both cases the disk-handling is the vendor engine's problem, not ours.
+- Memory guardrails mean a join whose estimate exceeds the tier-1 ceiling is **rejected or
+ rerouted, not spilled in-process**: `RESULT_TOO_LARGE` with the offending cardinality estimate
+ and a suggested narrowing, or - if the estimate would fit tier 2's larger, independently-sized
+ ceiling - a suggested `Prefer: respond-async` instead of a hard rejection. This only raises the
+ ceiling, it doesn't remove it: an estimate too large even for tier 3 is still rejected on cost
+ grounds, and every reroute is a suggestion the caller opts into, never an automatic switch of
+ execution mode they didn't ask for.
+- **Crypto-shred differs by tier, spelled out per-tier in the table above** (full treatment in
+ ADR-010): tiers 0-1 hold nothing past the request; tier 2's whole on-demand instance is
+ destroyed after the job, so there's no separate tenant key to manage; tier 3's ephemeral
+ executor disk dies with the job and its actual output uses the same per-tenant SSE-KMS
+ mechanism as everything else durable in this design.
+- Materialization at any tier beyond 0 moves data into our compute layer: egress cost, and a
+ residency obligation (Section 4.3) that federated execution avoids.
+- **The 2-table join is a demonstrated instance of this strategy, not its ceiling.** All four
+ tiers' engines (DuckDB, ClickHouse, Spark) are inherently N-way-join-capable; the two-table cap
+ lives entirely in the v1/v2 planner's plan-construction logic, not in any execution tier.
+ Building N-way support is a planner project - join ordering, multi-way cardinality estimation -
+ not a new tier. It also makes tier-routing *harder*, not easier: cardinality-estimate error,
+ already a known risk at 2 tables (see the semi-join section above), compounds as more tables
+ chain together, so N-way joins will misroute between tiers more often than 2-way joins do.
+
+**Revisit if.** > 20% of joins fall back past tier 0; tier-1 memory rejections become a common
+support burden; tier-2 rejections become common enough that tier 3 stops being a rare escape
+hatch; N-way join volume justifies building planner support for it; or a wrong cardinality
+estimate routes a job to a tier too small for it often enough to need a runtime escalation/retry
+path, which does not exist today.
 
 **Open question: `LIMIT`/`OFFSET` - not yet designed past the grammar.** Section 1.4's SQL
 surface lists `LIMIT`/`OFFSET`; nothing past the grammar has been decided, and the prototype
@@ -1269,6 +1314,14 @@ choice and it is the kind of thing an auditor will ask about.
 - Invalidate plan and result caches.
 - Revoke connector OAuth grants.
 - Emit a completion attestation with timestamps for each step.
+
+**Cross-tenant materialization tiers (ADR-007) don't add a new shred surface.** Tiers 0-1
+(in-process, sync) hold nothing past the request. Tier 2's on-demand ClickHouse instance and
+tier 3's Spark executors are single-tenant and destroyed at job teardown - there's no separate
+per-tenant key to manage for either, because nothing from them outlives the job. The one place
+tier 3 writes anything durable - its Parquet output on S3 - uses the same per-tenant KEK/DEK
+envelope this ADR already defines, so shredding that tenant's key covers it too. See ADR-007's
+Consequences for the full per-tier breakdown.
 
 **Consequences we accept.** The audit key domain is a residual data footprint after
 shredding. We document exactly what it retains. Break-glass access to it requires two-person
@@ -1482,12 +1535,18 @@ Weighted mean **W ~ 245 ms**. By **Little's Law**, L = lambda x W:
 
 ### 5.2 Derived sizing
 
+**Scope: this entire section sizes the gateway pod fleet only - tiers 0-1 of ADR-007's join
+ladder.** Tier 2 (on-demand ClickHouse) and tier 3 (Spark serverless) are provisioned
+independently, per escalated job, outside this fleet - see ADR-007 and Section 2.1. Nothing
+below bounds their footprint; a fleet-wide accounting of tier 2/3 spend belongs in cost
+guardrails (Section 8.4), not gateway pod sizing.
+
 | Resource | Derivation | Size |
 |---|---|---|
 | **Gateway pods** | I/O-bound Go; ~100 QPS/pod, 4 vCPU. Memory (8 GB) derived below, not asserted | **20-24 pods**, 3 AZs, N+1 per AZ |
 | **Planner sidecars** | Only cache misses reach it: 10% x 1,000 = 100 plans/s; Calcite ~25 ms -> L = 2.5 concurrent | **4-6 pods**, floored by HA and warm spares rather than by load. Uncached, 1,000 plans/s -> L = 25 concurrent -> ~10-12 pods. The cache saves **~2-3x**, not an order of magnitude - see ADR-003 for why the fleet saving is *not* the main reason it exists. |
 | **Connector concurrency** | Calls/s = 0.55x1000 + 0.15x2x1000 + ~10% probes ~ **935 calls/s**; at connector p95 0.8 s -> L = 748 | **~750 concurrent outbound**, allocated per connector by semaphore (ADR-006) |
-| **Materialization memory** | Joins = 150 QPS x 0.6 s = 90 concurrent x 256 MB `memory_limit` | **~23 GB fleet-wide**; capped at 8 concurrent joins/pod (2 GB), excess queued then shed |
+| **Materialization memory (tiers 0-1 only)** | Joins = 150 QPS x 0.6 s = 90 concurrent x 256 MB `memory_limit` | **~23 GB fleet-wide**; capped at 8 concurrent joins/pod (2 GB), excess queued then shed |
 | **Result/freshness cache memory** | Miss rate 70% x 1,000 = 700/s; over a 60 s staleness window, 21,000-42,000 live entries x 100-200 KB/entry | **~2-8 GB fleet-wide**; a range, not a point estimate - see derivation below |
 | **Redis** | Lease reconciliation, not per-request: ~24 pods x ~20 buckets x 1 Hz ~ **500 ops/s** | Single 3-node cluster, vastly under-utilized |
 | **Network** | 100 MB/s egress ~ 800 Mbps, plus comparable connector ingest | Budget **2 Gbps** sustained |

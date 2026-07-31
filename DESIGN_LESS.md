@@ -419,9 +419,15 @@ own RLS/CLS is role-derived and deterministic; layer 3 answers to the individual
 
 ---
 
-### ADR-003 - Plan caching and cache key
+### ADR-003 - Caching: plan cache and result cache
 
 **Status:** Accepted | **Contested:** medium
+
+Two caches, one shared topology principle: both need a per-pod-plus-shared-Redis tier to
+survive autoscaling and rolling deploys without resetting hit ratio to zero. One ADR because
+the topology decision is identical, even though what each cache holds differs completely.
+
+#### Plan cache
 
 **Context.** ADR-001's latency argument depends on a high hit ratio, and a plan carries policy
 - those two facts conflict.
@@ -463,6 +469,42 @@ toward the `(sql, user)` case. Invalidation is eventually consistent within the 
 
 **Revisit if.** Hit ratio < 95% (the P95 trap - Section 5.2); a tenant exceeds N distinct role
 sets; any incident traced to invalidation lag.
+
+#### Result cache
+
+**Context.** ADR-005 governs *when* a fetch is stale; it says nothing about *where* the cache
+lives. Left unstated, the default is per-pod-only - and a fleet of 20-24 pods behind a load
+balancer with no cache-key-aware routing means the same `(principal, table, columns,
+filters)` key gets independently missed and cached on multiple pods at once, the identical
+failure mode the Plan cache's topology already exists to prevent.
+
+| Option | Rejected because |
+|---|---|
+| Per-pod only, no shared tier | Understates memory and overstates hit ratio - redundant misses across pods, and every autoscale/redeploy resets the fleet's effective hit ratio to zero. |
+| Sticky routing (consistent hashing, no shared store) | Avoids duplication without new infra, but couples the load balancer to the cache key's shape and creates hot-pod risk for any popular query. |
+| **Shared Redis tier, same shape as the Plan cache** ← chosen | - |
+
+**Decision.** Mirrors the Plan cache exactly: thin per-pod LRU (fast path) backed by a shared
+Redis tier, keyed per ADR-002's addendum (principal-scoped, not just table/columns/filters). A
+local miss checks Redis before a genuine live fetch; only the genuine miss spends rate-limit
+quota (ADR-006), so a request another pod already cached doesn't cost a second outbound call.
+
+**Combined Redis load, three workloads on one cluster now.** Section 5.2's Redis row
+previously counted only rate-limit leases (~500 ops/s) - already incomplete, since it never
+included the Plan cache's own Redis traffic either. All three: leases (~500/s) + Plan cache
+local misses (10% x 1,000 = 100/s) + Result cache local misses (70% x 1,000 = 700/s) ≈
+**~1,300 ops/s combined** - still a small fraction of real cluster capacity, but an actual
+number instead of an unquantified "vastly under-utilized."
+
+**Consequences we accept.** Result cache entries (rows) are larger than Plan cache entries (a
+compiled shape), so Redis's own memory now carries part of the 2-8 GB estimate, shrinking
+each pod's local slice. Same eventual-consistency risk the Plan cache already accepts, bounded
+by keeping the local tier's TTL short relative to Redis's. One cluster now serves three
+purposes - cheaper to run, but a wider blast radius if it degrades.
+
+**Revisit if.** Combined Redis ops become a significant fraction of real cluster capacity;
+local-tier/Redis staleness skew causes a `STALE_DATA`-class incident; the combined cluster
+needs to split rather than share.
 
 ---
 
@@ -1038,7 +1080,7 @@ this one is correct.*
 |---|---|---|---|
 | **001** Planner (PROPOSED) | Capability discovery, pushdown, join plan, spill decision | Trino; DataFusion; Steampipe/FDW; Go-native parser; GraalVM Calcite; Velox; Spark | **n/a** - in-process Go planner is itself spike evidence |
 | **002** Entitlements | RLS/CLS from source perms + tenant policy; document plan compilation | Post-filter in Go; inject into Substrait; OPA as blob store; Zanzibar; Cedar; sampled verification; pushing security predicates to `ADVISORY` | **Mostly** - injection, invariant, verification real; OPA + delegated OAuth mocked |
-| **003** Plan cache | *(no direct requirement)* | No cache; key on SQL text; key on `(sql, user)` | **Yes** |
+| **003** Plan + result cache | *(no direct requirement)* | No cache; key on SQL text; key on `(sql, user)`; result cache per-pod only, or sticky routing | **Partial** - plan cache yes, result cache's shared tier designed only |
 | **004** Build vs buy | Capability model, auth/refresh, pagination, error codes | Build all; buy all | **No** - both connectors mocked |
 | **005** Freshness | Avoid stale data; per-query staleness hints; honor rate limits | Centralized CDC/lake; `MAX(updated_at)` probes | **Partial** - rungs 1 &amp; 4 + `max_staleness` |
 | **006** Rate limits | Token buckets/concurrency pools; head-of-line avoidance | In-memory per-pod buckets; Redis on every decision; Envoy ratelimit | **Partial** - single-node bucket, 429, async reroute |
@@ -1048,10 +1090,11 @@ this one is correct.*
 | **010** Crypto-shred | Per-tenant keys; automated shredding; audit trails | "Instantly destroy the KMS key"; shred audit under tenant key | **No** |
 | **011** Identity | OIDC AuthN, policy AuthZ; token → scopes/roles → RLS/CLS | Trust token claims; direct federation (kept as fallback); mTLS | **Partial** - issuer→tenant real, signature mocked |
 
-**Two patterns.** ADR-003 is the only entry with no requirement behind it, fully built, while
-ADR-001 - the decision it partly serves - is not: its *latency* case depends on an expensive
-planner; its *correctness* case (a bug class that also covers the result and attribute caches)
-does not. Every unbuilt ADR (001, 004, 008, 010) maps to an *infrastructure* requirement -
+**Two patterns.** ADR-003's plan-cache half is the only entry with no requirement behind it,
+fully built, while ADR-001 - the decision it partly serves - is not: its *latency* case
+depends on an expensive planner; its *correctness* case (a bug class this same ADR now also
+applies to its own result-cache half, designed but not built, and to the attribute cache) does
+not. Every unbuilt ADR (001, 004, 008, 010) maps to an *infrastructure* requirement -
 planner runtime, vendor contract, Terraform, a KMS call; every fully built one maps to
 *behavior under adversarial conditions*. We built what a reviewer cannot take on faith.
 

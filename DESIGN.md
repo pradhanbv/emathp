@@ -76,7 +76,7 @@ operative clause; if these diverge, this one is correct.*
 |---|---|---|---|---|
 | [**001**](#adr-001---planner-runtime-and-placement) Planner **(PROPOSED)** | *"Query Planner: capability discovery, predicate/column pushdown, join plan, cost/freshness hints, spill to materialization when necessary."* (the cardinality estimate feeding this comes from whatever planner [ADR-001](#adr-001---planner-runtime-and-placement) settles on; the spill decision and its mechanism are both [ADR-007](#adr-007---join-strategy)) | Something must turn SQL into a capability-aware pushdown plan; the choice fixes runtime, latency floor, and plan IR. **Deliberately left open** - the required capabilities are fixed, the tool is chosen by measurement in M1. | Trino; DataFusion; Steampipe/FDW; Go-native parser; GraalVM-native Calcite; Spark | **n/a** - prototype uses an in-process Go planner, which is itself spike evidence |
 | [**002**](#adr-002---entitlement-enforcement-mechanism-and-placement) Entitlements | *"enforce least-privilege access; row/column-level security (RLS/CLS) based on source permissions and tenant policy"*; *"Document how policies are compiled into query plans."* | The brief's hardest requirement; three layers, partial evaluation, `ENFORCED`/`ADVISORY`, and verification all fall out of it. | Post-filter in Go; inject into compiled Substrait; OPA as blob store; Zanzibar/OpenFGA; Cedar | **Mostly** - injection, invariant, verification real; OPA + delegated OAuth mocked |
-| [**003**](#adr-003---plan-caching-and-cache-key) Plan cache | *(no direct requirement - nearest is "cache hit ratios" under sizing math)* | Anything derived from policy and then cached inherits the policy's version; a naive plan cache is therefore a privilege-escalation vector. Also amortizes planning **if** [ADR-001](#adr-001---planner-runtime-and-placement) stays expensive. | No cache; key on SQL text alone; key on `(sql, user)` | **Yes** |
+| [**003**](#adr-003---caching-plan-cache-and-result-cache) Plan + result cache | *(no direct requirement - nearest is "cache hit ratios" under sizing math)* | Anything derived from policy and then cached inherits the policy's version; a naive plan cache is therefore a privilege-escalation vector. Also amortizes planning **if** [ADR-001](#adr-001---planner-runtime-and-placement) stays expensive. | No cache; key on SQL text alone; key on `(sql, user)`; result cache: per-pod only, sticky routing without a shared store | **Partial** - plan cache real; result cache's shared Redis tier designed, not built |
 | [**004**](#adr-004---connector-strategy-build-vs-buy) Build vs buy | *"Connector SDK: capability model (tables/fields/ops/limits), auth/token refresh, pagination, concurrency contracts, standardized error codes."*; *"you may reference merge.dev/categories"* | 1000s of app types cannot be hand-built in six months; splitting by whether pushdown determines the SLO is the call the brief invites. | Build all; buy all (Merge/Nango/Airbyte) | **No** - both connectors mocked |
 | [**005**](#adr-005---freshness-watermark-capability-ladder) Freshness | *"avoid materially stale data vs. sources; allow per-query staleness hints"*; *"Freshness controls honoring rate limits"* | Freshness must not spend the quota queries need, and SaaS change-detection varies too widely for one mechanism. | Centralized CDC / data lake; `SELECT MAX(updated_at)` probes | **Partial** - rungs 1 & 4 + `max_staleness` |
 | [**006**](#adr-006---rate-limiting-and-multi-tenant-fairness) Rate limits | *"token buckets/concurrency pools per connector/tenant/user; backoff and budget allocation; async overflow path"*; *"head-of-line blocking avoidance"* | Quota is a hard external ceiling shared across tenants; one tenant must not spend another's budget or queue behind its own backlog. | In-memory per-pod buckets; Redis on every decision; Envoy ratelimit | **Partial** - single-node bucket, 429, async reroute |
@@ -86,14 +86,16 @@ operative clause; if these diverge, this one is correct.*
 | [**010**](#adr-010---keys-crypto-shredding-and-the-audit-conflict) Crypto-shred | *"per-tenant keys; automated org off-boarding and crypto-shredding"*; *"audit logs, access trails"* | Off-boarding must render data unreadable immediately despite KMS destruction delays, which collides with the audit retention the same brief demands. | "Instantly destroy the KMS key"; shred audit under the tenant key | **No** |
 | [**011**](#adr-011---identity-tenant-derivation-and-principal-attribute-resolution) Identity | *"AuthN via OIDC, AuthZ via policy (OPA or embedded engine)"*; *"user token -> scopes/roles -> RLS/CLS"* | Policy needs principal attributes, and reading them from claims makes `tenant_id` forgeable and roles unreliable at enterprise scale. | Trust token claims; direct federation; mTLS / client certs | **Partial** - issuer->tenant real, signature mocked |
 
-**Two patterns worth naming.** [ADR-003](#adr-003---plan-caching-and-cache-key) is the only
-entry with no requirement behind it, and it is fully implemented while
-[ADR-001](#adr-001---planner-runtime-and-placement) - the decision it partly serves - is not.
-That is deliberate rather than inconsistent: its *latency* justification depends on an
+**Two patterns worth naming.** [ADR-003](#adr-003---caching-plan-cache-and-result-cache)'s
+plan-cache half is the only entry with no requirement behind it, and it is fully implemented,
+while [ADR-001](#adr-001---planner-runtime-and-placement) - the decision it partly serves - is
+not. That is deliberate rather than inconsistent: its *latency* justification depends on an
 expensive planner, but its *correctness* justification does not. Policy-derived caching is a
-bug class that also covers the result cache and
+bug class this same ADR now also applies to its own result-cache half (designed, not yet
+built) and to
 [ADR-011](#adr-011---identity-tenant-derivation-and-principal-attribute-resolution)'s attribute
-cache, and the plan cache is the cheapest place to make it visible and testable. And every
+cache, and the plan cache is simply the cheapest place to make that principle visible and
+testable first. And every
 unbuilt ADR ([001](#adr-001---planner-runtime-and-placement),
 [004](#adr-004---connector-strategy-build-vs-buy),
 [008](#adr-008---tenant-lifecycle-terraform-vs-control-plane-api),
@@ -778,9 +780,16 @@ closed. A prototype that only proves the happy path proves nothing about entitle
 
 ---
 
-### ADR-003 - Plan caching and cache key
+### ADR-003 - Caching: plan cache and result cache
 
 **Status:** Accepted | **Contested:** medium
+
+Two different caches, one shared architectural principle: both need a two-tier topology
+(per-pod local + shared Redis) to survive autoscaling and rolling deploys without resetting
+hit ratio to zero exactly when load is highest. Treated as one ADR because the topology
+decision is identical even though what each cache holds, and why, is completely different.
+
+#### Plan cache
 
 **Context.** ADR-001's latency argument depends entirely on a high cache hit ratio, and a
 plan carries policy. Those two facts conflict.
@@ -851,6 +860,63 @@ load is highest.
 **Revisit if.** Hit ratio **< 95%** (the P95 trap in Section 5.2 - the old 90% trigger was set
 against mean latency and would not have protected the percentile SLO), a tenant exceeds N
 distinct role sets, any incident traced to invalidation lag.
+
+#### Result cache
+
+**Context.** ADR-005 governs *when* a cached fetch is considered stale; it says nothing about
+*where* the cache physically lives. Left unstated, the default is per-pod-only - and a fleet
+of 20-24 Gateway pods behind a load balancer with no cache-key-aware routing means the same
+`(principal, table, columns, filters)` key can be independently missed and cached on multiple
+pods at once. That is the identical failure mode the Plan cache section above already exists
+to prevent, just never stated for this second cache.
+
+**Options.**
+- **Per-pod only, no shared tier** - simplest, but silently understates memory and overstates
+  hit ratio: every pod that independently misses the same key both spends a redundant
+  connector call and holds a redundant copy, and every autoscale or rolling-deploy event
+  resets the fleet's effective hit ratio to zero, same as the Plan cache without Redis.
+- **Sticky routing** (consistent hashing on the cache key, no shared store) - avoids
+  duplication without new infrastructure, but couples the load balancer to the cache key's
+  shape and creates hot-pod risk for any single popular query.
+- **Shared Redis tier, same shape as the Plan cache** <- CHOSEN
+
+**Decision.** Two tiers, mirroring the Plan cache exactly: a thin per-pod LRU (fast path, no
+RTT) backed by a shared Redis tier holding the cached rows, keyed exactly as ADR-002's
+addendum specifies (principal-scoped, not just table/columns/filters). A miss on the local
+tier checks Redis before falling back to a genuine live fetch - only the genuine-miss path
+spends rate-limit quota (ADR-006), so a request another pod already cached does not cost a
+second outbound call just because it landed on a different pod.
+
+**Why this wasn't optional, once checked.** Without a shared tier, the ~2-8 GB fleet-wide
+estimate and the hit-ratio numbers in Section 5.2/5.3 both understate reality - fragmentation
+across pods means more live entries and a lower real hit ratio than a single-pod model
+predicts, in the same direction (and for the same reason) as the failure mode this ADR's
+Plan cache section already solved.
+
+**Combined Redis load, now that a third workload rides the same cluster.** Section 5.2's
+Redis row previously counted only rate-limit lease reconciliation (~500 ops/s) - already
+incomplete, since it never included the Plan cache's own Redis traffic. All three workloads
+together: rate-limit leases (~500/s) + Plan cache local-tier misses (10% x 1,000 = 100/s) +
+Result cache local-tier misses (70% x 1,000 = 700/s) ~ **~1,300 ops/s combined**, still a
+small fraction of a 3-node cluster's real capacity, but a number that should replace "vastly
+under-utilized" as an assertion with an actual combined figure.
+
+**Consequences we accept.**
+- Result cache entries (rows) are larger than Plan cache entries (a compiled shape), so
+  Redis's own memory footprint - not just Gateway pod memory - now carries part of the 2-8 GB
+  estimate; each pod's local slice shrinks accordingly rather than holding the full range.
+- Same failure mode the Plan cache already accepts: eventual consistency between a pod's
+  local tier and Redis means a request can be served from a local entry that is technically
+  staler than Redis's own copy, bounded by keeping the local tier's TTL short relative to
+  Redis's.
+- One Redis cluster now serves three purposes (rate limiting, Plan cache, Result cache)
+  rather than three separate pieces of infrastructure - cheaper to operate, but an incident
+  affecting Redis now has a wider blast radius across previously-independent concerns.
+
+**Revisit if.** Combined Redis ops become a significant fraction of the cluster's real
+capacity rather than the small one assumed here; local-tier/Redis staleness skew causes a
+`STALE_DATA`-class incident; the combined three-workload cluster needs to split rather than
+share.
 
 ---
 

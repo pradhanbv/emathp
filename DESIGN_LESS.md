@@ -1073,19 +1073,25 @@ a sharper version of the same seam.
 | M | Focus | Exit criteria |
 |---|---|---|
 | **M1** | Connector SDK v0; Salesforce + Zendesk; entitlement skeleton; identity broker (JWKS verify + issuer→tenant + attributes, ADR-011); `SELECT/WHERE/LIMIT`; rate-limit guardrails | Live single-tenant demo; SDK conformance passes both connectors; a forged `tenant_id` claim is ignored; an invalid/expired signature is rejected before tenant derivation |
-| **M2** | Planner + pushdown; plan cache; freshness rungs 1-3; NDJSON streaming (single-source); per-tenant KMS; Tenant Lifecycle API v0 (ADR-008); crypto-shred disable+revoke (ADR-010); token exchange (ADR-011) | **P95 < 1.8 s** single-source; **plan cache hit > 95%**; **`result_cache_hit_ratio` measured against real traffic - the most important output of M2**; trace shows connector time; tenant onboarded via API in <10s |
+| **M2** | Planner + pushdown; plan cache; **per-pod result cache (ADR-003 - shared Redis tier is M5)**; freshness rungs 1-3; NDJSON streaming (single-source); per-tenant KMS; Tenant Lifecycle API v0 (ADR-008); crypto-shred disable+revoke (ADR-010); token exchange (ADR-011) | **P95 < 1.8 s** single-source; **plan cache hit > 95%**; **`result_cache_hit_ratio` measured against real traffic - the most important output of M2**; trace shows connector time; tenant onboarded via API in <10s |
 | **M3** | Policy DSL via OPA partial eval; async overflow; full error vocabulary; audit trail; first buy-tier connector (ADR-004) | RLS/CLS: 0 leaks across 50 adversarial cases; plan-time invariant **and** runtime verification filter both tested; buy-tier connector passes the same SDK conformance suite |
-| **M4** | Autoscaling; materialization (ADR-007); Helm/Terraform complete; DR basics | 1k QPS sustained 60s within SLO; join P95 < 4 s; `RESULT_TOO_LARGE` fires correctly; a slow join source returns `SOURCE_TIMEOUT` outright, not a partial (ADR-009) |
-| **M5** | Multi-tenant hardening; fairness; audit/alerts; cost guardrails | Tenant A at 10x budget doesn't degrade tenant B's P95 by >10%; cost attribution accurate within 5%; off-boarding attestation passes |
+| **M4** | Autoscaling; materialization, **tiers 0-1 only** (ADR-007 - tiers 2-3 deliberately out of scope, see Sequencing rationale); Helm/Terraform complete; DR basics | 1k QPS sustained 60s within SLO; join P95 < 4 s; `RESULT_TOO_LARGE` fires correctly; a slow join source returns `SOURCE_TIMEOUT` outright, not a partial (ADR-009) |
+| **M5** | Multi-tenant hardening; fairness; **result cache's shared Redis tier (ADR-003)**; audit/alerts; cost guardrails | Tenant A at 10x budget doesn't degrade tenant B's P95 by >10%; **result cache hit ratio holds steady across a pod restart - the shared tier, not per-pod state, is serving hits**; cost attribution accurate within 5%; off-boarding attestation passes |
 | **M6** | GA criteria; chaos drills; security review; onboarding playbook | Chaos (Redis loss, connector 429 flood, planner pod loss) degrades gracefully; external security review, no criticals; connector onboarded by an outsider using only docs |
 
 **Sequencing rationale.** Entitlements (M3) land after the planner (M2) because policy
 compiles into plans - building it twice would be worse. Tenant Lifecycle and crypto-shred land
 in M2, not M5, because M5's own exit criteria already assumes off-boarding attestation exists.
 The riskiest measurement (cache hit ratio) is pulled to M2 because it can invalidate the
-capacity model.
+capacity model. **The result cache's shared Redis tier waits for M5**: a per-pod cache already
+produces the M2 hit-ratio measurement that matters, and the shared tier's value - consistency
+across pods - has nothing real to prove itself against until M5's multi-tenant hardening.
+**Tiers 2-3 of ADR-007 (on-demand ClickHouse, Spark serverless) are absent from every
+milestone here on purpose** - designed, not scheduled. Building either before M4 measures
+tier-1's real `RESULT_TOO_LARGE` rate would be guessing at a problem that hasn't been measured
+yet.
 
-**Risk register (top five):**
+**Risk register (top six):**
 
 | Risk | Mitigation | Trigger |
 |---|---|---|
@@ -1094,12 +1100,15 @@ capacity model.
 | Quota exhaustion / vendor ban | Fail-closed leases; per-tenant budgets | Any ban, or budget > 80% sustained |
 | Schema drift breaking pinned connectors | Versioned connectors; nightly contract tests | Any drift reaching production |
 | Delegated OAuth unavailable on key connectors | Service-account fallback + mirrored policy | ≥2 of 10 built connectors lack it |
+| Tier-1 `RESULT_TOO_LARGE` rate high enough to need ADR-007's tier 2 before GA | Not built by default; pull forward into M5/M6 if triggered - on-demand per-job, no standing cost until then | Fires on >5% of cross-app joins in M4 |
 
 **Budget, order of magnitude.** ~$4-5k/month compute, ~$1k observability, and **egress
 dominates everything else**: 100 MB/s sustained ≈ 260 TB/month ≈ $13-23k, but at a realistic
 20% duty cycle ≈ $3-5k. Call it **~$12-20k/month excluding the unified-API vendor**. The
 number that matters isn't the total - egress and vendor calls both scale with cache miss rate,
-so Section 5.3 sets the budget as well as the architecture.
+so Section 5.3 sets the budget as well as the architecture. **Also excludes ADR-007's tiers
+2-3** - neither is built by default, and both are on-demand per job rather than standing infra,
+so there's no fleet-wide line to size until the risk above triggers.
 
 ---
 

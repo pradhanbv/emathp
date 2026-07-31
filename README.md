@@ -29,7 +29,7 @@ reference material you can skip.
 4. `DESIGN.md` ADR-002 and its two diagrams - how policy becomes plan nodes
 5. [The measurement table](#measured-the-number-the-design-is-least-sure-about) below - the
    assumption the capacity model rests on
-6. `DESIGN.md` Section 12 - what I'm least sure of, and what would change my mind
+6. `DESIGN.md` Section 11 - what I'm least sure of, and what would change my mind
 7. [The afterthought](#afterthought-the-conformance-gate-is-provenance-blind) below - what
    building it surfaced that the design hadn't anticipated, and where I'd take it next
 8. [Quickstart](#quickstart) below - stop reading and run it: the stack, the RLS/masking demo,
@@ -102,7 +102,7 @@ section). The blue lane is a different kind of gap than either - not a deliberat
 like the grey lane (nothing here was decided against), and not a narrowed-but-real mechanism
 like the yellow lane: it's a hole in the v1 SQL surface itself, surfaced by review rather than
 designed around, and left open on purpose rather than guessed at - see `DESIGN.md` ADR-007 and
-Section 12, item 5.
+Section 11, item 5.
 
 ---
 
@@ -517,8 +517,8 @@ connector drops zero rows. Two metrics, opposite expectations:
 
 Every contested call, the requirement that forced it, the alternatives rejected, and whether
 the prototype builds it. Requirement text is quoted from the brief, trimmed to the operative
-clause - full text and the remaining-requirements checklist are in
-[`DESIGN.md` Section 11](./DESIGN.md#11-requirements-traceability), which is canonical.
+clause - full text and the remaining-requirements checklist are in `DESIGN.md`'s
+[Requirement Resolution Index](./DESIGN.md#requirement-resolution-index), which is canonical.
 
 | ADR | Requirement (verbatim) | Why it exists | Rejected (for the final design) | Built (prototype) |
 |---|---|---|---|---|
@@ -644,7 +644,7 @@ observable at two connectors on one node.
 | Connector SDK as a wire contract; independently deployable, versioned connectors (ADR-004) | `connector.Source` in-process Go interface (`HTTPSource`), compiled into the gateway binary | Real at n=2 - two Go types satisfying one in-process interface is simplest, and there's no onboard-without-rebuild story worth demonstrating with two connectors that never change mid-run. The RPC boundary only pays for itself once connectors are added or updated on their own schedule, independent of the gateway's release cycle. |
 
 **One thing the prototype taught us about the design.** A ~250-line Go planner handled the
-entire v1 SQL surface cleanly. That is weak but real evidence for `DESIGN.md` Section 12's first open
+entire v1 SQL surface cleanly. That is weak but real evidence for `DESIGN.md` Section 11's first open
 question - that the Calcite sidecar may be over-built and in-process DataFusion is the better
 call. The design was updated to say so rather than the prototype being written to agree with it.
 

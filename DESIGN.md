@@ -6,7 +6,7 @@
 > This document is the design deliverable. It states the architecture, then records the
 > ten decisions that were genuinely contested as ADRs with the options rejected and the
 > costs accepted. The requirement resolution index follows immediately below; the six-month
-> plan is Section 10. Where a decision is uncertain, Section 12 says so and names the metric
+> plan is Section 10. Where a decision is uncertain, Section 11 says so and names the metric
 > that would change it.
 
 ---
@@ -56,7 +56,7 @@ the plan cache does not leak across roles, and that the semi-join rewrite cuts p
 ~30x. Scope was chosen to maximise proof per hour, not surface area.
 
 **Where to spend ten minutes:** Section 5.3 (the risk the whole capacity model rests on), ADR-002
-(entitlements, and the two diagrams in it), Section 12 (what I am least sure of).
+(entitlements, and the two diagrams in it), Section 11 (what I am least sure of).
 
 ---
 
@@ -144,7 +144,7 @@ behalf of the calling user, under that user's own source-side permissions.
 
 | # | Assumption | Why it matters | If false |
 |---|---|---|---|
-| A1 | Connectors expose per-user delegated OAuth, not just service accounts | Source-side ACLs are our primary entitlement substrate (ADR-002) | Fall back to service-account + mirrored permission graph; materially worse (Section 12) |
+| A1 | Connectors expose per-user delegated OAuth, not just service accounts | Source-side ACLs are our primary entitlement substrate (ADR-002) | Fall back to service-account + mirrored permission graph; materially worse (Section 11) |
 | A2 | Average result payload ~ 100 KB (100 MB/s / 1k QPS) | Drives egress, buffer, and materialization sizing (Section 5) | Re-derive Section 5 entirely |
 | A3 | ~70% of queries are single-source with full predicate pushdown | The P95 < 1.5 s SLO is scoped to these | SLO must be renegotiated per query class |
 | A4 | Connector p95 latency 200-800 ms; a long tail of sources exceed 2 s | Drives timeout, partial-result, and async design (ADR-009) | Timeout budget shifts |
@@ -393,7 +393,7 @@ reorder, and the plan must carry RLS/CLS structurally (ADR-002). Planning sits i
 |---|---|---|
 | **Trino / Starburst** | Mature federation, huge connector library, real cost-based optimizer, and a `SystemAccessControl` SPI that has provided `getRowFilters` and `getColumnMask` since release 331 (2020) - plus a first-class OPA access-control plugin that returns mask expressions from Rego. Row/column security is genuinely solved here. | Targets JDBC/object-storage sources, not SaaS REST APIs - the connector model, catalog-scoped credentials, and shared-worker-pool isolation all fight this design (A1, per-tenant economics). |
 | **Steampipe / Postgres FDW** | Exactly this product category - SQL over SaaS APIs via foreign data wrappers, and it already exists | Single-tenant by construction, with no per-predicate `ENFORCED`/`ADVISORY` contract - the primitive ADR-002 is built on. |
-| **Apache DataFusion (Rust)** | Extensible rule-based optimizer, native Substrait, no JVM, no GC, no network hop | **Closest runner-up** - rejected on team-capability grounds, not technical merit; a defensible reversal (Section 12). |
+| **Apache DataFusion (Rust)** | Extensible rule-based optimizer, native Substrait, no JVM, no GC, no network hop | **Closest runner-up** - rejected on team-capability grounds, not technical merit; a defensible reversal (Section 11). |
 | **Go-native parser (vitess / pg_query_go / tidb)** | Single runtime, no hop | Gives an AST, not an optimizer - we'd own capability-aware pushdown and residual-predicate correctness ourselves, the security-critical part (ADR-002). |
 | **Calcite in-process via GraalVM native-image** | No hop, no JVM warmup | Native-image's closed-world compilation conflicts with Calcite's reflection - but only if the *executor* needs it too. An open spike question, not a settled rejection. |
 | **Apache Spark** | - | Batch scheduler - never a candidate at a 500 ms P50 budget. |
@@ -1878,10 +1878,10 @@ same kind of seam.
 | M | Focus | Exit criteria (measurable) |
 |---|---|---|
 | **M1** | Connector SDK v0; 2 connectors (Salesforce, Zendesk); entitlement skeleton; **identity broker: JWKS-pinned signature verification + issuer->tenant derivation + attribute resolution (ADR-011)**; `SELECT/WHERE/LIMIT`; rate-limit guardrails | Single-tenant demo runs a live query end-to-end; SDK conformance suite passes for both connectors; token bucket rejects at configured threshold with correct `Retry-After`; **negative test: a token asserting a foreign `tenant_id` claim is ignored and the tenant resolved from `iss`**; **a token with an invalid or expired signature is rejected before tenant derivation runs** |
-| **M2** | Planner with predicate pushdown; plan cache; freshness TTL + rungs 1-3; NDJSON streaming + timeout budget cascade, single-source path (ADR-009); per-tenant KMS; **Tenant Lifecycle API v0 (ADR-008): onboard/offboard endpoints provisioning namespace, KMS key, policy binding**; **crypto-shred: disable KEK + revoke grants on offboard (ADR-010)**; ingress token exchange (ADR-011); observability v1 | **P95 < 1.8 s** on single-source queries; **plan cache hit ratio > 95%** (Section 5.2 percentile trap); `result_cache_hit_ratio` measured against real tenant traffic - *this is the Section 5.3 number and the most important output of M2*; trace shows connector time; `SOURCE_TIMEOUT` terminates a slow single-source query with a partial, honestly-labelled NDJSON frame; tenant onboarded via API in <10s; API-provisioned and Terraform-provisioned (single-tenant) tenants are behaviorally identical (ADR-008 conformance test); offboarding disables KEK and revokes grants within seconds of the call |
+| **M2** | Planner with predicate pushdown; plan cache; **per-pod result cache (ADR-003) - the shared Redis tier is M5, see Sequencing rationale**; freshness TTL + rungs 1-3; NDJSON streaming + timeout budget cascade, single-source path (ADR-009); per-tenant KMS; **Tenant Lifecycle API v0 (ADR-008): onboard/offboard endpoints provisioning namespace, KMS key, policy binding**; **crypto-shred: disable KEK + revoke grants on offboard (ADR-010)**; ingress token exchange (ADR-011); observability v1 | **P95 < 1.8 s** on single-source queries; **plan cache hit ratio > 95%** (Section 5.2 percentile trap); `result_cache_hit_ratio` measured against real tenant traffic - *this is the Section 5.3 number and the most important output of M2*; trace shows connector time; `SOURCE_TIMEOUT` terminates a slow single-source query with a partial, honestly-labelled NDJSON frame; tenant onboarded via API in <10s; API-provisioned and Terraform-provisioned (single-tenant) tenants are behaviorally identical (ADR-008 conformance test); offboarding disables KEK and revokes grants within seconds of the call |
 | **M3** | Policy DSL (RLS/CLS) via OPA partial eval; async overflow path; full error vocabulary; audit trail; **first buy-tier connector via unified-API vendor (ADR-004), behind the Connector SDK interface** | RLS/CLS conformance suite: 0 leaks across 50 adversarial cases; plan-time invariant **and** runtime verification filter both tested; `enforced_predicate_violations_total` fires against a deliberately lying connector; clean UX under sustained throttling (reviewed with PM); **buy-tier connector passes the same SDK conformance suite as build-tier connectors; capability tier (build vs buy) visible in the catalog/admin UX** |
-| **M4** | Autoscaling; materialization (ADR-007); Helm/Terraform complete; DR basics | **1k QPS synthetic sustained 60s** with P95 within SLO; scale-out demonstrated without manual intervention; cross-app join P95 < 4 s; `RESULT_TOO_LARGE` fires correctly at guardrail; **a slow source inside a cross-app join returns `SOURCE_TIMEOUT` outright, not a partial result, per ADR-009's buffered-path rule** |
-| **M5** | Multi-tenant hardening; fairness; audit/alerts; perf tuning; cost guardrails | Noisy-neighbour test: tenant A at 10x budget does not degrade tenant B's P95 by >10%; per-tenant cost attribution accurate within 5%; off-boarding attestation passes |
+| **M4** | Autoscaling; materialization, **tiers 0-1 only** (ADR-007 - tiers 2-3 are explicitly out of scope for this plan, see Sequencing rationale); Helm/Terraform complete; DR basics | **1k QPS synthetic sustained 60s** with P95 within SLO; scale-out demonstrated without manual intervention; cross-app join P95 < 4 s; `RESULT_TOO_LARGE` fires correctly at guardrail; **a slow source inside a cross-app join returns `SOURCE_TIMEOUT` outright, not a partial result, per ADR-009's buffered-path rule** |
+| **M5** | Multi-tenant hardening; fairness; **result cache's shared Redis tier (ADR-003)**; audit/alerts; perf tuning; cost guardrails | Noisy-neighbour test: tenant A at 10x budget does not degrade tenant B's P95 by >10%; **result cache hit ratio holds steady across a pod restart - proof the shared tier, not just per-pod state, is what's actually serving hits**; per-tenant cost attribution accurate within 5%; off-boarding attestation passes |
 | **M6** | GA criteria; chaos drills; security review; onboarding playbook | Chaos: Redis loss, connector 429 flood, planner pod loss - all degrade gracefully per design; external security review with no criticals; connector onboarded by someone outside the team using only the docs |
 
 **Sequencing rationale.** Entitlements (M3) land *after* the planner (M2) because policy
@@ -1896,7 +1896,16 @@ retrofitting it, and M5 becomes hardening and proving something real rather than
 under a different name. The buy-tier connector (ADR-004) waits for M3 because its
 prerequisite - unified-API vendor procurement - is itself tagged M2 in Section 10.0; nothing
 here should be read as buy-tier being lower priority than build-tier, only that a contract has
-to exist before an adapter can be tested against it.
+to exist before an adapter can be tested against it. **The result cache's shared Redis tier
+waits for M5, not M2**, because a per-pod cache is enough to produce the M2 hit-ratio
+measurement that actually matters (Section 5.3) - the shared tier's value is consistency and
+fairness *across* pods, which has no signal worth building for until M5's multi-tenant
+hardening gives it a real workload to prove itself against. **Tiers 2-3 of ADR-007 (on-demand
+ClickHouse, Spark serverless) are deliberately absent from every milestone here** - they are
+designed, not scheduled. Building either before M4 establishes tier-1's real `RESULT_TOO_LARGE`
+rate would be guessing at a problem we haven't measured yet, which is exactly the mistake
+Section 10.0 exists to avoid repeating. See the risk register below for what would pull them
+into scope early.
 
 ### 10.3 Risk register
 
@@ -1911,6 +1920,7 @@ to exist before an adapter can be tested against it.
 | Single-tenant operational load | Med | Med | Conformance test that both provisioning paths produce identical tenants (ADR-008) | Infra | >5 single-tenant customers |
 | Customer IdP variability (Entra group-overage, missing custom claims) blocks onboarding | High | Med | Attribute resolution independent of claim contents; per-attribute owner in tenant config (ADR-011) | Security | Any tenant needing an unmappable attribute |
 | Team unfamiliarity with Calcite | Med | Med | Spike in M1; keep planner rules minimal; DX owns internal docs | BE(2) | M2 slips >2 weeks |
+| Tier-1 `RESULT_TOO_LARGE` rate high enough to need ADR-007's tier 2 (ClickHouse) before GA | Med | Med | Not built by default (see Sequencing rationale); pull forward into M5/M6 if triggered, on-demand per-job so no standing infra cost until then | BE(1) | `RESULT_TOO_LARGE` fires on >5% of cross-app joins in M4 |
 
 ### 10.4 Budget and infra assumptions
 
@@ -1918,13 +1928,16 @@ to exist before an adapter can be tested against it.
 Postgres with a cross-region replica, 2 Gbps sustained egress, plus the unified-API vendor
 per-call fee for the long tail (ADR-004). Egress and vendor calls dominate - both scale with
 cache miss rate, which is why Section 5.3 is the number that drives the budget as well as the
-architecture.
+architecture. **Excludes ADR-007's tiers 2-3** (on-demand ClickHouse, Spark serverless): neither
+is built by default in this plan, and both are on-demand per escalated job rather than standing
+infra, so there is no fleet-wide line to size until the risk register's trigger above pulls them
+into scope.
 
 ---
 
-## 12. Decisions we are least confident about
+## 11. Decisions we are least confident about
 
-Three calls could reasonably go the other way. Each names the metric that would flip it.
+Five calls could reasonably go the other way. Each names the metric that would flip it.
 
 **1. The planner runtime, now formally deferred (ADR-001 + ADR-003).** ADR-001 is the only ADR
 still marked Proposed, with criteria and a decision date rather than a choice, because the

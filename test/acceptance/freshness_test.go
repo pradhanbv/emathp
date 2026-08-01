@@ -36,7 +36,7 @@ func TestMaxStalenessServesCache(t *testing.T) {
 // wrong: once the cache entry goes stale, revalidating it (a conditional
 // fetch that comes back 304, unchanged) still spends a rate-limit token.
 // Treating a "nothing changed" response as free would silently exceed a
-// real source's quota - the doc calls this out directly (Section 5, ADR-005).
+// real source's quota - the doc calls this out directly (DESIGN_FULL.md Section 5, ADR-005).
 func TestETagRevalidationSpendsBudget(t *testing.T) {
 	sf := mocksf.Start(t, mocksf.Rows(5))
 	deps := testDeps(t, sf)
@@ -91,7 +91,7 @@ func TestFreshnessCacheIsolatedByPrincipal(t *testing.T) {
 // TestResultCacheHitRatioMetric proves result_cache_requests_total records
 // exactly one miss (the first, uncached call) and one hit (the second,
 // within max_staleness) for a single principal - the counter DESIGN.md
-// Section 9 says result_cache_hit_ratio is derived from via PromQL rate(),
+// DESIGN_FULL.md Section 9 says result_cache_hit_ratio is derived from via PromQL rate(),
 // rather than something the gateway computes and stores itself.
 func TestResultCacheHitRatioMetric(t *testing.T) {
 	obs.ResetMetrics()

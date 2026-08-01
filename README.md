@@ -1,28 +1,37 @@
 # Universal SQL Across Enterprise Apps
 
-A federated SQL gateway over Salesforce + Zendesk, generalizing to 1,000s of SaaS app types.
-One cross-app query, end-to-end: auth, entitlement checks, rate-limit handling, freshness
-control. This file is a 5-minute orientation - depth lives elsewhere:
+Federated SQL over Salesforce + Zendesk, generalizing to 1,000s of SaaS app types. One cross-app
+query end-to-end: **auth → entitlement checks → rate-limit handling → freshness control**.
 
-| File | For |
-|---|---|
-| [`DESIGN.md`](./DESIGN.md) | 25-minute design read - all 11 ADRs, both capability ladders, capacity math |
-| [`DESIGN_FULL.md`](./DESIGN_FULL.md) | Full canonical design - worked derivations, rejected alternatives, sequence diagrams |
-| [`DESIGN_LESS.md`](./DESIGN_LESS.md) | Same content as `DESIGN_FULL.md`, denser prose, shorter than it |
-| [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md) | Every option seriously considered and turned down |
-| [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) | The TDD build log, cycle by cycle |
+| Doc | For | Read time |
+|---|---|---|
+| **This file** | Orientation, quickstart, what's proven and what isn't | ~7 min |
+| [`DESIGN.md`](./DESIGN.md) | All 11 ADRs, both capability ladders, capacity math, six-month plan | ~25 min |
+| [`DESIGN_FULL.md`](./DESIGN_FULL.md) | Canonical — worked derivations, full rejection reasoning, 16 diagrams | ~90 min |
+| [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md) | Every option considered and turned down, with its steelman | ~15 min |
+| [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) | The TDD build log, cycle by cycle | ~20 min |
 
 ---
 
 ## Quickstart
 
 ```bash
-docker compose --profile core --profile mocks up -d # gateway + 2 mock SaaS sources
-go test ./... # 30 tests, ~1s
-docker compose --profile testing run --rm k6 # load test: 500 req/s for 60s
+docker compose --profile core --profile mocks up -d --build   # gateway + 2 mock SaaS sources
+go test ./...                                                 # 36 tests, ~1s
+docker compose --profile testing run --rm k6                  # load test: 500 req/s for 60s
+
+docker compose --profile "*" down                             # tear down — see note below
 ```
 
-The demo that matters - the same SQL under two identities:
+> **Teardown needs a profile flag.** Every service in `docker-compose.yml` is profile-gated
+> (`core`, `mocks`, `observability`, `testing`) and there is no default profile-less service, so a
+> bare `docker compose down` selects **zero** services, stops nothing, and exits `0` with no
+> output. Confusingly `docker compose ps` still lists the containers — it matches on the project
+> label rather than the profile selection — which makes this look like a Docker bug rather than a
+> flag you're missing. Use `--profile "*"` (or name the profiles, or list the services
+> explicitly).
+
+**The demo that matters** — same SQL, two identities:
 
 ```bash
 # Support agent: RLS restricts to their region, email is masked
@@ -36,90 +45,537 @@ curl -s localhost:8080/v1/query \
  -d '{"sql":"SELECT id, name, email, region FROM sf.accounts","max_staleness":"60s"}' | jq
 ```
 
-Every response carries `freshness_ms`, `rate_limit_status`, `trace_id`. Rate-limit exhaustion,
-async reroute, and the freshness cold/warm/revalidated states are all reproducible with one
-command each - ask, or see `DESIGN_FULL.md`'s recreate section for the full list.
+Every response carries `freshness_ms`, `rate_limit_status`, `trace_id`.
+
+**Every other claim in this README is runnable too** — rate-limit exhaustion, async reroute,
+freshness cold/warm/revalidated, connector SDK mechanics, and both observability screenshots, with
+exact commands and expected output:
+[Appendix — Recreate every claim yourself, in full](#appendix--recreate-every-claim-yourself-in-full).
+
+---
+
+## Four tests carry the submission
+
+Each exists because it proves a design claim a reviewer would otherwise take on faith.
+
+| Test | Claim it proves | ADR |
+|---|---|---|
+| `TestLyingConnectorFailsClosed` | A connector that declares a predicate `ENFORCED` then ignores it is **caught at runtime and fails closed** — RLS survives a connector whose behaviour diverges from its declaration | 002 |
+| `TestPlanCacheDoesNotLeakAcrossRoles` | Caching a plan *before* policy injection is a privilege-escalation vector; the composite cache key prevents it. Built even though the in-process planner is cheap — the bug class covers the result cache too | 003 |
+| `TestSemiJoinReducesProbeCalls` | Cross-app join rewritten as a semi-join: **505 → 17 connector calls (29.7×)** at 2.4% join-key selectivity. The ratio *is* selectivity | 007 |
+| `TestTenantDerivedFromIssuerNotClaim` | A token asserting `tenant_id: t_evilcorp` resolves to `t_acme` — tenant comes from the verified issuer, the claim is never read | 011 |
+
+```bash
+go test ./... -run 'LyingConnector|PlanCacheDoesNotLeak|SemiJoin|TenantDerived' -v
+```
+
+**Why the lying-connector test is the important one.** The realistic failure isn't vendor
+dishonesty — it's *our own* connector sending `?region=EMEA` where the API expects
+`?filter[region]=EMEA`. Most REST frameworks **silently ignore unknown query parameters** and
+return the unfiltered set: an RLS filter that appears pushed, does nothing, and leaks the full
+table with a `200`. So every `PUSHED_ENFORCED` security predicate is re-applied locally after
+fetch, with two metrics carrying opposite expectations:
+
+| Metric | Expected | Meaning |
+|---|---|---|
+| `residual_filter_rows_dropped` | Non-zero | Normal — the cost of the `ADVISORY` path |
+| `enforced_predicate_violations_total` | **Zero** | Non-zero ⇒ a connector diverged from its declaration. **Page someone.** |
 
 ---
 
 ## MVP status at a glance
 
-Same eleven ADRs, grouped by how real the prototype's version of each is - not by ADR number,
-since "partial" hides very different kinds of partial.
+Eleven ADRs, grouped by *how real* the prototype's version of each is rather than by ADR number —
+because several ADRs land in more than one lane at once. ADR-007 alone is fully built (semi-join),
+entirely absent (DuckDB), and undecided (`RESULT_TOO_LARGE`) in three different places, which a
+single per-ADR verdict would flatten into one misleading word.
 
-```mermaid
-flowchart TB
-    subgraph built["BUILT AND VERIFIED — real code, real tests, real HTTP round trips"]
-        direction LR
-        PLAN["Go planner + capability<br/>classification<br/><i>spike evidence for ADR-001</i>"]
-        RLS["RLS/CLS injection, plan-time<br/>invariant, runtime verification<br/>filter (ADR-002)"]
-        CACHE["Parameterized plan cache,<br/>role-isolated (ADR-003)"]
-        JOIN["Semi-join rewrite —<br/>505→17 calls, 29.7x (ADR-007)"]
-        TENANT["Tenant from verified <code>iss</code>,<br/>never from claim (ADR-011)"]
-        OBS["Real Prometheus histogram +<br/>real OTel trace, connector<br/>spans nested under query span"]
-        RCACHE["Result cache keyed by principal,<br/>not just table+columns+filters<br/><i>ADR-002 addendum; real<br/>result_cache_requests_total metric</i>"]
-    end
+| Lane | Contents |
+|---|---|
+| **🟢 Built & verified**<br>real code, real tests, real HTTP round trips | Go planner + capability classification · RLS/CLS injection + plan-time invariant + runtime verification filter (002) · parameterized role-isolated plan cache (003) · semi-join rewrite, 505→17 calls (007) · tenant from verified `iss`, never a claim (011) · real Prometheus histogram + real OTel trace · result cache keyed by principal |
+| **🟡 Partial**<br>real mechanism, deliberately narrowed scope | Freshness rungs 1 & 4 + `max_staleness` only (005) · rate limits: single-node bucket, `429`, async reroute — no Redis lease, no fair queue, **no per-tenant dimension** (006) · NDJSON + `SOURCE_TIMEOUT` terminal frame, thin coverage (009) · policy injection real, OPA mocked (002) · identity derivation real, signature verification mocked (011) |
+| **⚪ Mocked / not built**<br>infrastructure a reviewer can assume | Salesforce + Zendesk connectors are mocks (004) · Calcite sidecar + Substrait IR deferred to M1 spike (001) · materialization is an in-memory Go hash join, not DuckDB (007) · tenant lifecycle API (008) · per-tenant KMS + crypto-shred (010) · **audit trail (010) — no access log exists; nothing to review post-incident** |
+| **🔵 Open question**<br>not decided, not just unbuilt | `LIMIT`/`OFFSET` — same implementation layer as projection but less MVP value, which is likely why the gap wasn't caught; still undecided past the grammar (007) · `RESULT_TOO_LARGE` — guardrail specified in 007, never implemented. **The sharper risk: a skewed join can exhaust memory today** |
 
-    subgraph partial["PARTIAL — real mechanism, deliberately narrowed scope"]
-        direction LR
-        FRESH["Freshness: rungs 1 &amp; 4 +<br/><code>max_staleness</code> (ADR-005)<br/><i>rungs 2–3 not built</i>"]
-        RATE["Rate limits: single-node bucket,<br/>429, async reroute (ADR-006)<br/><i>no Redis lease, no fair queue</i>"]
-        STREAM["NDJSON + <code>SOURCE_TIMEOUT</code><br/>terminal frame (ADR-009)<br/><i>thin coverage, at risk</i>"]
-        POLICY["Policy: <code>PolicyProvider</code> stub<br/>returns residuals from JSON<br/><i>injection real, OPA mocked</i>"]
-        JWT["Identity: issuer→tenant<br/>derivation is real<br/><i>signature verification mocked</i>"]
-    end
+**The pattern.** Every unbuilt ADR maps to a requirement about *infrastructure* — a JVM sidecar,
+a vendor contract, Terraform, a KMS call. Every built one maps to a requirement about *behaviour
+under adversarial conditions*. **We built what a reviewer cannot take on faith.**
 
-    subgraph mocked["MOCKED OR NOT BUILT — infrastructure a reviewer can assume"]
-        direction LR
-        CONN["Salesforce + Zendesk<br/>connectors (ADR-004)<br/><i>mocksf / mockzd, not real APIs</i>"]
-        SIDECAR["Calcite sidecar,<br/>Substrait IR (ADR-001)<br/><i>deferred to M1 spike</i>"]
-        DUCK["Ephemeral DuckDB<br/>materialization (ADR-007)<br/><i>in-memory Go hash join instead</i>"]
-        LIFE["Tenant lifecycle API<br/>(ADR-008) — not implemented"]
-        KMS["Per-tenant KMS,<br/>crypto-shred (ADR-010)<br/>— not implemented"]
-        AUDIT["Audit trail<br/>(ADR-010) — not implemented<br/><i>no access log exists;<br/>nothing to review post-incident</i>"]
-    end
+---
 
-    subgraph open["OPEN QUESTION — not decided, not just unbuilt"]
-        direction LR
-        LIMITOFFSET["LIMIT / OFFSET<br/>same layer as projection,<br/>less MVP value — gap, not a cut<br/><i>ADR-007: pushdown vs. truncation-only</i>"]
-        RTL["RESULT_TOO_LARGE<br/>guardrail specified in ADR-007,<br/>never implemented<br/><i>the sharper risk — a skewed join<br/>can exhaust memory today</i>"]
-    end
+## Measured: the number the design is least sure about
 
-    classDef builtStyle fill:#dcfce7,stroke:#16a34a,color:#14532d
-    classDef partialStyle fill:#fef9c3,stroke:#ca8a04,color:#713f12
-    classDef mockedStyle fill:#f3f4f6,stroke:#6b7280,color:#1f2937
-    classDef openStyle fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
-    class PLAN,RLS,CACHE,JOIN,TENANT,OBS,RCACHE builtStyle
-    class FRESH,RATE,STREAM,POLICY,JWT partialStyle
-    class CONN,SIDECAR,DUCK,LIFE,KMS,AUDIT mockedStyle
-    class LIMITOFFSET,RTL openStyle
+Per-principal cache hit ratio is *"the single most consequential unknown"* in the design.
+Per-user delegated tokens make entitlements correct essentially for free, but force per-principal
+cache keys and collapse locality. **The capacity model assumes 30%.** The k6 script is
+parameterized by distinct principal count, so this is measured rather than assumed — every row
+below is **500 req/s for 60 s (30,001 requests), 0 failures**, gateway restarted between runs so
+a warm cache can't inflate the next:
+
+```bash
+docker compose --profile testing run --rm -e PRINCIPALS=100 k6   # then 1000, then 10000
 ```
 
-**What it proves.** Green is exactly the mechanisms a reviewer would otherwise take on faith -
-security and correctness, not infrastructure. Grey is every ADR whose unbuilt half is
-infrastructure (a JVM sidecar, a KMS call, a Terraform-replacing API) - never a security
-mechanism; that split is deliberate, not a shortfall. Blue is a hole in the v1 SQL surface
-itself, surfaced by review rather than designed around - see `DESIGN.md`'s Decision register
-(ADR-007) and least-confident-decisions section.
+| Distinct principals | `result_cache_hit_ratio` | Connector calls (of 30,001) | p95 |
+|---|---|---|---|
+| 1 | 99.99% | 3 | 398 µs |
+| 100 | 99.33% | 200 | 420 µs |
+| 1,000 | 93.33% | 2,000 | 491 µs |
+| **10,000** | **33.33%** | **20,000** | **713 µs** |
+
+- **Connector calls track distinct principals exactly** — `principals × 2` in every row: each
+  principal misses once on first fetch, once more when its 30 s `max_staleness` expires midway
+  through the 60 s run.
+- **Cross-checked three ways** — k6's client-side `meta.cache_hit`, the gateway's
+  `result_cache_requests_total{outcome}`, and `connector_request_duration_seconds_count`. All
+  three agree exactly on the 10,000-principal run (10,001 hits / 20,000 misses / 20,000 calls).
+- **What it means:** hit ratio holds well past the model's 30% assumption — *but only while
+  principal count stays small relative to request volume.* At 10,000 principals it falls to 33%,
+  and p95 rises in step, because a miss is a real connector call. At 10M users principal count
+  dominates request volume by orders of magnitude, so **connector quota — not our fleet — becomes
+  the binding constraint**, and quota can't be autoscaled past.
+- **Latency caveat:** sub-millisecond p95 against in-process mocks says nothing about the 1.5 s
+  SLO, which real SaaS latency dominates. The p95 column is good for its *shape* (it moves with
+  miss rate), not its magnitude.
+
+**A real bug, found while building this table.** Two requests sharing a cached plan (same SQL
+shape, different `WHERE` literal) were silently serving whichever literal built the plan — the
+plan cache's own hit-ratio pressure triggered it on any two same-shaped, differently-valued
+queries. `$principal.<attr>` values were already resolved lazily per call; ordinary literals were
+not, until this table required varying one. Fixed, and pinned by
+`TestPlanCacheHitsOnSameShapeDifferentValue` (`internal/plancache`), which asserts a cache hit
+must not reuse the first query's literal value.
 
 ---
 
-## One dashboard, one trace
+## Observability: one dashboard, one trace
 
-`jaeger_1.png` - a cross-app join trace: fanout to both connectors runs in parallel, and the
-merge step is visibly the only serial cost. `prom_1.png` / `prom_2.png` - request-duration
-histogram and rate-limit budget remaining, by connector and tenant. What each proves: the SLO is
-dominated by external connector latency, not our own overhead - the whole basis for excluding
-upstream source faults from the availability SLI (`DESIGN.md`, SLO section).
+| Artifact | What it proves |
+|---|---|
+| `jaeger_1.png` | Cross-app join trace — fanout to both connectors runs genuinely **in parallel**, and our own overhead is a small fraction of wall clock. This is the whole basis for excluding upstream source faults from the availability SLI |
+| `prom_1.png`, `prom_2.png` | Request-duration histogram and rate-limit budget remaining, by connector and tenant — the load-test run behind the hit-ratio table above |
+
+![Jaeger trace of a cross-app join](./jaeger_1.png)
+
+![Prometheus request-duration and rate-limit budget panels](./prom_2.png)
 
 ---
 
-## Rationale in one paragraph
+## Recreate every claim yourself
 
-Three enforcement layers for entitlements (object auth, policy-compiled RLS/CLS, source ACLs as
-backstop, plus a runtime filter that catches a connector lying about its own capability), a
-freshness ladder that never spends rate-limit quota silently, and a four-tier join ladder
-(in-memory → DuckDB → on-demand ClickHouse → Spark serverless) sized by a cost estimate, never
-by table count. Every "partial" or "not built" item above is a named, deliberate scope cut with
-its own reasoning in `DESIGN.md` - not a silent gap. Full trade-off discussion, all rejected
-alternatives, and the six-month execution plan: `DESIGN.md` → `DESIGN_FULL.md`.
+| Claim | How |
+|---|---|
+| **Entitlement enforcement (RLS/CLS)** | The two-identity demo in Quickstart above |
+| **Async reroute** | `Prefer: respond-async` header → returns a `poll_url`; poll it for the result. Doesn't require exhausting a budget first — the header reroutes on request, the same path a client falls back to after a `429` |
+| **Rate-limit exhaustion** | Compose runs unlimited by default. Start a second gateway with a budget: `go run ./cmd/gateway --addr :8090 --sf-url http://localhost:8081 --zd-url http://localhost:8082 --sf-limit 3`, then send 4 requests → 3× `200`, then `429` + `Retry-After: 1` |
+| **Freshness control** | Vary `max_staleness` across calls and watch `freshness_ms` and the cold/warm/revalidated states in the response |
+| **Load / hit ratio** | `docker compose --profile testing run --rm -e PRINCIPALS=10000 k6` |
+
+Exact commands with expected output: [Appendix](#appendix--recreate-every-claim-yourself-in-full) at the bottom of this file.
+
+---
+
+## Error vocabulary
+
+Every message names **what to do**, not just what broke.
+
+| Code | HTTP | When |
+|---|---|---|
+| `RATE_LIMIT_EXHAUSTED` | 429 | Budget spent — carries `Retry-After` + async instructions |
+| `STALE_DATA` | 200 | Served outside `max_staleness`; a probe would have exceeded budget |
+| `ENTITLEMENT_DENIED` | 403 | Policy or source ACL denied — names the resource, never the policy reason |
+| `SOURCE_TIMEOUT` | 200 + terminal frame | A source exceeded its budget; partial results labelled honestly |
+| `UNSUPPORTED_PREDICATE` | 400 | Plan would require a full scan of a SaaS API |
+| `RESULT_TOO_LARGE` | 400 | Materialization would exceed guardrail *(specified, not implemented)* |
+| `CONNECTOR_AUTH_FAILED` | 502 | Token refresh failed / grant revoked |
+| `SCHEMA_DRIFT` | 409 | Source schema changed under a pinned connector version |
+| `PRINCIPAL_UNRESOLVED` | 503 | Attribute resolution failed and cache expired — fail closed |
+| `RESIDENCY_VIOLATION` | 403 | Plan would cross a residency boundary |
+
+---
+
+## Afterthought: connector authoring is the real bottleneck
+
+Building this surfaced something the brief frames as one requirement among many, but which is
+actually **the constraint the whole product lives or dies on: writing and validating connectors
+at 1,000s-of-app-types scale.** Everything else here — planner, policy compilation, join ladder,
+capacity model — is work that gets done once and then serves every connector. Connector authoring
+is the only cost that scales *linearly with the catalog*, and ADR-004's build-vs-buy split is
+better read as a symptom of that than as a solution to it: **building** everything is "1,000
+connectors against unversioned vendor APIs," and **buying** everything normalizes away the
+per-field pushdown and per-user delegated auth that ADR-002 and the SLO both depend on. Neither
+option removes the bottleneck; they just decide who absorbs it.
+
+**So the thing I'd actually try next is LLM-drafted connectors** — 1,000+ app types each speaking
+its own dialect (SOQL, GraphQL, REST, Elasticsearch DSL…) is precisely a translation-and-volume
+problem, which is what generation is good at, aimed squarely at the one cost that scales with the
+catalog.
+
+**The convenient part is a coincidence, not the reason.** `TestLyingConnectorFailsClosed` was
+built for an entirely different purpose — catching a connector that declares a predicate
+`ENFORCED` and then ignores it, most likely our *own* connector with a malformed query parameter.
+It happens to be **provenance-blind**: it never asks who wrote a connector, only whether it
+behaves. So the validation harness that makes generated connectors safe to accept already exists,
+having been built for a reason that had nothing to do with LLMs. That removes the obvious
+objection to this idea; it isn't what prompted it.
+
+Three places to try it, in the order I'd attempt them:
+
+| # | Where | Why there first |
+|---|---|---|
+| 1 | **Capability discovery** — draft the `ENFORCED`/`ADVISORY` map from whatever docs exist (OpenAPI in the tidy case; prose and workflow descriptions in the common one) | Declarative output, not code, validated by the gate that already exists. `testdata/catalog/sf.accounts.json` is a handful of hand-written lines for *one* table — the authoring cost at n=1,000 is visible from n=2 |
+| 2 | **Schema-drift triage** — diff spec versions, classify breaking vs. additive, draft the patch | Attacks the cost ADR-004 itself calls decisive: *"schema drift alone would consume the team"* |
+| 3 | **Request translation** — plan → SOQL/GraphQL/REST/ES DSL | Placed *after* policy injection, so the model only ever **executes** a security decision already made — never makes one |
+
+How connectors get deployed and versioned — independent of who or what authors one — is a
+separate question from this suggestion, not a consequence of it: see ADR-004 in
+[`DESIGN.md`](./DESIGN.md).
+
+---
+
+## Layout
+
+| Path | What |
+|---|---|
+| `cmd/gateway` | The gateway binary |
+| `cmd/mocksf`, `cmd/mockzd` | Mock Salesforce / Zendesk sources |
+| `internal/{plan,exec}` | Planner, capability classification, semi-join rewrite, join execution |
+| `internal/{policy,identity}` | RLS/CLS residuals, issuer→tenant derivation |
+| `internal/{ratelimit,freshness}` | Token bucket, freshness ladder + result cache |
+| `internal/{connector,server,obs}` | Connector SDK, HTTP surface, OTel/Prometheus |
+| `test/acceptance` | End-to-end tests, including the four above |
+| `k6/` | Load script, parameterized by principal count |
+
+---
+
+## Appendix — Recreate every claim yourself, in full
+
+Every claim in this README you can run rather than take on faith, gathered in one place - the
+THP's three minimal expectations first (entitlement, rate-limit, freshness), then the connector
+SDK's own mechanics, then the two screenshots the submission asks for. All of it assumes the
+[Quickstart](#quickstart) stack is already running, except where a subsection says otherwise.
+
+### Recreate: entitlement enforcement (RLS/CLS)
+
+Already shown in Quickstart above - the same query as two identities, one restricted to their
+region with email masked, one not. Not repeated here to avoid duplicating the exact commands;
+scroll up if you jumped straight to this section.
+
+### Recreate: async reroute
+
+`Prefer: respond-async` (previously only provable by reading `TestAsyncReroute`). It doesn't
+require actually exhausting a connector's budget first - the header reroutes to the in-memory job
+queue on request, the same path a client would fall back to after a `429 RATE_LIMIT_EXHAUSTED`
+(see the next section for that path itself).
+
+```bash
+POLL_URL=$(curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -H "Prefer: respond-async" \
+ -d '{"sql":"SELECT id FROM sf.accounts"}' | jq -r .poll_url)
+echo "$POLL_URL"
+# /v1/jobs/job-1
+
+curl -s "localhost:8080$POLL_URL" | jq
+# {
+#   "done": true,
+#   "result": {
+#     "columns": ["id"],
+#     "rows": [...],
+#     "freshness_ms": 0,
+#     "rate_limit_status": {"sf": "unlimited"},
+#     "trace_id": "..."
+#   }
+# }
+```
+
+If `done` is `false` on the first poll, the job hasn't finished yet - re-run the second `curl`.
+The async job is an in-memory map with no real queue (`internal/server/server.go`'s `asyncJob`),
+so this resolves near-instantly against a mock; the poll contract itself is what
+`TestAsyncReroute` proves with `require.Eventually`.
+
+### Recreate: rate-limit exhaustion
+
+`docker-compose.yml`'s `gateway` service runs with no `--sf-limit`/`--zd-limit` flag, i.e.
+unlimited - the flag exists (`cmd/gateway/main.go`) but the default stack never sets it, so a
+`429` never happens against the plain quickstart. Run a second gateway locally instead, pointed
+at the same two mocks (their ports are already exposed to the host by `docker-compose.yml`),
+with a budget low enough to hit:
+
+```bash
+docker compose --profile mocks up -d   # just the two mocks - the compose gateway can stay up too
+
+# Build first, then run the binary directly. Do NOT use `go run ... &` here: go run
+# execs the compiled binary as a *child*, so killing the go run job leaves the real
+# gateway holding :8090, and every re-run then fails with "address already in use".
+go build -o /tmp/emathp-gw ./cmd/gateway
+/tmp/emathp-gw --addr :8090 --sf-url http://localhost:8081 --zd-url http://localhost:8082 --sf-limit 3 &
+GW=$!   # the gateway's own pid, directly killable
+
+for i in 1 2 3 4; do
+  curl -s -D - -o /dev/null localhost:8090/v1/query \
+    -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+    -d '{"sql":"SELECT id FROM sf.accounts"}' | grep -iE "^HTTP|Retry-After"
+done
+kill $GW   # stops the gateway started above
+```
+
+```
+HTTP/1.1 200 OK
+HTTP/1.1 200 OK
+HTTP/1.1 200 OK
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+```
+
+A budget of 3 lets exactly 3 calls through - `rate_limit_status.sf` in each body counts down
+`"2"` -> `"1"` -> `"0"` across them - and the 4th gets `429` + `Retry-After: 1` + an `error.code`
+of `RATE_LIMIT_EXHAUSTED` naming the connector and suggesting `Prefer: respond-async`. The same
+`429` `TestRateLimitExhausted` proves in-process.
+
+### Recreate: freshness control
+
+Same query, same principal, `max_staleness` set. Three states, not two - and which one a "first"
+call actually shows you depends on whether the gateway process already has a cache entry for this
+exact `(principal, table, columns, filters)` signature, since that cache lives for the process's
+whole lifetime, not per-request. Against a gateway you haven't touched yet you'll see the first
+two; against a long-lived one (the Docker stack, or one you've already been experimenting
+against) you may land straight on the third instead of the first - that's not a bug, see below.
+
+**1. Cold** - nothing cached yet, so `meta` is absent entirely (`resultOutcome` only sets it when
+a cache hit, a revalidation, or a join applies):
+
+```bash
+curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' | jq '{freshness_ms, meta}'
+# { "freshness_ms": 0, "meta": null }
+```
+
+**2. Warm** - the same call again, immediately, within the 60s window - served from memory, `sf`
+never touched:
+
+```bash
+curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' | jq '{freshness_ms, meta}'
+# { "freshness_ms": 24, "meta": {"cache_hit": true} }
+```
+
+`freshness_ms` here is however many milliseconds elapsed between the two curls - small and
+non-zero, not a fixed number.
+
+**3. Stale, but unchanged** - `max_staleness` isn't part of the cache key (only table/columns/
+filters/principal are), so the *same* entry from step 1-2 can be re-asked against a shorter
+budget once enough real time has passed. Wait past the previous entry's age, then ask with a
+tight `max_staleness`:
+
+```bash
+sleep 2
+curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"1s"}' | jq '{freshness_ms, meta}'
+# { "freshness_ms": 0, "meta": {"revalidated": true} }
+```
+
+This is the state you land on by accident if you just re-run step 1 after the entry has aged past
+60s on a gateway you've already exercised - the cache issues a conditional `If-None-Match` instead
+of a plain fetch, `sf`'s data hasn't actually changed, and it comes back `304`. `cache_hit` is
+omitted (`omitempty`, and it's `false` here - this wasn't served from memory, a real conditional
+request went out) while `revalidated: true` is the point worth noticing: ADR-005's "a conditional
+request is a request" made concrete. The connector still saw a call and the rate-limit budget
+still moved, even though no new bytes came back. `TestMaxStalenessServesCache` proves states 1-2
+in-process; `TestETagRevalidationSpendsBudget` proves state 3's budget accounting.
+
+### Recreate: connector SDK mechanics (pagination, ETag, the lying connector)
+
+Everything below is a real HTTP round trip against `cmd/mocksf` (built from `go build -o
+mocksf ./cmd/mocksf`), not a unit test asserting internal state - showing the behavior beats
+describing it.
+
+Start it with the defaults (250 rows, page-size 100, `status` enforced - `cmd/mocksf/main.go`
+always sets that last one regardless of flags):
+
+```
+$ ./mocksf &
+```
+
+**Pagination** - 250 rows requested at `page-size=100` come back as three pages, the last one
+short, each carrying an explicit `has_more` rather than the client having to guess from a
+row count:
+
+```
+$ curl -s "http://localhost:8081/accounts?fields=id&offset=0"   | jq '{count: (.rows | length), has_more}'
+{ "count": 100, "has_more": true }
+$ curl -s "http://localhost:8081/accounts?fields=id&offset=100" | jq '{count: (.rows | length), has_more}'
+{ "count": 100, "has_more": true }
+$ curl -s "http://localhost:8081/accounts?fields=id&offset=200" | jq '{count: (.rows | length), has_more}'
+{ "count": 50, "has_more": false }
+```
+
+`go test ./internal/connector/... -run TestConnectorPaginationAndETag -v`:
+
+```
+=== RUN   TestConnectorPaginationAndETag
+--- PASS: TestConnectorPaginationAndETag (0.00s)
+```
+
+`connector.HTTPSource.Fetch` hides this pagination entirely - it made one call to `exec`,
+three calls to the mock, matching the call-count assertion in the test.
+
+**ETag / `If-None-Match` -> 304** - a conditional re-request with the ETag the mock just
+issued gets a 304, not a re-fetch of the full body:
+
+```
+$ ETAG=$(curl -sI "http://localhost:8081/accounts" | grep -i '^etag' | tr -d '\r' | sed 's/.*: //')
+$ echo $ETAG
+7eaf965187fa89ec
+$ curl -s -o /dev/null -w "%{http_code}\n" -H "If-None-Match: $ETAG" "http://localhost:8081/accounts"
+304
+```
+
+**An enforced predicate actually filters** - `status` is declared `ENFORCED` by default, and
+a value no row has returns zero rows, not the whole table:
+
+```
+$ curl -s "http://localhost:8081/accounts?fields=id,status&status=closed" | jq '.rows | length'
+0
+```
+
+**The lying connector** - `--lie-about region` declares `region` `ENFORCED` (so our planner
+would push a security predicate to it) and then ignores the filter it claims to apply. This
+needs a second mock instance with different flags, so stop the first one before starting it -
+same port, same "address already in use" failure as the Docker one earlier if you don't:
+
+```
+$ kill %1   # or: pkill -f mocksf - stop the instance started above, it's still on :8081
+$ ./mocksf --rows 10 --lie-about region &
+$ curl -s "http://localhost:8081/accounts?fields=id,region&region=nonexistent-region" | jq '.rows | length'
+10
+```
+
+Ten rows for a value nothing matches is exactly the failure `TestLyingConnectorFailsClosed`
+(Cycle 6) exists to catch - the plan-time invariant has no way to see this, because the
+predicate *was* legitimately pushed to a connector that claimed to enforce it. Only the
+runtime verification filter, re-applying the predicate locally after fetch, notices the row
+count didn't drop to zero.
+
+### Recreate: the observability screenshots
+
+A real Prometheus endpoint and a real trace, not in-process approximations of either. Full
+step-by-step instructions for taking both submission screenshots are below; this part explains
+what's actually real and which test proves it, so the walkthrough isn't taken on faith either.
+
+**The metrics.** `GET /metrics` on the gateway is a genuine `prometheus/client_golang` registry,
+not the in-memory `obs.Observe`/`obs.Gather` pair the test suite also uses (that one exists so
+tests can assert "a sample was recorded" without a real registry in the loop - both are fed from
+the same call sites, so neither can drift from what actually happened). Two metrics live there:
+
+- `connector_request_duration_seconds` - a proper histogram (buckets, `_sum`, `_count`), labeled
+  by `connector` and `outcome`, plus the Go runtime metrics the client library exposes for free.
+  Proved real by `TestConnectorDurationMetric` (`test/acceptance/obs_test.go`).
+- `result_cache_requests_total{connector,outcome}` - a counter, `outcome` = `hit` (served from
+  the freshness/result cache, no outbound call) or `miss` (a live or conditional fetch was
+  made). `result_cache_hit_ratio` is derived from this via PromQL `rate()`, not stored directly -
+  see `DESIGN_FULL.md`'s ADR-002 addendum for why. Proved real by `TestResultCacheHitRatioMetric`, and
+  its cache-key correctness (principal isolation, not just table+columns+filters) by
+  `TestFreshnessCacheIsolatedByPrincipal`.
+
+**The trace.** `trace_id` in every response (and the `X-Trace-Id` header the connector receives)
+*is* a real OpenTelemetry trace id, not a random string that merely looks like one - the gateway
+starts a `gateway.query` span per request and a child `connector.fetch` span per connector call
+(`internal/freshness`), exported over OTLP/HTTP to Jaeger's all-in-one image. For the cross-app
+join, the same trace shows **one `connector.fetch` child per fetch** - one for the build side,
+then one per probe chunk (on the current fixture: 1 `sf` + 10 `zd` = 11)
+under one `gateway.query` span - the semi-join's call reduction, visible as spans, not just a
+log line. `TestTraceIDPropagates` proves the id `sf` actually receives on `X-Trace-Id` is the
+same one the gateway returns to its caller, independent of whether a collector is even running -
+tracing degrades gracefully to a no-op tracer when `--otlp-endpoint` is unset (the default for
+`go test`, and for the plain `go run ./cmd/gateway` quickstart), so the id is still real and
+still propagated, just not exported anywhere.
+
+#### Getting the two screenshots
+
+Both screenshots come off the same running stack. Start it once, generate traffic, take both.
+
+**Step 1 - start everything, including the observability profile.**
+
+```bash
+docker compose --profile core --profile mocks --profile observability up -d --build
+```
+
+This starts the gateway, both mocks, Prometheus (scraping the gateway every 5s, `prometheus.yml`),
+and Jaeger's all-in-one image (UI on `16686`, OTLP intake on `4318`, wired via
+`--otlp-endpoint jaeger:4318` in the gateway's compose command - present even when this profile
+isn't running, since the exporter connects lazily and an absent Jaeger just logs, never blocks).
+Give it a few seconds, then confirm the gateway is up:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" localhost:8080/metrics # expect 200
+```
+
+**Step 2 - generate traffic to graph and trace.** A few single-source queries (for the metrics
+graph and a real hit/miss ratio) and one cross-app join (for a trace worth screenshotting - two
+`connector.fetch` children instead of one):
+
+```bash
+for i in $(seq 1 5); do
+  curl -s localhost:8080/v1/query \
+    -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+    -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' > /dev/null
+done
+
+cat > /tmp/join.json <<'EOF'
+{"sql":"SELECT a.name, t.subject FROM sf.accounts a JOIN zd.tickets t ON t.organization_id = a.external_id WHERE t.status = 'open'"}
+EOF
+curl -s localhost:8080/v1/query \
+  -H "Authorization: Bearer $(cat testdata/tokens/root.jwt)" \
+  -d @/tmp/join.json | jq -r .trace_id
+```
+
+Keep the printed `trace_id` from that last command - you'll paste it into Jaeger in Step 4.
+(Using a file for the join query sidesteps shell-quoting issues with the nested single quotes
+around `'open'` - a one-line `curl -d '...'` with embedded quotes is easy to mistype in a way
+that silently truncates the SQL before the `JOIN`, which looks like a working query but returns
+the wrong thing. The `max_staleness` on the loop queries means the 2nd-5th are real cache hits,
+not just repeats - worth pointing out if `result_cache_requests_total` comes up.)
+
+**Step 3 - Prometheus screenshot.**
+
+1. Open `http://localhost:9090/graph` in a browser.
+2. Query `connector_request_duration_seconds_count`, press *Execute*, switch to the *Graph* tab.
+   You should see series labeled by `connector` and `outcome`, stepping up with Step 2's traffic.
+   (Swap in `result_cache_requests_total` to graph hit/miss instead - both are real series.)
+3. Widen the time range (top right) if the default window is too tight to show the steps.
+4. Screenshot the graph tab. This is the metrics screenshot - real connector call volume,
+   scraped from the gateway's own `/metrics`, not a number typed into a doc.
+
+**Step 4 - Jaeger screenshot.**
+
+1. Open `http://localhost:16686` in a browser.
+2. Paste the join query's `trace_id` from Step 2 directly into the search box at the top (or:
+   set *Service* to `emathp-gateway`, click *Find Traces*, and pick the most recent one - it'll
+   be the join, since it's the last query issued).
+3. Click into the trace. You should see a waterfall: one `gateway.query` span at the top with
+   `connector.fetch` children nested under it - **one for the build-side fetch (`sf`), then one
+   per probe chunk (`zd`)**. On the current fixture that's 1 + 10 = **11 fetch spans**; the exact
+   chunk count moves with join-key selectivity, so treat the shape as the claim, not the number.
+4. Screenshot the waterfall. This is the trace screenshot - the semi-join made visible: a single
+   small build-side fetch, then the chunked probe fanout, each span with its own real duration.
+   That chunking *is* the 505 -> 17 call reduction, not a log line asserting it happened.
+
+**What the pair proves together.** The metrics show call volume (and now cache hit/miss) are
+real and observable; the trace shows *where the time inside one request actually went*, and that
+a cross-app join really does fan out across two connectors under one root span - the same claim
+the capacity model makes numerically, here shown as spans a reviewer can click on.
+
+**Step 5 - tear it down.** This walkthrough leaves five containers running:
+
+```bash
+docker compose --profile "*" down
+```
+
+A bare `docker compose down` will *not* work here - every service is profile-gated, so with no
+profile flag it selects zero services and silently does nothing (see the note under Quickstart).
+
+---

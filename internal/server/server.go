@@ -204,7 +204,7 @@ func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, r
 	// the rate limiter or the connector at all. A miss or stale entry
 	// spends exactly one token and makes one (conditional, if an ETag is on
 	// hand) call - the same reservation-after-planning sequencing
-	// DESIGN.md Section 2.3 describes, just moved inside the wrapper so it
+	// DESIGN_FULL.md Section 2.3 describes, just moved inside the wrapper so it
 	// only fires when a call is actually going out. A join needs one
 	// wrapper per distinct connector (Cycle 10) - each side's rate budget
 	// and freshness cache are its own connector's, not shared.
@@ -360,7 +360,7 @@ func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req Query
 	if err == nil {
 		// sources is populated as soon as admission and routing succeed,
 		// independent of whether the fetch itself succeeds - DESIGN.md
-		// ADR-009/Section 7 promise the terminal frame "always carries"
+		// ADR-009 / DESIGN_FULL.md Section 7 promise the terminal frame "always carries"
 		// freshness_ms and rate_limit_status, timeout or not, since a
 		// SOURCE_TIMEOUT partial result is exactly the case a caller most
 		// needs to know which connector was rate-limited or already stale.

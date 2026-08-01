@@ -36,7 +36,7 @@ func TestSourceTimeoutPartialResults(t *testing.T) {
 	require.Equal(t, "SOURCE_TIMEOUT", last.Sources["zd"].Error)
 	require.NotEmpty(t, last.TraceID)
 
-	// DESIGN.md ADR-009 and Section 7 promise the terminal frame "always
+	// ADR-009 and DESIGN_FULL.md Section 7 promise the terminal frame "always
 	// carries" freshness_ms and rate_limit_status - not just on success. A
 	// SOURCE_TIMEOUT partial result is exactly the case a caller most needs
 	// this: which connector was rate-limited or already stale, not just

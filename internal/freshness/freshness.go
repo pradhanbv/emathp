@@ -169,7 +169,7 @@ func (s *Source) timedFetch(ctx context.Context, req connector.FetchRequest) ([]
 }
 
 // cacheKey signs an outbound fetch by principal, table, requested columns,
-// and bound filter values (DESIGN.md ADR-002's result-cache key addendum) -
+// and bound filter values (DESIGN_FULL.md ADR-002's result-cache key addendum) -
 // the same signature two calls need to share for one to safely serve the
 // other's cached rows. principal must be part of it: see Cache's doc
 // comment for why table/columns/filters alone isn't enough.

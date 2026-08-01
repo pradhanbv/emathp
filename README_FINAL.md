@@ -37,6 +37,11 @@ curl -s localhost:8080/v1/query \
 
 Every response carries `freshness_ms`, `rate_limit_status`, `trace_id`.
 
+**Every other claim in this README is runnable too** — rate-limit exhaustion, async reroute,
+freshness cold/warm/revalidated, connector SDK mechanics, and both observability screenshots, with
+exact commands and expected output:
+[Appendix — Recreate every claim yourself, in full](#appendix--recreate-every-claim-yourself-in-full).
+
 ---
 
 ## Four tests carry the submission
@@ -155,7 +160,7 @@ not, until this table required varying one. Fixed in
 | **Freshness control** | Vary `max_staleness` across calls and watch `freshness_ms` and the cold/warm/revalidated states in the response |
 | **Load / hit ratio** | `docker compose --profile testing run --rm -e PRINCIPALS=10000 k6` |
 
-Exact commands with expected output: `DESIGN_FULL.md`'s recreate section.
+Exact commands with expected output: [Appendix](#appendix--recreate-every-claim-yourself-in-full) at the bottom of this file.
 
 ---
 
@@ -229,3 +234,319 @@ separate question from this suggestion, not a consequence of it: see ADR-004 in
 | `internal/{connector,server,obs}` | Connector SDK, HTTP surface, OTel/Prometheus |
 | `test/acceptance` | End-to-end tests, including the four above |
 | `k6/` | Load script, parameterized by principal count |
+
+---
+
+## Appendix — Recreate every claim yourself, in full
+
+Every claim in this README you can run rather than take on faith, gathered in one place - the
+THP's three minimal expectations first (entitlement, rate-limit, freshness), then the connector
+SDK's own mechanics, then the two screenshots the submission asks for. All of it assumes the
+[Quickstart](#quickstart) stack is already running, except where a subsection says otherwise.
+
+### Recreate: entitlement enforcement (RLS/CLS)
+
+Already shown in Quickstart above - the same query as two identities, one restricted to their
+region with email masked, one not. Not repeated here to avoid duplicating the exact commands;
+scroll up if you jumped straight to this section.
+
+### Recreate: async reroute
+
+`Prefer: respond-async` (previously only provable by reading `TestAsyncReroute`). It doesn't
+require actually exhausting a connector's budget first - the header reroutes to the in-memory job
+queue on request, the same path a client would fall back to after a `429 RATE_LIMIT_EXHAUSTED`
+(see the next section for that path itself).
+
+```bash
+POLL_URL=$(curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -H "Prefer: respond-async" \
+ -d '{"sql":"SELECT id FROM sf.accounts"}' | jq -r .poll_url)
+echo "$POLL_URL"
+# /v1/jobs/job-1
+
+curl -s "localhost:8080$POLL_URL" | jq
+# {
+#   "done": true,
+#   "result": {
+#     "columns": ["id"],
+#     "rows": [...],
+#     "freshness_ms": 0,
+#     "rate_limit_status": {"sf": "unlimited"},
+#     "trace_id": "..."
+#   }
+# }
+```
+
+If `done` is `false` on the first poll, the job hasn't finished yet - re-run the second `curl`.
+The async job is an in-memory map with no real queue (`internal/server/server.go`'s `asyncJob`),
+so this resolves near-instantly against a mock; the poll contract itself is what
+`TestAsyncReroute` proves with `require.Eventually`.
+
+### Recreate: rate-limit exhaustion
+
+`docker-compose.yml`'s `gateway` service runs with no `--sf-limit`/`--zd-limit` flag, i.e.
+unlimited - the flag exists (`cmd/gateway/main.go`) but the default stack never sets it, so a
+`429` never happens against the plain quickstart. Run a second gateway locally instead, pointed
+at the same two mocks (their ports are already exposed to the host by `docker-compose.yml`),
+with a budget low enough to hit:
+
+```bash
+docker compose --profile mocks up -d   # just the two mocks - the compose gateway can stay up too
+go run ./cmd/gateway --addr :8090 --sf-url http://localhost:8081 --zd-url http://localhost:8082 --sf-limit 3 &
+
+for i in 1 2 3 4; do
+  curl -s -D - -o /dev/null localhost:8090/v1/query \
+    -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+    -d '{"sql":"SELECT id FROM sf.accounts"}' | grep -iE "^HTTP|Retry-After"
+done
+kill %1   # stop the gateway instance started above
+```
+
+```
+HTTP/1.1 200 OK
+HTTP/1.1 200 OK
+HTTP/1.1 200 OK
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+```
+
+A budget of 3 lets exactly 3 calls through - `rate_limit_status.sf` in each body counts down
+`"2"` -> `"1"` -> `"0"` across them - and the 4th gets `429` + `Retry-After: 1` + an `error.code`
+of `RATE_LIMIT_EXHAUSTED` naming the connector and suggesting `Prefer: respond-async`. The same
+`429` `TestRateLimitExhausted` proves in-process.
+
+### Recreate: freshness control
+
+Same query, same principal, `max_staleness` set. Three states, not two - and which one a "first"
+call actually shows you depends on whether the gateway process already has a cache entry for this
+exact `(principal, table, columns, filters)` signature, since that cache lives for the process's
+whole lifetime, not per-request. Against a gateway you haven't touched yet you'll see the first
+two; against a long-lived one (the Docker stack, or one you've already been experimenting
+against) you may land straight on the third instead of the first - that's not a bug, see below.
+
+**1. Cold** - nothing cached yet, so `meta` is absent entirely (`resultOutcome` only sets it when
+a cache hit, a revalidation, or a join applies):
+
+```bash
+curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' | jq '{freshness_ms, meta}'
+# { "freshness_ms": 0, "meta": null }
+```
+
+**2. Warm** - the same call again, immediately, within the 60s window - served from memory, `sf`
+never touched:
+
+```bash
+curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' | jq '{freshness_ms, meta}'
+# { "freshness_ms": 24, "meta": {"cache_hit": true} }
+```
+
+`freshness_ms` here is however many milliseconds elapsed between the two curls - small and
+non-zero, not a fixed number.
+
+**3. Stale, but unchanged** - `max_staleness` isn't part of the cache key (only table/columns/
+filters/principal are), so the *same* entry from step 1-2 can be re-asked against a shorter
+budget once enough real time has passed. Wait past the previous entry's age, then ask with a
+tight `max_staleness`:
+
+```bash
+sleep 2
+curl -s localhost:8080/v1/query \
+ -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+ -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"1s"}' | jq '{freshness_ms, meta}'
+# { "freshness_ms": 0, "meta": {"revalidated": true} }
+```
+
+This is the state you land on by accident if you just re-run step 1 after the entry has aged past
+60s on a gateway you've already exercised - the cache issues a conditional `If-None-Match` instead
+of a plain fetch, `sf`'s data hasn't actually changed, and it comes back `304`. `cache_hit` is
+omitted (`omitempty`, and it's `false` here - this wasn't served from memory, a real conditional
+request went out) while `revalidated: true` is the point worth noticing: ADR-005's "a conditional
+request is a request" made concrete. The connector still saw a call and the rate-limit budget
+still moved, even though no new bytes came back. `TestMaxStalenessServesCache` proves states 1-2
+in-process; `TestETagRevalidationSpendsBudget` proves state 3's budget accounting.
+
+### Recreate: connector SDK mechanics (pagination, ETag, the lying connector)
+
+Everything below is a real HTTP round trip against `cmd/mocksf` (built from `go build -o
+mocksf ./cmd/mocksf`), not a unit test asserting internal state - showing the behavior beats
+describing it.
+
+Start it with the defaults (250 rows, page-size 100, `status` enforced - `cmd/mocksf/main.go`
+always sets that last one regardless of flags):
+
+```
+$ ./mocksf &
+```
+
+**Pagination** - 250 rows requested at `page-size=100` come back as three pages, the last one
+short, each carrying an explicit `has_more` rather than the client having to guess from a
+row count:
+
+```
+$ curl -s "http://localhost:8081/accounts?fields=id&offset=0"   | jq '{count: (.rows | length), has_more}'
+{ "count": 100, "has_more": true }
+$ curl -s "http://localhost:8081/accounts?fields=id&offset=100" | jq '{count: (.rows | length), has_more}'
+{ "count": 100, "has_more": true }
+$ curl -s "http://localhost:8081/accounts?fields=id&offset=200" | jq '{count: (.rows | length), has_more}'
+{ "count": 50, "has_more": false }
+```
+
+`go test ./internal/connector/... -run TestConnectorPaginationAndETag -v`:
+
+```
+=== RUN   TestConnectorPaginationAndETag
+--- PASS: TestConnectorPaginationAndETag (0.00s)
+```
+
+`connector.HTTPSource.Fetch` hides this pagination entirely - it made one call to `exec`,
+three calls to the mock, matching the call-count assertion in the test.
+
+**ETag / `If-None-Match` -> 304** - a conditional re-request with the ETag the mock just
+issued gets a 304, not a re-fetch of the full body:
+
+```
+$ ETAG=$(curl -sI "http://localhost:8081/accounts" | grep -i '^etag' | tr -d '\r' | sed 's/.*: //')
+$ echo $ETAG
+7eaf965187fa89ec
+$ curl -s -o /dev/null -w "%{http_code}\n" -H "If-None-Match: $ETAG" "http://localhost:8081/accounts"
+304
+```
+
+**An enforced predicate actually filters** - `status` is declared `ENFORCED` by default, and
+a value no row has returns zero rows, not the whole table:
+
+```
+$ curl -s "http://localhost:8081/accounts?fields=id,status&status=closed" | jq '.rows | length'
+0
+```
+
+**The lying connector** - `--lie-about region` declares `region` `ENFORCED` (so our planner
+would push a security predicate to it) and then ignores the filter it claims to apply. This
+needs a second mock instance with different flags, so stop the first one before starting it -
+same port, same "address already in use" failure as the Docker one earlier if you don't:
+
+```
+$ kill %1   # or: pkill -f mocksf - stop the instance started above, it's still on :8081
+$ mocksf --rows 10 --lie-about region &
+$ curl -s "http://localhost:8081/accounts?fields=id,region&region=nonexistent-region" | jq '.rows | length'
+10
+```
+
+Ten rows for a value nothing matches is exactly the failure `TestLyingConnectorFailsClosed`
+(Cycle 6) exists to catch - the plan-time invariant has no way to see this, because the
+predicate *was* legitimately pushed to a connector that claimed to enforce it. Only the
+runtime verification filter, re-applying the predicate locally after fetch, notices the row
+count didn't drop to zero.
+
+### Recreate: the observability screenshots
+
+A real Prometheus endpoint and a real trace, not in-process approximations of either. Full
+step-by-step instructions for taking both submission screenshots are below; this part explains
+what's actually real and which test proves it, so the walkthrough isn't taken on faith either.
+
+**The metrics.** `GET /metrics` on the gateway is a genuine `prometheus/client_golang` registry,
+not the in-memory `obs.Observe`/`obs.Gather` pair the test suite also uses (that one exists so
+tests can assert "a sample was recorded" without a real registry in the loop - both are fed from
+the same call sites, so neither can drift from what actually happened). Two metrics live there:
+
+- `connector_request_duration_seconds` - a proper histogram (buckets, `_sum`, `_count`), labeled
+  by `connector` and `outcome`, plus the Go runtime metrics the client library exposes for free.
+  Proved real by `TestConnectorDurationMetric` (`test/acceptance/obs_test.go`).
+- `result_cache_requests_total{connector,outcome}` - a counter, `outcome` = `hit` (served from
+  the freshness/result cache, no outbound call) or `miss` (a live or conditional fetch was
+  made). `result_cache_hit_ratio` is derived from this via PromQL `rate()`, not stored directly -
+  see `DESIGN.md`'s ADR-002 addendum for why. Proved real by `TestResultCacheHitRatioMetric`, and
+  its cache-key correctness (principal isolation, not just table+columns+filters) by
+  `TestFreshnessCacheIsolatedByPrincipal`.
+
+**The trace.** `trace_id` in every response (and the `X-Trace-Id` header the connector receives)
+*is* a real OpenTelemetry trace id, not a random string that merely looks like one - the gateway
+starts a `gateway.query` span per request and a child `connector.fetch` span per connector call
+(`internal/freshness`), exported over OTLP/HTTP to Jaeger's all-in-one image. For the cross-app
+join, the same trace shows *two* `connector.fetch` children (build side, then each probe chunk)
+under one `gateway.query` span - the semi-join's call reduction, visible as spans, not just a
+log line. `TestTraceIDPropagates` proves the id `sf` actually receives on `X-Trace-Id` is the
+same one the gateway returns to its caller, independent of whether a collector is even running -
+tracing degrades gracefully to a no-op tracer when `--otlp-endpoint` is unset (the default for
+`go test`, and for the plain `go run ./cmd/gateway` quickstart), so the id is still real and
+still propagated, just not exported anywhere.
+
+#### Getting the two screenshots
+
+Both screenshots come off the same running stack. Start it once, generate traffic, take both.
+
+**Step 1 - start everything, including the observability profile.**
+
+```bash
+docker compose --profile core --profile mocks --profile observability up -d --build
+```
+
+This starts the gateway, both mocks, Prometheus (scraping the gateway every 5s, `prometheus.yml`),
+and Jaeger's all-in-one image (UI on `16686`, OTLP intake on `4318`, wired via
+`--otlp-endpoint jaeger:4318` in the gateway's compose command - present even when this profile
+isn't running, since the exporter connects lazily and an absent Jaeger just logs, never blocks).
+Give it a few seconds, then confirm the gateway is up:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" localhost:8080/metrics # expect 200
+```
+
+**Step 2 - generate traffic to graph and trace.** A few single-source queries (for the metrics
+graph and a real hit/miss ratio) and one cross-app join (for a trace worth screenshotting - two
+`connector.fetch` children instead of one):
+
+```bash
+for i in $(seq 1 5); do
+  curl -s localhost:8080/v1/query \
+    -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
+    -d '{"sql":"SELECT id FROM sf.accounts","max_staleness":"60s"}' > /dev/null
+done
+
+cat > /tmp/join.json <<'EOF'
+{"sql":"SELECT a.name, t.subject FROM sf.accounts a JOIN zd.tickets t ON t.organization_id = a.external_id WHERE t.status = 'open'"}
+EOF
+curl -s localhost:8080/v1/query \
+  -H "Authorization: Bearer $(cat testdata/tokens/root.jwt)" \
+  -d @/tmp/join.json | jq -r .trace_id
+```
+
+Keep the printed `trace_id` from that last command - you'll paste it into Jaeger in Step 4.
+(Using a file for the join query sidesteps shell-quoting issues with the nested single quotes
+around `'open'` - a one-line `curl -d '...'` with embedded quotes is easy to mistype in a way
+that silently truncates the SQL before the `JOIN`, which looks like a working query but returns
+the wrong thing. The `max_staleness` on the loop queries means the 2nd-5th are real cache hits,
+not just repeats - worth pointing out if `result_cache_requests_total` comes up.)
+
+**Step 3 - Prometheus screenshot.**
+
+1. Open `http://localhost:9090/graph` in a browser.
+2. Query `connector_request_duration_seconds_count`, press *Execute*, switch to the *Graph* tab.
+   You should see series labeled by `connector` and `outcome`, stepping up with Step 2's traffic.
+   (Swap in `result_cache_requests_total` to graph hit/miss instead - both are real series.)
+3. Widen the time range (top right) if the default window is too tight to show the steps.
+4. Screenshot the graph tab. This is the metrics screenshot - real connector call volume,
+   scraped from the gateway's own `/metrics`, not a number typed into a doc.
+
+**Step 4 - Jaeger screenshot.**
+
+1. Open `http://localhost:16686` in a browser.
+2. Paste the join query's `trace_id` from Step 2 directly into the search box at the top (or:
+   set *Service* to `emathp-gateway`, click *Find Traces*, and pick the most recent one - it'll
+   be the join, since it's the last query issued).
+3. Click into the trace. You should see a waterfall: one `gateway.query` span at the top, with
+   **two** `connector.fetch` children nested under it (the join's build-side fetch and its
+   probe-side fetch), each with its own duration.
+4. Screenshot the waterfall. This is the trace screenshot - the semi-join's two-connector
+   fanout, visible as spans with real durations, not a log line asserting it happened.
+
+**What the pair proves together.** The metrics show call volume (and now cache hit/miss) are
+real and observable; the trace shows *where the time inside one request actually went*, and that
+a cross-app join really does fan out to two connectors under one root span - the same claim
+Section 5's capacity model makes numerically, here shown as spans a reviewer can click on.
+
+---

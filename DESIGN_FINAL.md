@@ -16,31 +16,58 @@ backwards from concurrency rather than asserted.
 
 ## 1. THP requirement coverage
 
-**Functional:**
+Every requirement in the brief, what answers it, and how real that answer is in the prototype.
+Eleven of these needed a contested call recorded as an ADR; the rest are answered by a section.
+What each ADR *rejected* is in [§14](#14-rejected-alternatives-by-decision), kept out of this
+table so it stays scannable.
 
-| Requirement | Answered by | Built? |
+### Functional
+
+| Requirement | Addressed by | Built in MVP? |
 |---|---|---|
-| SQL: projection, filters, pagination, optional joins | §3 SQL surface, ADR-007 | Yes (except `LIMIT`/`OFFSET`) |
-| Entitlements: least-privilege, RLS/CLS from source perms + tenant policy | ADR-002 | Mostly |
-| Real-time: on-demand; timeouts + partial results for slow sources | ADR-009 | Partial |
-| Rate limits: per-app constraints; friendly, actionable exhaustion messages | ADR-006 | Partial |
-| Freshness: avoid materially stale data; per-query staleness hints | ADR-005 | Partial |
-| Admin UX: fast connector onboarding; versioned connectors | ADR-004, §11 M6 | No |
-| Deployment modes: multi-tenant + single-tenant, no code changes | ADR-008 | No |
+| SQL: projection, filters, pagination, optional joins | [§3](#3-sql-surface), [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Yes** — except `LIMIT`/`OFFSET`, see [§13](#13-decisions-we-are-least-confident-about) item 5 |
+| Query Planner: capability discovery, pushdown, join plan, cost/freshness hints, spill to materialization | [ADR-001](#adr-001--planner-runtime-proposed) | **n/a** — in-process Go planner is itself spike evidence |
+| Entitlements: least-privilege; RLS/CLS from source permissions + tenant policy | [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement) | **Mostly** — injection, invariant, verification real; OPA + delegated OAuth mocked |
+| AuthN via OIDC, AuthZ via policy; user token → scopes/roles → RLS/CLS | [ADR-011](#adr-011--identity-tenant-derivation-attribute-resolution) | **Partial** — issuer→tenant real, signature mocked |
+| Connector SDK: capability model, auth/token refresh, pagination, concurrency contracts, error codes | [ADR-004](#adr-004--connector-strategy-build-vs-buy) | **No** — both connectors mocked |
+| Real-time: on demand; timeouts + partial results for slow sources | [ADR-009](#adr-009--streaming-timeouts-partial-results) | **Partial** — NDJSON terminal frame, thin coverage |
+| Rate limits: per-app constraints; friendly, actionable exhaustion messages | [ADR-006](#adr-006--rate-limiting-and-multi-tenant-fairness) | **Partial** — single-node bucket, `429`, async reroute |
+| Freshness: avoid materially stale data; per-query staleness hints | [ADR-005](#adr-005--freshness-watermark-capability-ladder) | **Partial** — rungs 1 & 4 + `max_staleness` |
+| Caching *(implied — nearest is "cache hit ratios" under sizing math)* | [ADR-003](#adr-003--caching-plan-cache--result-cache) | **Partial** — plan cache real; result cache's shared tier designed |
+| Materialization: short-lived tables for joins/aggregations, lifecycle ≤ N min, encrypted per tenant | [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Partial** — semi-join real; DuckDB/ClickHouse/Spark tiers designed |
+| Admin UX: onboard connectors quickly via console/config; connectors versioned | [ADR-004](#adr-004--connector-strategy-build-vs-buy), [§12.3](#123-milestones) M6 | **No** |
+| Deployment modes: multi-tenant and single-tenant without code changes | [ADR-008](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api) | **No** |
+| Error vocabulary + `Retry-After` + async guidance | [§8](#8-error-vocabulary) | **Yes** |
 
-**Non-functional:**
+### Non-functional
 
-| Requirement | Answered by | Built? |
+| Requirement | Addressed by | Built in MVP? |
 |---|---|---|
-| Scale: 10M users, 1k QPS, ~100 MB/s | §8 capacity | Load-tested at 500 req/s |
-| Latency: P50 < 500 ms, P95 < 1.5 s single-source | §8, §9 | Measured in prototype |
-| Availability: 99.9% monthly + error budget policy | §9 | Design only |
-| Autoscaling; cost guardrails | §8.4, §12.4 | No |
-| Rate-limit governance per connector/tenant/user; cross-tenant fairness | ADR-006 | Partial — no per-tenant dimension |
-| Freshness controls honoring rate limits | ADR-005 | Yes — probes charge the bucket |
-| Infra automation: Terraform, Helm, canary/blue-green + auto-rollback | §12 | No |
-| Security & isolation: storage/compute/network, per-tenant keys, crypto-shred | ADR-010, §10 | No |
-| Compliance: audit logs, access trails, residency tags | ADR-010, §10 | No |
+| Scale: 10M users, peak ~1k QPS, ~100 MB/s | [§6](#6-capacity-and-performance) | **Load-tested at 500 req/s**, 0 failures |
+| Latency SLOs: P50 < 500 ms, P95 < 1.5 s single-source | [§6](#6-capacity-and-performance), [§7](#7-slos-and-error-budget) | **Measured** in prototype |
+| Availability 99.9% monthly + error budget policy | [§7](#7-slos-and-error-budget) | Design only |
+| Autoscaling without manual intervention; cost guardrails | [§6.5](#65-autoscaling-backpressure-overload), [§10.4](#10-deployment-and-operations) | **No** |
+| Rate-limit governance per connector/tenant/user; fairness across tenants | [ADR-006](#adr-006--rate-limiting-and-multi-tenant-fairness) | **Partial** — **no per-tenant dimension**, the real fairness gap |
+| Freshness controls honoring rate limits; configurable per source/class | [ADR-005](#adr-005--freshness-watermark-capability-ladder) | **Yes** — probes charge the same bucket as fetches |
+| Infra automation: Terraform, Helm/k8s, canary/blue-green + automated rollback | [§10](#10-deployment-and-operations) | **No** |
+| Security & isolation: storage/compute/network; per-tenant keys; crypto-shred | [ADR-010](#adr-010--keys-crypto-shredding-and-the-audit-conflict), [§9](#9-security-isolation-compliance) | **No** |
+| Compliance: audit logs, access trails, data residency tags | [ADR-010](#adr-010--keys-crypto-shredding-and-the-audit-conflict), [§9](#9-security-isolation-compliance) | **No** — no access log exists |
+| Threat model (STRIDE) + mitigations; pen-test readiness | [§9](#9-security-isolation-compliance) | Design only |
+| Sizing math for 1k QPS: concurrency, latency percentiles, cache hit ratios | [§6](#6-capacity-and-performance) | **Measured** — hit ratio, see README |
+| Backpressure; overload protection | [§6.5](#65-autoscaling-backpressure-overload) | **No** |
+| DR/BCP: multi-AZ, RPO/RTO targets | [§10.2](#10-deployment-and-operations) | **No** |
+| Runbooks: rate-limit floods, connector auth failures, cache stampedes | [§10.3](#10-deployment-and-operations) | Design only |
+| Observability: OTel traces, Prometheus metrics, structured logs | [§11](#11-observability) | **Yes** — real histogram + real trace |
+| Six-month plan: team, milestones, acceptance criteria, risks, budget | [§12](#12-six-month-execution-plan) | n/a — plan |
+| Bonus: cost levers, chaos plan, predicate-pushdown creativity | [§10.4](#10-deployment-and-operations), [§12.3](#123-milestones) M6, [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Semi-join built** (29.7× reduction) |
+
+**The pattern worth naming.** Every ADR that is unbuilt ([001](#adr-001--planner-runtime-proposed),
+[004](#adr-004--connector-strategy-build-vs-buy),
+[008](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api),
+[010](#adr-010--keys-crypto-shredding-and-the-audit-conflict)) maps to a requirement about
+*infrastructure* — a planner runtime, a vendor contract, Terraform, a KMS call. Every built one
+maps to a requirement about *behaviour under adversarial conditions*. **We built what a reviewer
+cannot take on faith.**
 
 ---
 
@@ -48,8 +75,8 @@ backwards from concurrency rather than asserted.
 
 | # | Assumption | Why it matters | If false |
 |---|---|---|---|
-| **A1** | Connectors expose per-user delegated OAuth, not just service accounts | Source ACLs are the primary entitlement substrate (ADR-002) | Fall back to service-account + mirrored permission graph — materially worse |
-| **A2** | Average result payload ~100 KB (100 MB/s ÷ 1k QPS) | Drives egress, buffer, materialization sizing | Re-derive §8 entirely |
+| **A1** | Connectors expose per-user delegated OAuth, not just service accounts | Source ACLs are the primary entitlement substrate ([ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)) | Fall back to service-account + mirrored permission graph — materially worse |
+| **A2** | Average result payload ~100 KB (100 MB/s ÷ 1k QPS) | Drives egress, buffer, materialization sizing | Re-derive [§6](#6-capacity-and-performance) entirely |
 | **A3** | ~70% of queries are single-source with full pushdown | The P95 < 1.5 s SLO is scoped to these | SLO renegotiated per query class |
 | **A4** | Connector p95 200–800 ms; long tail exceeds 2 s | Drives timeout, partial-result, async design | Timeout budget shifts |
 | **A5** | Tenants tolerate seconds-to-minutes staleness | Makes caching viable at all | Hit ratio → 0; quota pressure rises sharply |
@@ -73,7 +100,7 @@ WHERE <conjunctive predicates>
 - Conjunctive `WHERE` only.
 - Cross-source disjunctions rejected at plan time with `UNSUPPORTED_PREDICATE` — **a full scan of
   a SaaS API is a quota incident, not a slow query.**
-- `LIMIT`/`OFFSET` parse but are not executed — see §14, item 5.
+- `LIMIT`/`OFFSET` parse but are not executed — see [§13](#13-decisions-we-are-least-confident-about), item 5.
 
 ---
 
@@ -178,41 +205,7 @@ query, not a standing fleet, so neither adds an always-on row above.
 
 ---
 
-## 5. MVP status
-
-| Lane | Contents |
-|---|---|
-| **🟢 Built & verified**<br>real code, real tests, real HTTP | Go planner + capability classification · RLS/CLS injection + plan-time invariant + runtime verification filter (002) · parameterized role-isolated plan cache (003) · semi-join rewrite, 505→17 calls (007) · tenant from verified `iss` (011) · Prometheus histogram + OTel trace · result cache keyed by principal |
-| **🟡 Partial**<br>real mechanism, narrowed scope | Freshness rungs 1 & 4 only (005) · rate limits: single-node bucket, 429, async reroute — no Redis lease, no fair queue, **no per-tenant dimension** (006) · NDJSON + `SOURCE_TIMEOUT` terminal frame, thin coverage (009) · policy injection real, OPA mocked · identity derivation real, signature mocked |
-| **⚪ Mocked / not built**<br>infrastructure a reviewer can assume | Salesforce + Zendesk connectors are mocks (004) · Calcite sidecar deferred to M1 spike (001) · materialization is in-memory Go hash join, not DuckDB (007) · tenant lifecycle API (008) · per-tenant KMS + crypto-shred (010) · audit trail (010) — no access log exists |
-| **🔵 Open question**<br>not decided, not just unbuilt | `LIMIT`/`OFFSET` — same implementation layer as projection, less MVP value, which is likely why the gap wasn't caught (007) · `RESULT_TOO_LARGE` — guardrail specified in 007, never implemented; **the sharper risk: a skewed join can exhaust memory today** |
-
-**The pattern.** Every unbuilt ADR (001, 004, 008, 010) maps to a requirement about
-*infrastructure* — a planner runtime, a vendor contract, Terraform, a KMS call. Every built one
-maps to a requirement about *behaviour under adversarial conditions*. **We built what a reviewer
-cannot take on faith.**
-
----
-
-## 6. Decision register
-
-| ADR | Requirement (trimmed) | Rejected | Built |
-|---|---|---|---|
-| **001** Planner | *"capability discovery, pushdown, join plan, cost/freshness hints, spill to materialization"* | • Trino<br>• DataFusion<br>• Steampipe/FDW<br>• Go-native parser<br>• GraalVM Calcite<br>• Spark | **n/a** — in-process Go planner is itself spike evidence |
-| **002** Entitlements | *"least-privilege; RLS/CLS from source permissions and tenant policy"* | • Post-filter in Go<br>• Inject into compiled Substrait<br>• OPA as blob store<br>• Zanzibar/OpenFGA<br>• Cedar | **Mostly** — injection, invariant, verification real; OPA + delegated OAuth mocked |
-| **003** Caching | *(none — nearest is "cache hit ratios")* | • Plan: no cache / key on SQL text / key on `(sql, user)`<br>• Result: per-pod only, no shared tier | **Partial** — plan cache real; result cache's shared tier designed |
-| **004** Build vs buy | *"capability model, auth/token refresh, pagination, concurrency contracts, error codes"* | • Build all<br>• Buy all (Merge/Nango/Airbyte) | **No** — both connectors mocked |
-| **005** Freshness | *"avoid materially stale data; per-query staleness hints"* | • Centralized CDC / data lake<br>• `SELECT MAX(updated_at)` probes | **Partial** — rungs 1 & 4 + `max_staleness` |
-| **006** Rate limits | *"token buckets/concurrency pools per connector/tenant/user; head-of-line avoidance"* | • In-memory per-pod buckets<br>• Redis on every decision<br>• Envoy ratelimit | **Partial** — single-node bucket, 429, async reroute |
-| **007** Joins | *"federated on the fly vs. short-lived materialization"; "spill when necessary"* | • Container-per-join DuckDB<br>• Naive dual full fetch<br>• Always-on shared ClickHouse<br>• Spark-only from day one | **Partial** — semi-join yes; DuckDB/ClickHouse/Spark tiers designed |
-| **008** Tenant lifecycle | *"multi- and single-tenant without code changes"; "off-boarding triggers crypto-shred"* | `terraform apply` per tenant | **No** |
-| **009** Streaming | *"timeouts and partial results for slow sources"* | • Chunked transfer + status code<br>• HTTP trailers | **At risk** |
-| **010** Crypto-shred | *"per-tenant keys; automated off-boarding and crypto-shredding"; "audit logs"* | • "Instantly destroy the KMS key"<br>• Shred audit under tenant key | **No** |
-| **011** Identity | *"AuthN via OIDC, AuthZ via policy"; "user token → scopes/roles → RLS/CLS"* | • Trust token claims<br>• Direct federation<br>• mTLS / client certs | **Partial** — issuer→tenant real, signature mocked |
-
----
-
-## 7. The eleven decisions
+## 5. The eleven decisions
 
 ### ADR-001 — Planner runtime *(Proposed)*
 
@@ -408,9 +401,9 @@ issuer** — key rotation, JWKS publication, and our own signing key's blast rad
 
 ---
 
-## 8. Capacity and performance
+## 6. Capacity and performance
 
-### 8.1 Baseline
+### 6.1 Baseline
 
 100 MB/s ÷ 1,000 QPS = **~100 KB average payload** (A2).
 
@@ -423,7 +416,7 @@ issuer** — key rotation, JWKS publication, and our own signing key's blast rad
 Weighted mean **W ≈ 245 ms** → by **Little's Law** (`L = λ × W`):
 **L = 1,000 × 0.245 ≈ 245 concurrent in-flight queries.**
 
-### 8.2 Derived sizing
+### 6.2 Derived sizing
 
 > **Scope: gateway pod fleet only — tiers 0–1.** Tiers 2–3 are provisioned per escalated job,
 > outside this fleet; nothing here bounds their footprint.
@@ -448,7 +441,7 @@ are **additive: ~25–31 GB combined.**
 | Applies to | Only the 15% join share | All traffic |
 | Purpose | Compute a result | Avoid re-doing work |
 
-### 8.3 Gateway pod size — worked backwards, not asserted
+### 6.3 Gateway pod size — worked backwards, not asserted
 
 1. **K = 8 max concurrent joins/pod** — a design choice: too small needs more pods for join
    capacity; too large lets a join burst starve everything else. → **2 GB** reserved.
@@ -465,9 +458,9 @@ are **additive: ~25–31 GB combined.**
 planning assumptions worth re-verifying with real data; step 8's headroom target is the only
 genuinely arbitrary choice, and is labelled as one.
 
-### 8.4 The sensitivity that actually matters
+### 6.4 The sensitivity that actually matters
 
-The 30% hit ratio is the **weakest** number here — ADR-002's per-principal keying means it
+The 30% hit ratio is the **weakest** number here — [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)'s per-principal keying means it
 degrades as users-per-tenant grows.
 
 | Hit ratio | Mean W | Concurrency L | Connector calls/s |
@@ -485,7 +478,7 @@ the 95th-percentile request is by definition a miss, so planner latency lands in
 undiminished. Keeping the planner out of P95 needs ≥95% hit, realistically ~98%. **Hit-ratio
 targets set against mean latency will silently fail a percentile SLO.**
 
-### 8.5 Autoscaling, backpressure, overload
+### 6.5 Autoscaling, backpressure, overload
 
 - **HPA on concurrency** (in-flight per pod), **not CPU** — the workload is I/O-bound and CPU is a
   lagging signal.
@@ -496,13 +489,13 @@ targets set against mean latency will silently fail a percentile SLO.**
 
 ---
 
-## 9. SLOs and error budget
+## 7. SLOs and error budget
 
 | SLI | Target | Scope |
 |---|---|---|
 | Gateway availability | **99.9% monthly** (~43 min) | Excludes upstream source faults |
 | Latency, single-source pushdown | **P50 < 500 ms, P95 < 1.5 s** | As specified |
-| Latency, cross-app join | **P95 < 4 s** | Separate SLI (ADR-007) |
+| Latency, cross-app join | **P95 < 4 s** | Separate SLI ([ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder)) |
 | Freshness accuracy | 99% within declared `max_staleness` | Per connector rung |
 
 **The SLO boundary.** We depend on OPA, Redis, Postgres, a JVM sidecar, and third-party APIs
@@ -518,7 +511,7 @@ requests and audited monthly so they can't become a loophole.
 
 ---
 
-## 10. Error vocabulary
+## 8. Error vocabulary
 
 | Code | HTTP | Meaning | Message must contain |
 |---|---|---|---|
@@ -538,7 +531,7 @@ Every response — success or failure — returns `freshness_ms`, `rate_limit_st
 
 ---
 
-## 11. Security, isolation, compliance
+## 9. Security, isolation, compliance
 
 **STRIDE:**
 
@@ -562,15 +555,15 @@ Every response — success or failure — returns `freshness_ms`, `rate_limit_st
 
 ---
 
-## 12. Deployment and operations
+## 10. Deployment and operations
 
-**12.1 IaC / CD.** Terraform modules (`/global-control-plane`, `/shared-data-plane`,
+**10.1 IaC / CD.** Terraform modules (`/global-control-plane`, `/shared-data-plane`,
 `/tenant-resources`); Helm charts identical across modes. **Argo Rollouts** canary 5 → 25 → 50 →
 100%, each step gated on a Prometheus analysis template. Auto-rollback on P95 > 1.5 s, error rate
 > 1%, **or `ENTITLEMENT_DENIED` rate deviating from baseline** — that last one is a *correctness*
 canary, not a performance one, and it's the one worth having.
 
-**12.2 DR / BCP:**
+**10.2 DR / BCP:**
 
 | Component | Strategy | RPO | RTO |
 |---|---|---|---|
@@ -583,7 +576,7 @@ canary, not a performance one, and it's the one worth having.
 Region strategy is **active/passive** for v1 — active/active is deferred because per-tenant
 residency tags make global routing a *compliance* problem, not just a traffic problem.
 
-**12.3 Runbooks.**
+**10.3 Runbooks.**
 
 | Incident | Detect | Act |
 |---|---|---|
@@ -592,15 +585,15 @@ residency tags make global routing a *compliance* problem, not just a traffic pr
 | **Cache stampede** | Connector calls/s spikes with flat QPS | Singleflight should prevent it; if it fires the cause is usually synchronized TTL expiry → jitter, then find why keys aligned |
 | **Off-boarding verification** | Scheduled attestation | DEKs destroyed · KEK disabled · grants revoked · jobs cancelled · caches invalidated · audit tokens unmapped |
 
-**12.4 Cost guardrails.** Attributed per tenant per query (connector calls, egress bytes,
+**10.4 Cost guardrails.** Attributed per tenant per query (connector calls, egress bytes,
 materialization GB-seconds, planner CPU-ms); monthly budget alerting at 50/80/100%; at 100% the
 tenant is **throttled to a reduced lease, not cut off**. **Levers by impact:** (1) raise cache hit
-ratio — but it fights ADR-002, the real tension; (2) semi-join rewrites; (3) freshness rung
+ratio — but it fights [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement), the real tension; (2) semi-join rewrites; (3) freshness rung
 upgrades turning fetches into 304s; (4) async reroute moving peak into troughs.
 
 ---
 
-## 13. Observability
+## 11. Observability
 
 **Traces (OTel)** — one span per stage, so a single trace answers "where did the time go":
 
@@ -633,14 +626,14 @@ predicates contain customer data.
 
 ---
 
-## 14. Six-month execution plan
+## 12. Six-month execution plan
 
-### 14.1 First two weeks — validate, unblock, decide. No architecture.
+### 12.1 First two weeks — validate, unblock, decide. No architecture.
 
 | Day | Action | Why it's first |
 |---|---|---|
-| 1–2 | Confirm **delegated per-user OAuth** end-to-end against Salesforce + Zendesk sandboxes | A1 underpins ADR-002. If it fails, the entitlement model changes shape and M1 scope is wrong |
-| 3–4 | Sample **query-shape repetition** from existing telemetry | This is the §8.4 number. Every capacity and cost figure moves with it |
+| 1–2 | Confirm **delegated per-user OAuth** end-to-end against Salesforce + Zendesk sandboxes | A1 underpins [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement). If it fails, the entitlement model changes shape and M1 scope is wrong |
+| 3–4 | Sample **query-shape repetition** from existing telemetry | This is the [§6.4](#64-the-sensitivity-that-actually-matters) number. Every capacity and cost figure moves with it |
 | 5 | Confirm team reality — hired vs. open req | M1 scope is fiction until this is known |
 | 6–7 | **Book the external security review for M6 now** | 6–8 week lead time. Booked in M3 is already late |
 | 8–10 | Open vendor conversations: rate-limit ceilings, unified-API pricing | Quota is an external ceiling. Lead time is commercial, not technical |
@@ -651,7 +644,7 @@ comment, then the owning engineer decides — EM decides only ties or cross-team
 reopen:** 001, 004, 005. **Would defend hard:** 002, 011 — security invariants, where
 relitigating mid-build costs more than any design gain.
 
-### 14.2 Team shape
+### 12.2 Team shape
 
 | Role | FTE | Primary ownership |
 |---|---|---|
@@ -666,7 +659,7 @@ relitigating mid-build costs more than any design gain.
 **Split by seam, not feature** — so the `ENFORCED`/`ADVISORY` contract has an owner on *both*
 sides from day one. It's the interface most likely to rot.
 
-### 14.3 Milestones
+### 12.3 Milestones
 
 | M | Focus | Exit criteria (measurable) |
 |---|---|---|
@@ -681,11 +674,11 @@ sides from day one. It's the interface most likely to rot.
 plans — building policy first means building it twice. Tenant lifecycle and crypto-shred land in
 M2, not M5, because M5's own exit criteria already assume off-boarding attestation exists. The
 riskiest measurement (hit ratio) is pulled to M2 because it can invalidate the capacity model.
-**ADR-007's tiers 2–3 appear in no milestone on purpose** — designed, not scheduled; building
+**[ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder)'s tiers 2–3 appear in no milestone on purpose** — designed, not scheduled; building
 either before M4 measures tier-1's real `RESULT_TOO_LARGE` rate would be guessing at an unmeasured
 problem.
 
-### 14.4 Risk register
+### 12.4 Risk register
 
 | Risk | L | I | Mitigation | Owner | Trigger |
 |---|---|---|---|---|---|
@@ -697,9 +690,9 @@ problem.
 | Delegated OAuth unavailable on key connectors (A1) | Med | High | Service-account fallback + mirrored policy; promotes the Zanzibar option | Security | ≥ 2 of 10 built connectors lack it |
 | Customer IdP variability blocks onboarding | High | Med | Attribute resolution independent of claim contents | Security | Any tenant needing an unmappable attribute |
 | Single-tenant operational load | Med | Med | Conformance test that both provisioning paths produce identical tenants | Infra | > 5 single-tenant customers |
-| Tier-1 `RESULT_TOO_LARGE` rate forces ADR-007 tier 2 before GA | Med | Med | Not built by default; pull into M5/M6 if triggered — on-demand, so no standing cost until then | BE(1) | Fires on > 5% of cross-app joins in M4 |
+| Tier-1 `RESULT_TOO_LARGE` rate forces [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) tier 2 before GA | Med | Med | Not built by default; pull into M5/M6 if triggered — on-demand, so no standing cost until then | BE(1) | Fires on > 5% of cross-app joins in M4 |
 
-### 14.5 Budget
+### 12.5 Budget
 
 ~24 gateway pods (4 vCPU/8 GB), 6 planner pods, 3-node Redis, multi-AZ Postgres with cross-region
 replica, 2 Gbps egress, plus unified-API vendor per-call fees. ~$4–5k/month compute, ~$1k
@@ -708,17 +701,39 @@ $13–23k, but at a realistic 20% duty cycle ≈ $3–5k. Call it **~$12–20k/m
 fee**. Excludes tiers 2–3 (on-demand, no standing line until the risk above triggers).
 
 **The number that matters isn't the total** — egress *and* vendor calls both scale with cache miss
-rate, so §8.4 sets the budget as well as the architecture. A hit-ratio miss is a cost overrun and
+rate, so [§6.4](#64-the-sensitivity-that-actually-matters) sets the budget as well as the architecture. A hit-ratio miss is a cost overrun and
 a capacity problem simultaneously.
 
 ---
 
-## 15. Decisions we are least confident about
+## 13. Decisions we are least confident about
 
 | # | Decision | Would flip if |
 |---|---|---|
-| 1 | **Planner runtime** (001+003) — formally deferred; DataFusion rejected on team capability, not merit. The plan cache exists to make a sidecar viable, so a low hit ratio wouldn't mean "tune the cache," it would mean ADR-001 was wrong | Hit ratio < 95% sustained, or sidecar > 15% of P95 |
-| 2 | **Per-principal caching vs. hit ratio** (002 ↔ §8.4) — delegated tokens give correct, always-current entitlements essentially free, but destroy cache locality. **The single most consequential unknown in the design** | `result_cache_hit_ratio` < 15% in M2 |
+| 1 | **Planner runtime** (001+003) — formally deferred; DataFusion rejected on team capability, not merit. The plan cache exists to make a sidecar viable, so a low hit ratio wouldn't mean "tune the cache," it would mean [ADR-001](#adr-001--planner-runtime-proposed) was wrong | Hit ratio < 95% sustained, or sidecar > 15% of P95 |
+| 2 | **Per-principal caching vs. hit ratio** (002 ↔ [§6.4](#64-the-sensitivity-that-actually-matters)) — delegated tokens give correct, always-current entitlements essentially free, but destroy cache locality. **The single most consequential unknown in the design** | `result_cache_hit_ratio` < 15% in M2 |
 | 3 | **Build-vs-buy split** (004) — the 10–20/long-tail line is a judgment call with no data yet | > 25% of tenant queries hit long-tail connectors and suffer measurably, or vendor pricing exceeds build cost at our volume |
 | 4 | **Token exchange vs. direct federation** (011) — exchange gives one claim contract everywhere at the cost of an extra hop and operating our own issuer. Chosen for the 1000s-of-app-types case; at 10 customers it would be over-built | Exchange > 10% of P50, or a compliance regime forbids re-issuing identity |
 | 5 | **`LIMIT`/`OFFSET`** (007) — genuinely undecided, not just unbuilt. Same implementation layer as projection but less MVP value, which is likely why it wasn't caught. Pushdown is a clean win single-source; pushing into a cross-app join is unsound, so `LIMIT` gives the join path **zero** cost relief however it's built. **The bigger gap isn't `LIMIT` — it's that `RESULT_TOO_LARGE` was specified and never implemented** | `LIMIT`/`OFFSET` requested, or a skewed join causes an incident |
+
+---
+
+## 14. Rejected alternatives, by decision
+
+What each ADR turned down, and why in one line. Full steelman cases for every option — including
+ones argued at length before being dropped — are in
+[`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md).
+
+| ADR | Rejected | Why not |
+|---|---|---|
+| [**001** Planner](#adr-001--planner-runtime-proposed) | • Trino<br>• DataFusion<br>• Steampipe/FDW<br>• Go-native parser<br>• GraalVM-native Calcite<br>• Spark | Trino on connector model + credential scoping; **DataFusion is the closest runner-up, rejected on team capability, not merit**; Steampipe/FDW has no policy-injection hook; a hand-rolled Go parser re-implements a solved problem; GraalVM-native Calcite is immature for this surface; Spark is a batch scheduler, never a candidate at a 500 ms P50 |
+| [**002** Entitlements](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement) | • Post-filter in Go<br>• Inject into compiled Substrait<br>• OPA as a blob store<br>• Zanzibar / OpenFGA<br>• Cedar | Post-filtering means rows leave the source before being discarded — the leak *plus* wasted quota; Substrait uses positional field refs, so rewriting a compiled plan fails silently under column reordering; OPA-as-blob-store wastes OPA (the planner would re-implement Rego); Zanzibar is better for *mirroring* permission graphs, but A1 means nothing needs mirroring — **revisit hard if A1 breaks**; Cedar is conceptually right (residual-to-SQL is its own motivating example) but both partial evaluators sit behind experimental flags |
+| [**003** Caching](#adr-003--caching-plan-cache--result-cache) | • Plan cache: none<br>• Plan cache: key on SQL text alone<br>• Plan cache: key on `(sql, user)`<br>• Result cache: per-pod only, no shared tier<br>• Result cache: sticky routing instead of a shared store | No cache re-plans every request *and* loses the correctness property; keying on SQL text alone lets a plan built under one policy version serve another — **the privilege-escalation vector**; keying on `(sql, user)` fixes that but destroys hit ratio; per-pod-only means N pods do N duplicate fetches of the same rows; sticky routing needs intelligent query routing no ADR designs, and rebalances badly on scale events |
+| [**004** Build vs buy](#adr-004--connector-strategy-build-vs-buy) | • Build all<br>• Buy all (Merge / Nango / Airbyte) | 1,000 connectors against unversioned vendor APIs is not a six-month program — schema drift alone would consume the team; buying all normalizes away per-field pushdown and per-user delegated auth, the two things the SLO and [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement) depend on |
+| [**005** Freshness](#adr-005--freshness-watermark-capability-ladder) | • Centralized CDC / data lake<br>• `SELECT MAX(updated_at)` probes | A cross-tenant lake violates on-demand federated execution and complicates crypto-shredding — *per-tenant* bounded snapshots survive as the quota-hostile-connector escape hatch; `MAX(updated_at)` assumes SaaS REST APIs accept SQL (they don't) and is **blind to hard deletes**, so a deleted record stays cached indefinitely |
+| [**006** Rate limits](#adr-006--rate-limiting-and-multi-tenant-fairness) | • In-memory per-pod buckets<br>• Redis on every decision<br>• Envoy ratelimit service | Per-pod buckets make the effective limit N × configured under autoscaling — the failure mode is the connector **banning our API key**, a cross-tenant outage; Redis on every decision adds an RTT to every request and creates shared fate; Envoy is solid but doesn't model per-connector budgets shared across sync *and* async paths |
+| [**007** Joins](#adr-007--join-strategy-a-four-tier-escalation-ladder) | • Naive dual full fetch<br>• Container-per-join DuckDB<br>• Always-on shared ClickHouse<br>• Spark-only from day one<br>• Disk spill in tiers 0–1<br>• Native same-source join pushdown (SOQL subqueries) | Dual full fetch is 505 calls vs. 17 on our fixture, and only competitive at poor selectivity where the semi-join loses too; container-per-join cold start alone can eat the 1.5 s budget; an always-on shared ClickHouse recreates the noisy-neighbour problem and idles between jobs; Spark-only pays distributed-shuffle overhead for jobs that are mostly "pod-ceiling-plus-a-bit"; disk spill inside the SLO trades a fast failure for a slow one; SOQL subqueries are real unexploited capability, rejected because the SDK contract would carry a second per-connector notion of "which join shapes push down" for 1,000s of apps that mostly have no equivalent |
+| [**008** Tenant lifecycle](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api) | • `terraform apply` per tenant onboard/offboard | Doesn't scale to hundreds of customers; makes off-boarding latency a function of a plan/apply cycle; **crypto-shredding cannot be gated on Terraform state** |
+| [**009** Streaming](#adr-009--streaming-timeouts-partial-results) | • Chunked transfer + status code<br>• HTTP trailers | Once bytes are on the wire the status is committed, so a mid-stream `SOURCE_TIMEOUT` can't surface as an error status; trailers solve it on paper but are inconsistently supported by intermediaries |
+| [**010** Crypto-shred](#adr-010--keys-crypto-shredding-and-the-audit-conflict) | • "Instantly destroy the KMS key"<br>• Shred the audit trail under the tenant key | KMS enforces a 7–30 day destruction window — instant destruction isn't an API that exists; shredding audit under the tenant key destroys the very record proving we handled that tenant's data correctly, which is the obligation that must *survive* off-boarding |
+| [**011** Identity](#adr-011--identity-tenant-derivation-attribute-resolution) | • Trust `tenant_id` / `roles` from token claims<br>• Direct federation<br>• mTLS / client certificates | Trusting claims makes `tenant_id` forgeable by any IdP admin — **a cross-tenant read**; direct federation is viable and simpler (**kept as the fallback** for tenants who require it) but pushes per-IdP claim quirks into OPA, the planner, and audit forever; mTLS has wrong ergonomics for end users and carries no attributes |

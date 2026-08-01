@@ -73,53 +73,12 @@ fetch, with two metrics carrying opposite expectations:
 Eleven ADRs, grouped by *how real* the prototype's version of each is — not by ADR number, since
 "partial" hides very different kinds of partial.
 
-```mermaid
-flowchart TB
-    subgraph built["BUILT AND VERIFIED — real code, real tests, real HTTP round trips"]
-        direction LR
-        PLAN["Go planner + capability<br/>classification<br/><i>spike evidence for ADR-001</i>"]
-        RLS["RLS/CLS injection, plan-time<br/>invariant, runtime verification<br/>filter (ADR-002)"]
-        CACHE["Parameterized plan cache,<br/>role-isolated (ADR-003)"]
-        JOIN["Semi-join rewrite —<br/>505→17 calls, 29.7x (ADR-007)"]
-        TENANT["Tenant from verified <code>iss</code>,<br/>never from claim (ADR-011)"]
-        OBS["Real Prometheus histogram +<br/>real OTel trace, connector<br/>spans nested under query span"]
-        RCACHE["Result cache keyed by principal,<br/>not just table+columns+filters<br/><i>ADR-002 addendum</i>"]
-    end
-
-    subgraph partial["PARTIAL — real mechanism, deliberately narrowed scope"]
-        direction LR
-        FRESH["Freshness: rungs 1 &amp; 4 +<br/><code>max_staleness</code> (ADR-005)<br/><i>rungs 2–3 not built</i>"]
-        RATE["Rate limits: single-node bucket,<br/>429, async reroute (ADR-006)<br/><i>no Redis lease, no fair queue,<br/>no per-tenant dimension</i>"]
-        STREAM["NDJSON + <code>SOURCE_TIMEOUT</code><br/>terminal frame (ADR-009)<br/><i>thin coverage, at risk</i>"]
-        POLICY["Policy: <code>PolicyProvider</code> stub<br/>returns residuals from JSON<br/><i>injection real, OPA mocked</i>"]
-        JWT["Identity: issuer→tenant<br/>derivation is real<br/><i>signature verification mocked</i>"]
-    end
-
-    subgraph mocked["MOCKED OR NOT BUILT — infrastructure a reviewer can assume"]
-        direction LR
-        CONN["Salesforce + Zendesk<br/>connectors (ADR-004)<br/><i>mocksf / mockzd, not real APIs</i>"]
-        SIDECAR["Calcite sidecar,<br/>Substrait IR (ADR-001)<br/><i>deferred to M1 spike</i>"]
-        DUCK["Ephemeral DuckDB<br/>materialization (ADR-007)<br/><i>in-memory Go hash join instead</i>"]
-        LIFE["Tenant lifecycle API<br/>(ADR-008) — not implemented"]
-        KMS["Per-tenant KMS,<br/>crypto-shred (ADR-010)<br/>— not implemented"]
-        AUDIT["Audit trail<br/>(ADR-010) — not implemented<br/><i>no access log exists;<br/>nothing to review post-incident</i>"]
-    end
-
-    subgraph open["OPEN QUESTION — not decided, not just unbuilt"]
-        direction LR
-        LIMITOFFSET["LIMIT / OFFSET<br/>same layer as projection,<br/>less MVP value — gap, not a cut<br/><i>ADR-007: pushdown vs. truncation-only</i>"]
-        RTL["RESULT_TOO_LARGE<br/>guardrail specified in ADR-007,<br/>never implemented<br/><i>the sharper risk — a skewed join<br/>can exhaust memory today</i>"]
-    end
-
-    classDef builtStyle fill:#dcfce7,stroke:#16a34a,color:#14532d
-    classDef partialStyle fill:#fef9c3,stroke:#ca8a04,color:#713f12
-    classDef mockedStyle fill:#f3f4f6,stroke:#6b7280,color:#1f2937
-    classDef openStyle fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
-    class PLAN,RLS,CACHE,JOIN,TENANT,OBS,RCACHE builtStyle
-    class FRESH,RATE,STREAM,POLICY,JWT partialStyle
-    class CONN,SIDECAR,DUCK,LIFE,KMS,AUDIT mockedStyle
-    class LIMITOFFSET,RTL openStyle
-```
+| Lane | Contents |
+|---|---|
+| **🟢 Built & verified**<br>real code, real tests, real HTTP round trips | Go planner + capability classification · RLS/CLS injection + plan-time invariant + runtime verification filter (002) · parameterized role-isolated plan cache (003) · semi-join rewrite, 505→17 calls (007) · tenant from verified `iss`, never a claim (011) · real Prometheus histogram + real OTel trace · result cache keyed by principal |
+| **🟡 Partial**<br>real mechanism, deliberately narrowed scope | Freshness rungs 1 & 4 + `max_staleness` only (005) · rate limits: single-node bucket, `429`, async reroute — no Redis lease, no fair queue, **no per-tenant dimension** (006) · NDJSON + `SOURCE_TIMEOUT` terminal frame, thin coverage (009) · policy injection real, OPA mocked (002) · identity derivation real, signature verification mocked (011) |
+| **⚪ Mocked / not built**<br>infrastructure a reviewer can assume | Salesforce + Zendesk connectors are mocks (004) · Calcite sidecar + Substrait IR deferred to M1 spike (001) · materialization is an in-memory Go hash join, not DuckDB (007) · tenant lifecycle API (008) · per-tenant KMS + crypto-shred (010) · **audit trail (010) — no access log exists; nothing to review post-incident** |
+| **🔵 Open question**<br>not decided, not just unbuilt | `LIMIT`/`OFFSET` — same implementation layer as projection but less MVP value, which is likely why the gap wasn't caught; still undecided past the grammar (007) · `RESULT_TOO_LARGE` — guardrail specified in 007, never implemented. **The sharper risk: a skewed join can exhaust memory today** |
 
 **The pattern.** Every unbuilt ADR maps to a requirement about *infrastructure* — a JVM sidecar,
 a vendor contract, Terraform, a KMS call. Every built one maps to a requirement about *behaviour
@@ -176,9 +135,11 @@ not, until this table required varying one. Fixed in
 | Artifact | What it proves |
 |---|---|
 | `jaeger_1.png` | Cross-app join trace — fanout to both connectors runs genuinely **in parallel**, and our own overhead is a small fraction of wall clock. This is the whole basis for excluding upstream source faults from the availability SLI |
-| `prom_1.png`, `prom_2.png` | Request-duration histogram and rate-limit budget remaining, by connector and tenant |
+| `prom_1.png`, `prom_2.png` | Request-duration histogram and rate-limit budget remaining, by connector and tenant — the load-test run behind the hit-ratio table above |
 
 ![Jaeger trace of a cross-app join](./jaeger_1.png)
+
+![Prometheus request-duration and rate-limit budget panels](./prom_2.png)
 
 ---
 
@@ -212,6 +173,31 @@ Every message names **what to do**, not just what broke.
 | `SCHEMA_DRIFT` | 409 | Source schema changed under a pinned connector version |
 | `PRINCIPAL_UNRESOLVED` | 503 | Attribute resolution failed and cache expired — fail closed |
 | `RESIDENCY_VIOLATION` | 403 | Plan would cross a residency boundary |
+
+---
+
+## Afterthought: the conformance gate is provenance-blind
+
+ADR-004 rejects **building** everything ("1,000 connectors against unversioned vendor APIs is not
+a six-month program") and rejects **buying** everything (unified-API vendors normalize away
+per-field pushdown and per-user delegated auth). An LLM drafting connectors against our own
+Connector SDK interface is a third option that could close that gap — 1,000+ app types each
+speaking its own dialect (SOQL, GraphQL, REST, Elasticsearch DSL…) is exactly the
+translation-and-volume problem generation suits.
+
+**It isn't disqualified on trust grounds.** `TestLyingConnectorFailsClosed` proves the conformance
+gate never asks *who* wrote a connector, only whether it behaves — a generated one fails that
+check identically to a human-written one. Three places to try it, in the order I'd attempt them:
+
+| # | Where | Why there first |
+|---|---|---|
+| 1 | **Capability discovery** — draft the `ENFORCED`/`ADVISORY` map from whatever docs exist (OpenAPI in the tidy case; prose and workflow descriptions in the common one) | Declarative output, not code, validated by the gate that already exists. `testdata/catalog/sf.accounts.json` is a handful of hand-written lines for *one* table — the authoring cost at n=1,000 is visible from n=2 |
+| 2 | **Schema-drift triage** — diff spec versions, classify breaking vs. additive, draft the patch | Attacks the cost ADR-004 itself calls decisive: *"schema drift alone would consume the team"* |
+| 3 | **Request translation** — plan → SOQL/GraphQL/REST/ES DSL | Placed *after* policy injection, so the model only ever **executes** a security decision already made — never makes one |
+
+How connectors get deployed and versioned — independent of who or what authors one — is a
+separate question from this suggestion, not a consequence of it: see ADR-004 in
+[`DESIGN_FINAL.md`](./DESIGN_FINAL.md).
 
 ---
 

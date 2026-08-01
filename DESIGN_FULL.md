@@ -1,6 +1,5 @@
 # Universal SQL Across Enterprise Apps - High-Level Design
 
-**Status:** Proposed | **Version:** 1.0 | **Author:** _(you)_ | **Date:** _(fill)_
 **Scenario implemented in prototype:** Salesforce (accounts) JOIN Zendesk (tickets)
 
 > This document is the design deliverable. It states the architecture, then records the

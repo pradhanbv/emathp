@@ -70,8 +70,10 @@ fetch, with two metrics carrying opposite expectations:
 
 ## MVP status at a glance
 
-Eleven ADRs, grouped by *how real* the prototype's version of each is — not by ADR number, since
-"partial" hides very different kinds of partial.
+Eleven ADRs, grouped by *how real* the prototype's version of each is rather than by ADR number —
+because several ADRs land in more than one lane at once. ADR-007 alone is fully built (semi-join),
+entirely absent (DuckDB), and undecided (`RESULT_TOO_LARGE`) in three different places, which a
+single per-ADR verdict would flatten into one misleading word.
 
 | Lane | Contents |
 |---|---|
@@ -176,18 +178,32 @@ Every message names **what to do**, not just what broke.
 
 ---
 
-## Afterthought: the conformance gate is provenance-blind
+## Afterthought: connector authoring is the real bottleneck
 
-ADR-004 rejects **building** everything ("1,000 connectors against unversioned vendor APIs is not
-a six-month program") and rejects **buying** everything (unified-API vendors normalize away
-per-field pushdown and per-user delegated auth). An LLM drafting connectors against our own
-Connector SDK interface is a third option that could close that gap — 1,000+ app types each
-speaking its own dialect (SOQL, GraphQL, REST, Elasticsearch DSL…) is exactly the
-translation-and-volume problem generation suits.
+Building this surfaced something the brief frames as one requirement among many, but which is
+actually **the constraint the whole product lives or dies on: writing and validating connectors
+at 1,000s-of-app-types scale.** Everything else here — planner, policy compilation, join ladder,
+capacity model — is work that gets done once and then serves every connector. Connector authoring
+is the only cost that scales *linearly with the catalog*, and ADR-004's build-vs-buy split is
+better read as a symptom of that than as a solution to it: **building** everything is "1,000
+connectors against unversioned vendor APIs," and **buying** everything normalizes away the
+per-field pushdown and per-user delegated auth that ADR-002 and the SLO both depend on. Neither
+option removes the bottleneck; they just decide who absorbs it.
 
-**It isn't disqualified on trust grounds.** `TestLyingConnectorFailsClosed` proves the conformance
-gate never asks *who* wrote a connector, only whether it behaves — a generated one fails that
-check identically to a human-written one. Three places to try it, in the order I'd attempt them:
+**So the thing I'd actually try next is LLM-drafted connectors** — 1,000+ app types each speaking
+its own dialect (SOQL, GraphQL, REST, Elasticsearch DSL…) is precisely a translation-and-volume
+problem, which is what generation is good at, aimed squarely at the one cost that scales with the
+catalog.
+
+**The convenient part is a coincidence, not the reason.** `TestLyingConnectorFailsClosed` was
+built for an entirely different purpose — catching a connector that declares a predicate
+`ENFORCED` and then ignores it, most likely our *own* connector with a malformed query parameter.
+It happens to be **provenance-blind**: it never asks who wrote a connector, only whether it
+behaves. So the validation harness that makes generated connectors safe to accept already exists,
+having been built for a reason that had nothing to do with LLMs. That removes the obvious
+objection to this idea; it isn't what prompted it.
+
+Three places to try it, in the order I'd attempt them:
 
 | # | Where | Why there first |
 |---|---|---|

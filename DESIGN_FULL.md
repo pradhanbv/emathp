@@ -1911,6 +1911,8 @@ into scope early.
 
 ### 10.3 Risk register
 
+**L** = likelihood, **I** = impact — both High / Med / Low.
+
 | Risk | L | I | Mitigation | Owner | Trigger |
 |---|---|---|---|---|---|
 | **Result cache hit ratio far below 30%** (ADR-002 tension) | High | High | Measure in M2, not M5. Fallbacks: tenant-scoped snapshots (ADR-005), negotiated quota, semi-join rewrites | EM | `result_cache_hit_ratio` < 15% in M2 |

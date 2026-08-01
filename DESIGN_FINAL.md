@@ -12,6 +12,58 @@ four-rung freshness ladder that never spends quota silently, a four-tier join-ex
 (in-process → DuckDB → on-demand ClickHouse → Spark serverless), and capacity math derived
 backwards from concurrency rather than asserted.
 
+**How to read this.** Two kinds of content, labelled differently on purpose. **Sections (§1–§14)**
+describe and derive — architecture, capacity math, SLOs, the plan; check them. **ADRs (001–011)**
+record contested forks where several options were viable — each carries its rejected alternatives
+([§14](#14-rejected-alternatives-by-decision)) and the trigger that should reverse it; argue with
+them.
+
+---
+
+## Contents
+
+- **[1. THP requirement coverage](#1-thp-requirement-coverage)** — what the brief asks, what answers it, how real it is
+  - [Functional](#functional)
+  - [Non-functional](#non-functional)
+- **[2. Assumptions and non-goals](#2-assumptions-and-non-goals)** — A1-A5 and what breaks if each is false
+- **[3. SQL surface](#3-sql-surface)** — the v1 grammar
+- **[4. Architecture](#4-architecture)** — planes, topology, the two credential boundaries
+- **[5. The eleven decisions](#5-the-eleven-decisions)** — the ADRs
+  - [ADR-001 — Planner runtime (Proposed)](#adr-001--planner-runtime-proposed)
+  - [ADR-002 — Entitlement enforcement (the brief's hardest requirement)](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)
+  - [ADR-003 — Caching: plan cache + result cache](#adr-003--caching-plan-cache--result-cache)
+  - [ADR-004 — Connector strategy: build vs. buy](#adr-004--connector-strategy-build-vs-buy)
+  - [ADR-005 — Freshness: watermark capability ladder](#adr-005--freshness-watermark-capability-ladder)
+  - [ADR-006 — Rate limiting and multi-tenant fairness](#adr-006--rate-limiting-and-multi-tenant-fairness)
+  - [ADR-007 — Join strategy: a four-tier escalation ladder](#adr-007--join-strategy-a-four-tier-escalation-ladder)
+  - [ADR-008 — Tenant lifecycle: Terraform vs. Control Plane API](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api)
+  - [ADR-009 — Streaming, timeouts, partial results](#adr-009--streaming-timeouts-partial-results)
+  - [ADR-010 — Keys, crypto-shredding, and the audit conflict](#adr-010--keys-crypto-shredding-and-the-audit-conflict)
+  - [ADR-011 — Identity, tenant derivation, attribute resolution](#adr-011--identity-tenant-derivation-attribute-resolution)
+- **[6. Capacity and performance](#6-capacity-and-performance)** — Little's Law -> fleet -> pod size, derived not asserted
+  - [6.1 Baseline](#61-baseline)
+  - [6.2 Derived sizing](#62-derived-sizing)
+  - [6.3 Gateway pod size — worked backwards, not asserted](#63-gateway-pod-size--worked-backwards-not-asserted)
+  - [6.4 The sensitivity that actually matters](#64-the-sensitivity-that-actually-matters)
+  - [6.5 Autoscaling, backpressure, overload](#65-autoscaling-backpressure-overload)
+- **[7. SLOs and error budget](#7-slos-and-error-budget)** — targets, the SLO boundary, error budget
+- **[8. Error vocabulary](#8-error-vocabulary)** — ten codes, each actionable
+- **[9. Security, isolation, compliance](#9-security-isolation-compliance)** — STRIDE, isolation, residency
+- **[10. Deployment and operations](#10-deployment-and-operations)** — IaC/CD, DR, runbooks, cost
+  - [10.1 IaC / CD](#101-iac--cd)
+  - [10.2 DR / BCP](#102-dr--bcp)
+  - [10.3 Runbooks](#103-runbooks)
+  - [10.4 Cost guardrails](#104-cost-guardrails)
+- **[11. Observability](#11-observability)** — traces, the two metrics that matter, logs
+- **[12. Six-month execution plan](#12-six-month-execution-plan)** — team, milestones, risks, budget
+  - [12.1 First two weeks — validate, unblock, decide. No architecture.](#121-first-two-weeks--validate-unblock-decide-no-architecture)
+  - [12.2 Team shape](#122-team-shape)
+  - [12.3 Milestones](#123-milestones)
+  - [12.4 Risk register](#124-risk-register)
+  - [12.5 Budget](#125-budget)
+- **[13. Decisions we are least confident about](#13-decisions-we-are-least-confident-about)** — five calls that could go the other way
+- **[14. Rejected alternatives, by decision](#14-rejected-alternatives-by-decision)** — every option turned down, and why
+
 ---
 
 ## 1. THP requirement coverage
@@ -23,43 +75,43 @@ table so it stays scannable.
 
 ### Functional
 
-| Requirement | Addressed by | Built in MVP? |
-|---|---|---|
-| SQL: projection, filters, pagination, optional joins | [§3](#3-sql-surface), [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Yes** — except `LIMIT`/`OFFSET`, see [§13](#13-decisions-we-are-least-confident-about) item 5 |
-| Query Planner: capability discovery, pushdown, join plan, cost/freshness hints, spill to materialization | [ADR-001](#adr-001--planner-runtime-proposed) | **n/a** — in-process Go planner is itself spike evidence |
-| Entitlements: least-privilege; RLS/CLS from source permissions + tenant policy | [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement) | **Mostly** — injection, invariant, verification real; OPA + delegated OAuth mocked |
-| AuthN via OIDC, AuthZ via policy; user token → scopes/roles → RLS/CLS | [ADR-011](#adr-011--identity-tenant-derivation-attribute-resolution) | **Partial** — issuer→tenant real, signature mocked |
-| Connector SDK: capability model, auth/token refresh, pagination, concurrency contracts, error codes | [ADR-004](#adr-004--connector-strategy-build-vs-buy) | **No** — both connectors mocked |
-| Real-time: on demand; timeouts + partial results for slow sources | [ADR-009](#adr-009--streaming-timeouts-partial-results) | **Partial** — NDJSON terminal frame, thin coverage |
-| Rate limits: per-app constraints; friendly, actionable exhaustion messages | [ADR-006](#adr-006--rate-limiting-and-multi-tenant-fairness) | **Partial** — single-node bucket, `429`, async reroute |
-| Freshness: avoid materially stale data; per-query staleness hints | [ADR-005](#adr-005--freshness-watermark-capability-ladder) | **Partial** — rungs 1 & 4 + `max_staleness` |
-| Caching *(implied — nearest is "cache hit ratios" under sizing math)* | [ADR-003](#adr-003--caching-plan-cache--result-cache) | **Partial** — plan cache real; result cache's shared tier designed |
-| Materialization: short-lived tables for joins/aggregations, lifecycle ≤ N min, encrypted per tenant | [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Partial** — semi-join real; DuckDB/ClickHouse/Spark tiers designed |
-| Admin UX: onboard connectors quickly via console/config; connectors versioned | [ADR-004](#adr-004--connector-strategy-build-vs-buy), [§12.3](#123-milestones) M6 | **No** |
-| Deployment modes: multi-tenant and single-tenant without code changes | [ADR-008](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api) | **No** |
-| Error vocabulary + `Retry-After` + async guidance | [§8](#8-error-vocabulary) | **Yes** |
+| Requirement | Addressed by | Built in MVP? | Pending / planned |
+|---|---|---|---|
+| SQL: projection, filters, pagination, optional joins | [§3](#3-sql-surface), [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Partial** — all but `LIMIT`/`OFFSET` | `LIMIT`/`OFFSET` — undecided, [§13](#13-decisions-we-are-least-confident-about) |
+| Query Planner: capability discovery, pushdown, join plan, cost/freshness hints, spill to materialization | [ADR-001](#adr-001--planner-runtime-proposed) | **Partial** — in-process Go planner | Calcite sidecar + Substrait — M1 spike |
+| Entitlements: least-privilege; RLS/CLS from source permissions + tenant policy | [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement) | **Partial** — injection, invariant, verification | Real OPA engine; delegated OAuth — M3 |
+| AuthN via OIDC, AuthZ via policy; user token → scopes/roles → RLS/CLS | [ADR-011](#adr-011--identity-tenant-derivation-attribute-resolution) | **Partial** — issuer→tenant derivation | JWKS signature verification — M1 |
+| Connector SDK: capability model, auth/token refresh, pagination, concurrency contracts, error codes | [ADR-004](#adr-004--connector-strategy-build-vs-buy) | **No** — both connectors mocked | Real SF/ZD connectors — M1; buy-tier — M3 |
+| Real-time: on demand; timeouts + partial results for slow sources | [ADR-009](#adr-009--streaming-timeouts-partial-results) | **Partial** — NDJSON terminal frame | Per-source timeout budget cascade — M2 |
+| Rate limits: per-app constraints; friendly, actionable exhaustion messages | [ADR-006](#adr-006--rate-limiting-and-multi-tenant-fairness) | **Partial** — bucket, `429`, async reroute | Redis leases, semaphores, fair queues — M5 |
+| Freshness: avoid materially stale data; per-query staleness hints | [ADR-005](#adr-005--freshness-watermark-capability-ladder) | **Partial** — rungs 1 & 4 | Rungs 2 & 3 — M2 |
+| Caching *(implied — nearest is "cache hit ratios" under sizing math)* | [ADR-003](#adr-003--caching-plan-cache--result-cache) | **Partial** — plan + result cache | Result cache's shared Redis tier — M5 |
+| Materialization: short-lived tables for joins/aggregations, lifecycle ≤ N min, encrypted per tenant | [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Partial** — semi-join rewrite only | DuckDB tier — M4; ClickHouse/Spark unscheduled |
+| Admin UX: onboard connectors quickly via console/config; connectors versioned | [ADR-004](#adr-004--connector-strategy-build-vs-buy), [§12.3](#123-milestones) M6 | **No** — design only | Console onboarding + connector versioning — M6 |
+| Deployment modes: multi-tenant and single-tenant without code changes | [ADR-008](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api) | **No** — design only | Tenant Lifecycle API — M2 |
+| Error vocabulary + `Retry-After` + async guidance | [§8](#8-error-vocabulary) | **Yes** — all ten codes | — |
 
 ### Non-functional
 
-| Requirement | Addressed by | Built in MVP? |
-|---|---|---|
-| Scale: 10M users, peak ~1k QPS, ~100 MB/s | [§6](#6-capacity-and-performance) | **Load-tested at 500 req/s**, 0 failures |
-| Latency SLOs: P50 < 500 ms, P95 < 1.5 s single-source | [§6](#6-capacity-and-performance), [§7](#7-slos-and-error-budget) | **Measured** in prototype |
-| Availability 99.9% monthly + error budget policy | [§7](#7-slos-and-error-budget) | Design only |
-| Autoscaling without manual intervention; cost guardrails | [§6.5](#65-autoscaling-backpressure-overload), [§10.4](#10-deployment-and-operations) | **No** |
-| Rate-limit governance per connector/tenant/user; fairness across tenants | [ADR-006](#adr-006--rate-limiting-and-multi-tenant-fairness) | **Partial** — **no per-tenant dimension**, the real fairness gap |
-| Freshness controls honoring rate limits; configurable per source/class | [ADR-005](#adr-005--freshness-watermark-capability-ladder) | **Yes** — probes charge the same bucket as fetches |
-| Infra automation: Terraform, Helm/k8s, canary/blue-green + automated rollback | [§10](#10-deployment-and-operations) | **No** |
-| Security & isolation: storage/compute/network; per-tenant keys; crypto-shred | [ADR-010](#adr-010--keys-crypto-shredding-and-the-audit-conflict), [§9](#9-security-isolation-compliance) | **No** |
-| Compliance: audit logs, access trails, data residency tags | [ADR-010](#adr-010--keys-crypto-shredding-and-the-audit-conflict), [§9](#9-security-isolation-compliance) | **No** — no access log exists |
-| Threat model (STRIDE) + mitigations; pen-test readiness | [§9](#9-security-isolation-compliance) | Design only |
-| Sizing math for 1k QPS: concurrency, latency percentiles, cache hit ratios | [§6](#6-capacity-and-performance) | **Measured** — hit ratio, see README |
-| Backpressure; overload protection | [§6.5](#65-autoscaling-backpressure-overload) | **No** |
-| DR/BCP: multi-AZ, RPO/RTO targets | [§10.2](#10-deployment-and-operations) | **No** |
-| Runbooks: rate-limit floods, connector auth failures, cache stampedes | [§10.3](#10-deployment-and-operations) | Design only |
-| Observability: OTel traces, Prometheus metrics, structured logs | [§11](#11-observability) | **Yes** — real histogram + real trace |
-| Six-month plan: team, milestones, acceptance criteria, risks, budget | [§12](#12-six-month-execution-plan) | n/a — plan |
-| Bonus: cost levers, chaos plan, predicate-pushdown creativity | [§10.4](#10-deployment-and-operations), [§12.3](#123-milestones) M6, [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Semi-join built** (29.7× reduction) |
+| Requirement | Addressed by | Built in MVP? | Pending / planned |
+|---|---|---|---|
+| Scale: 10M users, peak ~1k QPS, ~100 MB/s | [§6](#6-capacity-and-performance) | **Partial** — load-tested 500 req/s | Full 1k QPS against real sources — M4 |
+| Latency SLOs: P50 < 500 ms, P95 < 1.5 s single-source | [§6](#6-capacity-and-performance), [§7](#7-slos-and-error-budget) | **Partial** — measured against mocks | Real connector latency — M2 |
+| Availability 99.9% monthly + error budget policy | [§7](#7-slos-and-error-budget) | **No** — design only | SLI wiring + error budget policy — M2 |
+| Autoscaling without manual intervention; cost guardrails | [§6.5](#65-autoscaling-backpressure-overload), [§10.4](#104-cost-guardrails) | **No** | HPA on concurrency; cost attribution — M4/M5 |
+| Rate-limit governance per connector/tenant/user; fairness across tenants | [ADR-006](#adr-006--rate-limiting-and-multi-tenant-fairness) | **Partial** — per-connector budget only | Per-tenant + per-user dimensions — M5 |
+| Freshness controls honoring rate limits; configurable per source/class | [ADR-005](#adr-005--freshness-watermark-capability-ladder) | **Yes** — probes charge the bucket | — |
+| Infra automation: Terraform, Helm/k8s, canary/blue-green + automated rollback | [§10](#10-deployment-and-operations) | **No** | Terraform, Helm, Argo canary — M4 |
+| Security & isolation: storage/compute/network; per-tenant keys; crypto-shred | [ADR-010](#adr-010--keys-crypto-shredding-and-the-audit-conflict), [§9](#9-security-isolation-compliance) | **No** | Per-tenant KMS — M2; crypto-shred — M2 |
+| Compliance: audit logs, access trails, data residency tags | [ADR-010](#adr-010--keys-crypto-shredding-and-the-audit-conflict), [§9](#9-security-isolation-compliance) | **No** — no access log | Audit trail — M3; residency tags — M5 |
+| Threat model (STRIDE) + mitigations; pen-test readiness | [§9](#9-security-isolation-compliance) | **No** — design only | External security review — M6 |
+| Sizing math for 1k QPS: concurrency, latency percentiles, cache hit ratios | [§6](#6-capacity-and-performance) | **Yes** — hit ratio measured | — |
+| Backpressure; overload protection | [§6.5](#65-autoscaling-backpressure-overload) | **No** | Admission control + load shedding — M4 |
+| DR/BCP: multi-AZ, RPO/RTO targets | [§10.2](#102-dr--bcp) | **No** | Multi-AZ + cross-region replica — M4 |
+| Runbooks: rate-limit floods, connector auth failures, cache stampedes | [§10.3](#103-runbooks) | **No** — design only | Chaos drills validate them — M6 |
+| Observability: OTel traces, Prometheus metrics, structured logs | [§11](#11-observability) | **Yes** — real histogram, real trace | — |
+| Six-month plan: team, milestones, acceptance criteria, risks, budget | [§12](#12-six-month-execution-plan) | **n/a** — planning artifact | — |
+| Bonus: cost levers, chaos plan, predicate-pushdown creativity | [§10.4](#104-cost-guardrails), [§12.3](#123-milestones) M6, [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Partial** — semi-join rewrite built | Cost levers — M5; chaos plan — M6 |
 
 **The pattern worth naming.** Every ADR that is unbuilt ([001](#adr-001--planner-runtime-proposed),
 [004](#adr-004--connector-strategy-build-vs-buy),
@@ -480,12 +532,39 @@ targets set against mean latency will silently fail a percentile SLO.**
 
 ### 6.5 Autoscaling, backpressure, overload
 
-- **HPA on concurrency** (in-flight per pod), **not CPU** — the workload is I/O-bound and CPU is a
-  lagging signal.
-- Scale-out at queue-depth p95 > 50 ms; scale-in with a 10-min stabilization window against thrash.
-- Backpressure propagates inward: connector semaphore saturation → fair queue → admission control → `429`.
-- Overload sheds the **newest** low-priority work first — shedding a query that already burned
-  connector quota wastes that quota twice.
+**Scaling signal: concurrency, not CPU.** HPA tracks in-flight requests per pod. The workload is
+I/O-bound — pods spend most of a request blocked on a connector response with idle CPU — so CPU
+utilization stays low right up until the pod is saturated with waiting work. Scaling on it would
+under-provision badly and react late.
+
+**Why the two thresholds are asymmetric:**
+
+| | Trigger | Why this value |
+|---|---|---|
+| **Scale-out** | Fair-queue wait **p95 > 50 ms** | Measured as *wait time*, not queue *length*: a depth of 20 means nothing without knowing the drain rate, whereas wait time is directly comparable to the latency budget it eats into. 50 ms is ~3% of the 1.5 s P95 target — early enough to add capacity while there's still headroom to absorb the burst, rather than after the SLO is already missed |
+| **Scale-in** | Same metric sustained low for **10 min** | Deliberately far slower than scale-out. Adding a pod is cheap and reversible; removing one during a lull that's about to end costs a cold start *plus* a cold plan/result cache on the next burst. 10 minutes exceeds typical burst duration, so the fleet doesn't chase noise |
+
+**Backpressure propagates inward — from the external boundary back toward the caller.** The
+scarce resource is not our CPU or goroutines, it is **upstream connector concurrency** (~750
+concurrent outbound, [§6.2](#62-derived-sizing)), which the vendor fixes and we cannot scale past.
+Each stage absorbs what it can and pushes the remainder back one step:
+
+| # | Stage | Saturates when | What it does |
+|---|---|---|---|
+| 1 | **Connector semaphore** ([ADR-006](#adr-006--rate-limiting-and-multi-tenant-fairness)) | Every slot for that connector is checked out | Blocks — no further outbound call is issued for that connector |
+| 2 | **Per-tenant fair queue** | Requests accumulate waiting for a slot | Holds them, dequeued by weighted fair share so one tenant's backlog cannot starve another's |
+| 3 | **Admission control** | Queue depth passes its bound | Stops accepting new work rather than letting the queue grow without limit |
+| 4 | **Client** | — | `429 RATE_LIMIT_EXHAUSTED` + `Retry-After` + the `Prefer: respond-async` option |
+
+**Why bound the queue at all, rather than just letting it grow?** An unbounded queue converts a
+fast rejection into a slow failure: the request waits, the caller's deadline expires anyway, and
+whatever connector quota was spent on it is wasted. A `429` at second zero is strictly better than
+a `SOURCE_TIMEOUT` at second thirty — same outcome for the caller, none of the wasted quota.
+
+**Overload sheds the newest low-priority work first.** A request already partway through has
+*already spent* connector quota; killing it wastes that quota and returns nothing for it. Shedding
+the newest arrivals preserves the work closest to completing — the opposite of the intuitive
+"drop the oldest, it's been waiting longest" rule, which here would maximize wasted quota.
 
 ---
 
@@ -557,13 +636,15 @@ Every response — success or failure — returns `freshness_ms`, `rate_limit_st
 
 ## 10. Deployment and operations
 
-**10.1 IaC / CD.** Terraform modules (`/global-control-plane`, `/shared-data-plane`,
+### 10.1 IaC / CD
+
+Terraform modules (`/global-control-plane`, `/shared-data-plane`,
 `/tenant-resources`); Helm charts identical across modes. **Argo Rollouts** canary 5 → 25 → 50 →
 100%, each step gated on a Prometheus analysis template. Auto-rollback on P95 > 1.5 s, error rate
 > 1%, **or `ENTITLEMENT_DENIED` rate deviating from baseline** — that last one is a *correctness*
 canary, not a performance one, and it's the one worth having.
 
-**10.2 DR / BCP:**
+### 10.2 DR / BCP
 
 | Component | Strategy | RPO | RTO |
 |---|---|---|---|
@@ -576,7 +657,7 @@ canary, not a performance one, and it's the one worth having.
 Region strategy is **active/passive** for v1 — active/active is deferred because per-tenant
 residency tags make global routing a *compliance* problem, not just a traffic problem.
 
-**10.3 Runbooks.**
+### 10.3 Runbooks
 
 | Incident | Detect | Act |
 |---|---|---|
@@ -585,7 +666,9 @@ residency tags make global routing a *compliance* problem, not just a traffic pr
 | **Cache stampede** | Connector calls/s spikes with flat QPS | Singleflight should prevent it; if it fires the cause is usually synchronized TTL expiry → jitter, then find why keys aligned |
 | **Off-boarding verification** | Scheduled attestation | DEKs destroyed · KEK disabled · grants revoked · jobs cancelled · caches invalidated · audit tokens unmapped |
 
-**10.4 Cost guardrails.** Attributed per tenant per query (connector calls, egress bytes,
+### 10.4 Cost guardrails
+
+Attributed per tenant per query (connector calls, egress bytes,
 materialization GB-seconds, planner CPU-ms); monthly budget alerting at 50/80/100%; at 100% the
 tenant is **throttled to a reduced lease, not cut off**. **Levers by impact:** (1) raise cache hit
 ratio — but it fights [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement), the real tension; (2) semi-join rewrites; (3) freshness rung
@@ -679,6 +762,8 @@ either before M4 measures tier-1's real `RESULT_TOO_LARGE` rate would be guessin
 problem.
 
 ### 12.4 Risk register
+
+**L** = likelihood, **I** = impact — both High / Med / Low.
 
 | Risk | L | I | Mitigation | Owner | Trigger |
 |---|---|---|---|---|---|

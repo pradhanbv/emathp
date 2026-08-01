@@ -3,9 +3,9 @@
 **Status:** Proposed | **Version:** 1.0-lean | **Date:** _(fill)_
 **Scenario implemented in prototype:** Salesforce (accounts) JOIN Zendesk (tickets)
 
-> Condensed companion to the full `DESIGN.md`. Same eleven decisions, same numbers, same
+> Condensed companion to the full `DESIGN_FULL.md`. Same eleven decisions, same numbers, same
 > rejections - trimmed to the argument each needs and no more. Where this document and the
-> full one could ever diverge, the full `DESIGN.md` is canonical; this one exists to be read
+> full one could ever diverge, the full `DESIGN_FULL.md` is canonical; this one exists to be read
 > in fifteen minutes, not ninety. Rejected alternatives with their strongest steelman case are
 > in `REJECTED_ALTERNATIVES.md`, not repeated here.
 
@@ -180,7 +180,7 @@ flowchart TB
 ```
 
 **Request path, condensed** (`L1`/`L2`/`L3` = the three authorization layers of ADR-002; full
-step-by-step sequence diagram is in `DESIGN.md` Section 2.3):
+step-by-step sequence diagram is in `DESIGN_FULL.md` Section 2.3):
 
 1. Identity Broker verifies the token's signature, derives tenant from `iss`, resolves
    roles/attributes, mints an internal token (ADR-011).

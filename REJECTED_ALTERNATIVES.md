@@ -1,9 +1,9 @@
 # Rejected Alternatives
 
-Companion to `DESIGN.md`. For every option that was genuinely in contention across the eleven
+Companion to `DESIGN_FULL.md`. For every option that was genuinely in contention across the eleven
 ADRs, this records the strongest real case *for* it, the specific reason it lost anyway, and a
 one-line summary of the trade-off. Full reasoning for the alternative that *was* chosen lives in
-`DESIGN.md`; this document exists so the road not taken is on record too, not just asserted away.
+`DESIGN_FULL.md`; this document exists so the road not taken is on record too, not just asserted away.
 
 **Method.** Every rejection here names what the option is genuinely good at before the
 constraint that rules it out. A rejection that only lists weaknesses reads as unfamiliarity with
@@ -18,7 +18,7 @@ smoothed over - see "Weakest rejections" at the end.
 | Option | Strongest case for it | Why rejected | Bottom line |
 |---|---|---|---|
 | **Trino / Starburst** | Mature federation, huge connector library, real CBO. `SystemAccessControl` has had `getRowFilters`/`getColumnMask` since release 331 (2020), and there is a first-class OPA plugin returning mask expressions from Rego - this is not a naive objection. | Connector model targets JDBC and object storage, not SaaS REST with pagination / rate limits / ETags / OAuth refresh. Credentials are catalog-scoped, cutting against per-principal delegated OAuth. Shared worker pool means no per-tenant isolation without a cluster each. No rate-limit governance concept. | Solves federation, not multi-tenant SaaS federation - the connector layer would need to be written regardless, and the credential and isolation models work against this design. |
-| **DataFusion (Rust)** | Extensible rule-based optimizer; `datafusion-substrait` covers logical and physical plans; no JVM, no GC, no hop. | Team capability, not merit - no Rust depth on the team shape (Section 10). | The closest call, which is why ADR-001 is held weakly (Section 12). Revisit if Rust depth is hired or the plan cache underperforms. |
+| **DataFusion (Rust)** | Extensible rule-based optimizer; `datafusion-substrait` covers logical and physical plans; no JVM, no GC, no hop. | Team capability, not merit - no Rust depth on the team shape (Section 10). | The closest call, which is why ADR-001 is held weakly (Section 11). Revisit if Rust depth is hired or the plan cache underperforms. |
 | **Steampipe / Postgres FDW** | Literally this product category, and it already exists. | Single-tenant by construction. No per-tenant key, quota, or fairness model. FDW pushdown is coarse - no per-predicate `ENFORCED`/`ADVISORY` contract, the primitive ADR-002 depends on. | Good evidence the product category is real; not a foundation for a multi-tenant product. |
 | **Go-native parser** (vitess, pg_query_go) | One runtime, no hop, and it handles the v1 SQL surface fine - the prototype proves it. | Gives an AST, not an optimizer. Ownership of capability-aware pushdown and residual-predicate correctness - the security-critical part - would fall to hand-written code. | Fine at n=2 (the prototype's own scale). The real question is n=50 connectors and multi-way joins, where owning rewrite-rule correctness for security predicates is the wrong trade. |
 | **GraalVM native-image Calcite** | No hop, no JVM warmup. | Native-image needs closed-world compilation, which fights Calcite's runtime code generation and reflection - but only if the *executor* needs native-image too, and only the *planner* is needed here. | An open question, not a settled rejection - this is exactly why ADR-001 is Proposed rather than Accepted. If an M1 spike shows planner-only compilation is reachable, this could still be selected. |
@@ -34,7 +34,7 @@ smoothed over - see "Weakest rejections" at the end.
 | **Post-filter in Go** | Simple, connector-agnostic, always correct. | Rows leave the source and enter our memory before being discarded - that is the leak, plus wasted quota. The `ADVISORY` residual path *is* this, bounded - it is rejected as the default, not as a fallback. | Rejected as a strategy, kept as a bounded fallback - a difference of degree, not kind, which is why `residual_filter_rows_dropped` is monitored rather than the exception being pretended away. |
 | **Inject into compiled Substrait in Go** | Keeps policy logic in one language, no planner round-trip. | Substrait uses positional field references; names survive only as root-level hints. Rewriting a compiled binary plan by position fails silently under column reordering. | The right idea at the wrong stage - injection belongs in the logical plan, while columns still have names, not after compilation to a positional form. |
 | **OPA as a policy blob store** | Simple, familiar, no Compile API dependency. | Wastes OPA - the planner would then have to interpret Rego semantics itself, duplicating the engine. | The right tool used the wrong way; partial evaluation via the Compile API is the actual value OPA provides here. |
-| **Zanzibar (OpenFGA / SpiceDB)** | Genuinely better for *mirroring* source permission graphs - Drive ACLs, Salesforce sharing rules. | Deferred, not dead: assumption A1 (source ACLs enforce themselves via delegated OAuth) means there's nothing to mirror, so no tuple store is needed - for now. | Held as the fallback if delegated OAuth doesn't hold across enough connectors - see ADR-002's revisit trigger and Section 12. |
+| **Zanzibar (OpenFGA / SpiceDB)** | Genuinely better for *mirroring* source permission graphs - Drive ACLs, Salesforce sharing rules. | Deferred, not dead: assumption A1 (source ACLs enforce themselves via delegated OAuth) means there's nothing to mirror, so no tuple store is needed - for now. | Held as the fallback if delegated OAuth doesn't hold across enough connectors - see ADR-002's revisit trigger and Section 11. |
 | **Cedar** | Comparable expressiveness, a stronger formal-verification story, and Cedar's own RFC 0095 uses residual-to-SQL translation as its motivating example - conceptually the same approach. | Maturity, not concept: both partial evaluators sit behind experimental crate features (`partial-eval`, superseded by `tpe`), and the untyped evaluator's own RFC states it can return ill-typed residuals it cannot safely simplify - exactly what would be fed into a plan. OPA's Compile API is GA and documented for this. | Conceptually validated by Cedar's own design docs; rejected on maturity. Worth revisiting once `tpe` stabilizes. |
 | **Sampling the runtime verification filter** | Cheaper than checking every request. | A security control that runs some fraction of the time lets a lying connector through the rest of the time. | Not a control if it's probabilistic. |
 | **Pushing security predicates to `ADVISORY` connectors as an optimization** | Would cut fetch volume while the local filter preserves correctness. | Safe against *under*-filtering (the common failure mode) but not *over*-filtering: an `ADVISORY` source silently dropping entitled rows produces an incomplete result that's undetectable without a control fetch. | Under-filtering is caught by the verification filter; over-filtering would not be. The bandwidth cost of not pushing is accepted in exchange for that guarantee. |
@@ -134,7 +134,7 @@ having been obvious from the start.
 ## Weakest rejections
 
 Ranked by how likely each one is to be reversed on new evidence - the same spirit as
-`DESIGN.md` Section 12, applied to the alternatives that lost rather than the decisions that won.
+`DESIGN_FULL.md` Section 11, applied to the alternatives that lost rather than the decisions that won.
 
 1. **DataFusion (ADR-001).** Not really a settled rejection - ADR-001 itself is Proposed, not
    Accepted, specifically because this is unresolved. The current position is to run Calcite in
@@ -160,5 +160,5 @@ Ranked by how likely each one is to be reversed on new evidence - the same spiri
    time-bound objection, not a structural one.
 
 **The general pattern.** Every item on this list names the metric or event that would flip it -
-consistent with `DESIGN.md`'s own convention for its accepted decisions (Section 12). A
+consistent with `DESIGN_FULL.md`'s own convention for its accepted decisions (Section 11). A
 rejection with no stated reversal condition is the kind worth re-examining first.

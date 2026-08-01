@@ -1,6 +1,6 @@
 # MVP Implementation Plan - TDD
 
-Companion to `DESIGN.md`. ~7 h across 14 cycles. Every cycle is red -> green -> refactor.
+Companion to `DESIGN_FULL.md`. ~7 h across 14 cycles. Every cycle is red -> green -> refactor.
 
 ## Ground rules
 
@@ -10,7 +10,7 @@ Companion to `DESIGN.md`. ~7 h across 14 cycles. Every cycle is red -> green -> 
  then unit tests drive the pieces it needs. This keeps the response contract honest and
  stops you from building beautifully-tested components that don't compose.
 3. **Cycles are risk-ordered, not layer-ordered.** The tests that could falsify a claim in
- `DESIGN.md` come first. If cycle 6 fails, you want to know at hour 3, not hour 6.
+ `DESIGN_FULL.md` come first. If cycle 6 fails, you want to know at hour 3, not hour 6.
 4. **Two things are not TDD'd**, and that's deliberate: the mock SaaS services (they *are*
  test fixtures - driven by the tests that consume them) and Docker Compose wiring. Say so
  in the README rather than pretending otherwise.
@@ -113,7 +113,7 @@ func TestTenantDerivedFromIssuerNotClaim(t *testing.T) {
 ```
 
 Implement: parse-unverified -> `registry.ByIssuer(iss)` -> group->role map -> attribute lookup.
-Signature verification is mocked; **derivation is real** (see `DESIGN.md` ADR-011).
+Signature verification is mocked; **derivation is real** (see `DESIGN_FULL.md` ADR-011).
 
 **Done when** the hostile fixture resolves to the correct tenant.
 
@@ -300,7 +300,7 @@ connector to wire it to. Two things were deferred waiting for exactly this point
 1. **`testdata/tokens/{dana,root}.jwt` don't exist yet.** `harness.Token` has been returning
  placeholder strings since Cycle 0. This is the cycle real Bearer tokens (and real
  `identity.Resolve` wiring into the handler) become necessary - create them here.
-2. **L1 object-level authorization has no test anywhere in this plan**, despite `DESIGN.md`'s
+2. **L1 object-level authorization has no test anywhere in this plan**, despite `DESIGN_FULL.md`'s
  "What the prototype enforces (not deferred)" section explicitly claiming "object-level authz
  rejects an out-of-scope table at admission" as one of three layers proven end-to-end. It
  doesn't belong in Cycle 4 (CLS/column hygiene is a Layer 2 concern; L1 is pre-plan admission,
@@ -426,7 +426,7 @@ func TestSemiJoinReducesProbeCalls(t *testing.T) {
 }
 ```
 
-`DESIGN.md` gives cross-app joins their own P95 < 4 s SLO. The prototype does not assert it -
+`DESIGN_FULL.md` gives cross-app joins their own P95 < 4 s SLO. The prototype does not assert it -
 at mock-source latencies the number is meaningless. Call counts are the honest proxy here, and
 they are what the rewrite actually changes.
 
@@ -498,7 +498,7 @@ func TestTraceIDPropagates(t *testing.T) {
 ## Cycle 13 - Compose, k6, README (40 min)
 
 k6 **parameterized by distinct principal count** - this is what turns a load test into
-evidence for `DESIGN.md` Section 5.3:
+evidence for `DESIGN_FULL.md` Section 5.3:
 
 ```js
 // k6/load.js - run: k6 run -e PRINCIPALS=1 ... then 10, 100
@@ -526,7 +526,7 @@ docker compose --profile testing run k6
 ## Cycle 14 - Result cache key correctness (25 min) [KEY]
 
 **Why this cycle exists.** `internal/freshness`'s cache key was `table|columns|filters` -
-no principal, no tenant. `DESIGN.md` ADR-002 says the result cache "must be keyed by
+no principal, no tenant. `DESIGN_FULL.md` ADR-002 says the result cache "must be keyed by
 principal" and explains why (layer 3 - source-side sharing rules apply under the *calling*
 principal's own delegated token, and can differ per user for an identical query, independent
 of anything our own RLS computes). The implementation didn't match the design. Nothing caught

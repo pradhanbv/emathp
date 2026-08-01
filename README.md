@@ -101,6 +101,10 @@ single per-ADR verdict would flatten into one misleading word.
 a vendor contract, Terraform, a KMS call. Every built one maps to a requirement about *behaviour
 under adversarial conditions*. **We built what a reviewer cannot take on faith.**
 
+**What building it changed my mind about:** the grey lane above is not evenly costly — connector
+authoring is the one line item that scales with the catalog, and that reframes ADR-004 entirely.
+See [Afterthought: connector authoring is the real bottleneck](#afterthought-connector-authoring-is-the-real-bottleneck).
+
 ---
 
 ## Measured: the number the design is least sure about

@@ -16,10 +16,20 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 ## Quickstart
 
 ```bash
-docker compose --profile core --profile mocks up -d   # gateway + 2 mock SaaS sources
-go test ./...                                          # 30 tests, ~1s
-docker compose --profile testing run --rm k6           # load test: 500 req/s for 60s
+docker compose --profile core --profile mocks up -d --build   # gateway + 2 mock SaaS sources
+go test ./...                                                 # 36 tests, ~1s
+docker compose --profile testing run --rm k6                  # load test: 500 req/s for 60s
+
+docker compose --profile "*" down                             # tear down — see note below
 ```
+
+> **Teardown needs a profile flag.** Every service in `docker-compose.yml` is profile-gated
+> (`core`, `mocks`, `observability`, `testing`) and there is no default profile-less service, so a
+> bare `docker compose down` selects **zero** services, stops nothing, and exits `0` with no
+> output. Confusingly `docker compose ps` still lists the containers — it matches on the project
+> label rather than the profile selection — which makes this look like a Docker bug rather than a
+> flag you're missing. Use `--profile "*"` (or name the profiles, or list the services
+> explicitly).
 
 **The demo that matters** — same SQL, two identities:
 
@@ -132,8 +142,9 @@ docker compose --profile testing run --rm -e PRINCIPALS=100 k6   # then 1000, th
 shape, different `WHERE` literal) were silently serving whichever literal built the plan — the
 plan cache's own hit-ratio pressure triggered it on any two same-shaped, differently-valued
 queries. `$principal.<attr>` values were already resolved lazily per call; ordinary literals were
-not, until this table required varying one. Fixed in
-`TestPlanCacheDoesNotStaleBindLiteralValues`.
+not, until this table required varying one. Fixed, and pinned by
+`TestPlanCacheHitsOnSameShapeDifferentValue` (`internal/plancache`), which asserts a cache hit
+must not reuse the first query's literal value.
 
 ---
 
@@ -293,14 +304,20 @@ with a budget low enough to hit:
 
 ```bash
 docker compose --profile mocks up -d   # just the two mocks - the compose gateway can stay up too
-go run ./cmd/gateway --addr :8090 --sf-url http://localhost:8081 --zd-url http://localhost:8082 --sf-limit 3 &
+
+# Build first, then run the binary directly. Do NOT use `go run ... &` here: go run
+# execs the compiled binary as a *child*, so killing the go run job leaves the real
+# gateway holding :8090, and every re-run then fails with "address already in use".
+go build -o /tmp/emathp-gw ./cmd/gateway
+/tmp/emathp-gw --addr :8090 --sf-url http://localhost:8081 --zd-url http://localhost:8082 --sf-limit 3 &
+GW=$!   # the gateway's own pid, directly killable
 
 for i in 1 2 3 4; do
   curl -s -D - -o /dev/null localhost:8090/v1/query \
     -H "Authorization: Bearer $(cat testdata/tokens/dana.jwt)" \
     -d '{"sql":"SELECT id FROM sf.accounts"}' | grep -iE "^HTTP|Retry-After"
 done
-kill %1   # stop the gateway instance started above
+kill $GW   # stops the gateway started above
 ```
 
 ```
@@ -432,7 +449,7 @@ same port, same "address already in use" failure as the Docker one earlier if yo
 
 ```
 $ kill %1   # or: pkill -f mocksf - stop the instance started above, it's still on :8081
-$ mocksf --rows 10 --lie-about region &
+$ ./mocksf --rows 10 --lie-about region &
 $ curl -s "http://localhost:8081/accounts?fields=id,region&region=nonexistent-region" | jq '.rows | length'
 10
 ```
@@ -468,7 +485,8 @@ the same call sites, so neither can drift from what actually happened). Two metr
 *is* a real OpenTelemetry trace id, not a random string that merely looks like one - the gateway
 starts a `gateway.query` span per request and a child `connector.fetch` span per connector call
 (`internal/freshness`), exported over OTLP/HTTP to Jaeger's all-in-one image. For the cross-app
-join, the same trace shows *two* `connector.fetch` children (build side, then each probe chunk)
+join, the same trace shows **one `connector.fetch` child per fetch** - one for the build side,
+then one per probe chunk (on the current fixture: 1 `sf` + 10 `zd` = 11)
 under one `gateway.query` span - the semi-join's call reduction, visible as spans, not just a
 log line. `TestTraceIDPropagates` proves the id `sf` actually receives on `X-Trace-Id` is the
 same one the gateway returns to its caller, independent of whether a collector is even running -
@@ -538,15 +556,26 @@ not just repeats - worth pointing out if `result_cache_requests_total` comes up.
 2. Paste the join query's `trace_id` from Step 2 directly into the search box at the top (or:
    set *Service* to `emathp-gateway`, click *Find Traces*, and pick the most recent one - it'll
    be the join, since it's the last query issued).
-3. Click into the trace. You should see a waterfall: one `gateway.query` span at the top, with
-   **two** `connector.fetch` children nested under it (the join's build-side fetch and its
-   probe-side fetch), each with its own duration.
-4. Screenshot the waterfall. This is the trace screenshot - the semi-join's two-connector
-   fanout, visible as spans with real durations, not a log line asserting it happened.
+3. Click into the trace. You should see a waterfall: one `gateway.query` span at the top with
+   `connector.fetch` children nested under it - **one for the build-side fetch (`sf`), then one
+   per probe chunk (`zd`)**. On the current fixture that's 1 + 10 = **11 fetch spans**; the exact
+   chunk count moves with join-key selectivity, so treat the shape as the claim, not the number.
+4. Screenshot the waterfall. This is the trace screenshot - the semi-join made visible: a single
+   small build-side fetch, then the chunked probe fanout, each span with its own real duration.
+   That chunking *is* the 505 -> 17 call reduction, not a log line asserting it happened.
 
 **What the pair proves together.** The metrics show call volume (and now cache hit/miss) are
 real and observable; the trace shows *where the time inside one request actually went*, and that
-a cross-app join really does fan out to two connectors under one root span - the same claim
-Section 5's capacity model makes numerically, here shown as spans a reviewer can click on.
+a cross-app join really does fan out across two connectors under one root span - the same claim
+the capacity model makes numerically, here shown as spans a reviewer can click on.
+
+**Step 5 - tear it down.** This walkthrough leaves five containers running:
+
+```bash
+docker compose --profile "*" down
+```
+
+A bare `docker compose down` will *not* work here - every service is profile-gated, so with no
+profile flag it selects zero services and silently does nothing (see the note under Quickstart).
 
 ---

@@ -10,6 +10,7 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 | [`DESIGN_FULL.md`](./DESIGN_FULL.md) | Canonical — worked derivations, full rejection reasoning, 16 diagrams | ~90 min |
 | [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md) | Every option considered and turned down, with its steelman | ~10 min |
 | [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) | The TDD build log, cycle by cycle | ~15 min |
+| [`HUMAN_AND_AI.md`](./HUMAN_AND_AI.md) | How this was built with Gemini + Claude — the division of labour, and the three failure modes worth reviewing for | ~6 min |
 
 ---
 

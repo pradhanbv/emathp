@@ -825,6 +825,26 @@ each other component closes a gap that leaves open:
 Policy writes in the control plane publish an invalidation event; we also bound staleness with
 a short TTL as a backstop against missed events.
 
+**Parameterization covers *two* kinds of value, and missing the second is a live bug.** The
+example above (`WHERE region = $principal.region`) is a *policy* residual, and those were
+resolved lazily from the start. Ordinary **user literals** need identical treatment for a reason
+that is easy to miss: `sql_shape_hash` deliberately normalizes literals away, so
+`status='open'` and `status='closed'` are the *same* key by design. That is the point - it is
+what makes the hit ratio survive real traffic - but it silently obligates the plan body to hold
+a `$param.N` slot rather than the literal, re-extracted per request (`plan.ExtractParams`) and
+bound at execution (`exec.resolveValue`) alongside the principal attributes.
+
+Bake the literal into the plan instead and the cache serves whichever request built it, to every
+later request of that shape. The failure has three properties that make it particularly nasty:
+it never appears on the first request; it needs a *warm* cache, so it strengthens exactly as the
+cache does its job; and it is invisible to a test suite that never issues two same-shaped
+queries with different values in sequence. Ours didn't, and 36 passing tests missed it - a load
+run that varied a `WHERE` value found it. Now pinned by
+`TestPlanCacheHitsOnSameShapeDifferentValue` (`internal/plancache`), which asserts both halves:
+the two shapes share a cache key, *and* the second execution sends its own literal to the
+connector. Resolution fails closed on a missing or out-of-range slot rather than comparing
+against an empty string, which would silently match or silently drop every row depending on data.
+
 **What this cache is actually for - and what it is not.** No requirement asks for plan
 caching; it exists because ADR-001 put a JVM planner in the request path, and without
 amortization that choice cannot pay for itself. Ranked honestly:
@@ -1577,12 +1597,22 @@ rather than folding into one number.
 | Bytes per entry | 100-200 KB | A2 fixes the client-facing *output* at 100 KB; the cache stores pre-mask, pre-trim rows, so entries run larger - no measured over-projection overhead exists yet |
 | **Total** | 21,000 x 100 KB to 42,000 x 200 KB | **~2-8 GB fleet-wide** |
 
+**This derivation assumes eviction that does not exist.** Every row above treats the staleness
+window as a bound on *memory*, but `internal/freshness.Cache` is a plain map - no `delete`, no
+LRU, no size cap - and an expired entry is *deliberately* retained so its ETag can drive a cheap
+304 revalidation. TTL therefore bounds **staleness**, not residency: the real resident set is
+every distinct key the process has ever seen, and ADR-002's per-principal keying makes that
+cardinality large. Read 2-8 GB as a **floor**, not a ceiling. Whatever eviction policy lands must
+drop the rows while keeping the ETag - evicting both converts free 304s into full refetches,
+trading memory for connector quota, which is the scarcer resource. Separately, the bytes-per-entry
+row is untested: the load script's query matches zero rows, so measured entries are ~2 bytes.
+
 *What distinguishes the two pools:*
 
 | | Materialization (23 GB) | Result cache (2-8 GB) |
 |---|---|---|
 | What it holds | Working memory for an active join computation - both sides' rows plus hash-join intermediates | Past fetch results kept for a future request to reuse |
-| Lifecycle | Torn down after ~0.6 s, when that join finishes | Lives until `max_staleness` expires (up to ~60 s) |
+| Lifecycle | Torn down after ~0.6 s, when that join finishes | Until evicted - **today, never**; `max_staleness` bounds staleness, not residency |
 | Applies to | Only the 15% join share | All traffic - both the single-source share and joins' own underlying fetches |
 | Purpose | Compute a result | Avoid re-doing work |
 
@@ -1735,9 +1765,19 @@ residency tags (Section 4.3) make global routing a compliance problem, not just 
 - **Connector auth failure.** Detect: `CONNECTOR_AUTH_FAILED` spike. Distinguish expired
  refresh token (re-consent flow) from revoked grant (tenant action) from vendor outage
  (status page). Never auto-retry a revoked grant - it accelerates lockout.
-- **Cache stampede.** Detect: connector calls/s spike with flat QPS. Singleflight should
- prevent it; if it fires, the cause is usually synchronized TTL expiry. Apply jitter, then
- investigate why keys aligned.
+- **Cache stampede.** Detect: connector calls/s spike with flat QPS. **Singleflight is
+ specified here but not implemented** - `internal/freshness` releases its lock across the fetch
+ (`lock -> read -> unlock -> fetch -> lock -> write`), so every concurrent request for one cold
+ key misses and fetches independently. Amplification is `1 + (requests/s on one key x fetch
+ duration)`, so it is governed by burst shape, not by traffic volume: ~**1.1x at design scale**
+ (1k QPS spread over 10k principals), **4-11x when a single principal fires 3-10 parallel
+ queries** at a cold key, and worst on a fleet restart when every key is cold simultaneously. A
+ deliberate single-hot-key probe (all 500 req/s at one key, against a 200 ms-1 s source) measured
+ 112x - a magnifier for detection, not a production forecast; it fell to 2.9x at 100 keys and
+ vanished by 1,000. Invisible
+ against instant mocks, which is why it went unnoticed. Until singleflight exists the mitigations
+ are TTL jitter and per-connector concurrency caps; if it fires, the cause is usually
+ synchronized TTL expiry, so apply jitter and investigate why keys aligned.
 - **Off-boarding verification.** Run the attestation check: DEKs destroyed, KEK disabled,
  grants revoked, jobs cancelled, caches invalidated, audit tokens unmapped.
 

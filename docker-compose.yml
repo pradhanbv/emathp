@@ -13,7 +13,11 @@ services:
     profiles: ["mocks"]
     ports:
       - "8081:8081"
-    command: ["--rows", "2000", "--page-size", "500"]
+    # SF_LATENCY_* inject real-ish connector latency (assumption A4). Default 0
+    # keeps the quickstart instant; set them to measure latency/concurrency,
+    # where a ~1 ms mock makes L = lambda x W collapse to ~1 in flight.
+    command: ["--rows", "2000", "--page-size", "500",
+              "--latency-min", "${SF_LATENCY_MIN:-0}", "--latency-max", "${SF_LATENCY_MAX:-0}"]
 
   mockzd:
     build:
@@ -22,7 +26,8 @@ services:
     profiles: ["mocks"]
     ports:
       - "8082:8082"
-    command: ["--tickets", "50000"]
+    command: ["--tickets", "50000",
+              "--delay", "${ZD_LATENCY_MIN:-0}", "--latency-max", "${ZD_LATENCY_MAX:-0}"]
 
   gateway:
     build:

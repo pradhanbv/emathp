@@ -9,6 +9,7 @@ package mockzd
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -22,6 +23,7 @@ type Server struct {
 	pageSize  int
 	maxInList int
 	delay     time.Duration
+	delayMax  time.Duration // if > delay, each response sleeps uniformly in [delay, delayMax]
 	callCount atomic.Int64
 }
 
@@ -51,6 +53,16 @@ func Delay(d time.Duration) Option {
 	return func(s *Server) { s.delay = d }
 }
 
+// DelayJitter makes every response sleep a uniform random duration in
+// [min, max] - a stand-in for real connector latency (assumption A4:
+// p50 200-800 ms), so a cache miss costs what it would in production
+// instead of the ~1 ms an in-process mock answers in. Without it, latency
+// and concurrency measurements are meaningless: L = lambda x W collapses to
+// ~1 in-flight request no matter the load - mirrors mocksf.DelayJitter.
+func DelayJitter(min, max time.Duration) Option {
+	return func(s *Server) { s.delay, s.delayMax = min, max }
+}
+
 // New builds a mock with the given options. pageSize defaults large enough
 // that one semi-join chunk's matching tickets fit in a single page for any
 // fixture size this mock is meant to exercise - pagination itself is
@@ -76,7 +88,11 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	s.callCount.Add(1)
 
 	if s.delay > 0 {
-		time.Sleep(s.delay)
+		d := s.delay
+		if s.delayMax > s.delay {
+			d += time.Duration(rand.Int63n(int64(s.delayMax - s.delay)))
+		}
+		time.Sleep(d)
 	}
 
 	q := r.URL.Query()

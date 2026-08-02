@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"sync"
@@ -29,6 +30,7 @@ type Server struct {
 	hidden    map[string]bool // column -> field-level-security hides it
 	rateLimit int             // max calls before 429; 0 = unlimited
 	delay     time.Duration
+	delayMax  time.Duration // if > delay, each response sleeps uniformly in [delay, delayMax]
 	etag      string
 	callCount atomic.Int64
 
@@ -91,6 +93,16 @@ func Delay(d time.Duration) Option {
 	return func(s *Server) { s.delay = d }
 }
 
+// DelayJitter makes every response sleep a uniform random duration in
+// [min, max] - a stand-in for real connector latency (assumption A4:
+// p50 200-800 ms), so a cache miss costs what it would in production
+// instead of the ~1 ms an in-process mock answers in. Without it, latency
+// and concurrency measurements are meaningless: L = lambda x W collapses to
+// ~1 in-flight request no matter the load.
+func DelayJitter(min, max time.Duration) Option {
+	return func(s *Server) { s.delay, s.delayMax = min, max }
+}
+
 // New builds a mock with the given options. Use Start in tests, which
 // wraps this in an httptest.Server.
 func New(opts ...Option) *Server {
@@ -139,7 +151,11 @@ func (s *Server) handleTable(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	if s.delay > 0 {
-		time.Sleep(s.delay)
+		d := s.delay
+		if s.delayMax > s.delay {
+			d += time.Duration(rand.Int63n(int64(s.delayMax - s.delay)))
+		}
+		time.Sleep(d)
 	}
 
 	if s.rateLimit > 0 && s.callCount.Load() > int64(s.rateLimit) {

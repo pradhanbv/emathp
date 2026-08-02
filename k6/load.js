@@ -27,6 +27,28 @@ const PRINCIPALS = parseInt(__ENV.PRINCIPALS || '10', 10);
 const RATE = parseInt(__ENV.RATE || '500', 10);
 const DURATION = __ENV.DURATION || '60s';
 const VUS = parseInt(__ENV.VUS || '100', 10);
+// QUERIES models a realistic caller: a dashboard with several widgets, or one
+// cross-app join whose probe side chunks into several IN-list fetches. Each
+// variety is a distinct projection, so each is a distinct freshness-cache key
+// (the key is principal|table|columns|filters - internal/freshness.cacheKey),
+// multiplying live keys by QUERIES x PRINCIPALS. Column sets are drawn only
+// from id/name/email/external_id: region and status are over-projected onto
+// every fetch anyway (dana's RLS residual filters on region, the WHERE clause
+// on status), so varying those two would collide onto one key rather than
+// creating a new one - verified by hand before this list was written.
+const QUERIES = parseInt(__ENV.QUERIES || '1', 10);
+const PROJECTIONS = [
+	'id',
+	'name',
+	'id, name',
+	'email',
+	'id, email',
+	'name, email',
+	'id, name, email',
+	'external_id',
+	'id, external_id',
+	'id, name, external_id',
+];
 
 // constant-arrival-rate, not vus+duration: the brief asks to "reach ~500-1k
 // QPS for 60s", which is a target *rate*. vus+duration would instead run
@@ -66,9 +88,14 @@ export default function () {
 	// at ~1 ms responses, 500 req/s needs well under one concurrent VU, so
 	// __VU would be 1 or 2 forever and PRINCIPALS would silently collapse
 	// to one or two distinct cache keys no matter what it was set to.
-	const principal = exec.scenario.iterationInTest % PRINCIPALS;
+	const iter = exec.scenario.iterationInTest;
+	const principal = iter % PRINCIPALS;
+	// Rotate widgets on a different modulus than principals so every
+	// (principal, widget) pair is exercised rather than each principal
+	// being pinned to one widget.
+	const projection = PROJECTIONS[Math.floor(iter / PRINCIPALS) % Math.min(QUERIES, PROJECTIONS.length)];
 	const payload = JSON.stringify({
-		sql: `SELECT id FROM sf.accounts WHERE status = 'open-${principal}'`,
+		sql: `SELECT ${projection} FROM sf.accounts WHERE status = 'open-${principal}'`,
 		max_staleness: '30s',
 	});
 

@@ -1,6 +1,6 @@
 # Universal SQL Across Enterprise Apps — Design
 
-**Status:** Proposed | **Scenario:** Salesforce (accounts) ⋈ Zendesk (tickets) | **Read time:** ~25 min
+**Status:** Proposed | **Scenario:** Salesforce (accounts) ⋈ Zendesk (tickets) | **Read time:** ~35 min
 
 > Condensed from [`DESIGN_FULL.md`](./DESIGN_FULL.md), which is canonical — worked derivations,
 > full rejected-alternative reasoning, and all 16 diagrams live there. This doc carries every
@@ -304,6 +304,23 @@ is a privilege-escalation vector.**
 | Fleet saving | ~2–3×, not an order of magnitude | Cuts connector quota spend directly |
 | Why it really exists | Correctness (policy-version isolation), not just latency | Quota, not latency |
 
+**The result cache has no eviction policy, and the sizing assumes one.** [§6.2](#62-derived-sizing)
+sizes it as `arrival × TTL × bytes`, but as built `freshness.Cache` is a plain map — no `delete`,
+no LRU, no size cap — and expired entries are *deliberately* retained so their ETag can drive a
+cheap 304. So TTL bounds staleness, not memory: resident set grows with every distinct key the
+process has seen, and per-principal keying makes that cardinality large. Whatever policy lands
+must evict the rows but keep the ETag; dropping both trades memory for connector quota, which is
+the scarcer resource.
+
+**`sql_shape_hash` is an obligation, not just a hash.** Because the shape deliberately normalizes
+literals away — so `status='open'` and `status='closed'` share one cached plan — the plan itself
+must carry a `$param.N` slot rather than the literal, re-extracted per request
+(`plan.ExtractParams`) and bound at execution (`exec.resolveValue`), exactly as
+`$principal.<attr>` residuals already were. Baking the literal into the plan is a silent
+correctness bug: it appears only on the *second* request of a shape, only under cache pressure,
+and it was invisible to the whole test suite until a load run varied a `WHERE` value. Pinned by
+`TestPlanCacheHitsOnSameShapeDifferentValue`.
+
 ### ADR-004 — Connector strategy: build vs. buy
 
 - 1,000s of app types **cannot** be hand-built in six months; schema drift alone would consume the team.
@@ -473,23 +490,60 @@ Weighted mean **W ≈ 245 ms** → by **Little's Law** (`L = λ × W`):
 > **Scope: gateway pod fleet only — tiers 0–1.** Tiers 2–3 are provisioned per escalated job,
 > outside this fleet; nothing here bounds their footprint.
 
+**Two sizing exercises, different inputs — kept apart on purpose.** Memory in this system is not
+one quantity. *Transient* memory is held by requests currently executing and scales with
+**concurrency × working set**; *resident* memory is held by the cache between requests and scales
+with **key cardinality × TTL × object size**. They respond to different things: double the traffic
+and the transient half doubles while the resident half does not move at all — it only moves if
+distinct keys or TTL change. Sizing them in one column is how a fleet ends up provisioned against
+the wrong variable.
+
+**Fleet and throughput (not memory):**
+
 | Resource | Derivation | Size |
 |---|---|---|
-| **Gateway pods** | I/O-bound Go, ~100 QPS/pod at 4 vCPU; memory derived below | **20–24 pods**, 3 AZs, N+1 per AZ |
-| **Planner sidecars** | Only misses reach it: 10% × 1,000 = 100 plans/s; Calcite ~25 ms → L = 2.5 | **4–6 pods** — floored by HA, not load. Uncached would be ~10–12; the cache saves ~2–3×, **not** an order of magnitude |
+| **Gateway pods** | I/O-bound Go, ~100 QPS/pod at 4 vCPU; memory derived in 6.3 | **20–24 pods**, 3 AZs, N+1 per AZ |
+| **Planner sidecars** | Only plan-cache misses reach it: **10%** × 1,000 = 100 plans/s; Calcite ~25 ms → L = 2.5. Deliberately pessimistic — [§6.4](#64-the-sensitivity-that-actually-matters) targets ≥95% hit, which would give 50 plans/s; the count is floored by HA either way | **4–6 pods** — floored by HA, not load. Uncached would be ~10–12; the cache saves ~2–3×, **not** an order of magnitude |
 | **Connector concurrency** | 0.55×1000 + 0.15×2×1000 + ~10% probes ≈ **935 calls/s**; at p95 0.8 s → L = 748 | **~750 concurrent outbound**, per-connector semaphore |
-| **Materialization memory** (tiers 0–1) | 150 QPS × 0.6 s = 90 concurrent × 256 MB | **~23 GB fleet-wide**; capped 8 joins/pod (2 GB) |
-| **Result/freshness cache** | 700 misses/s × 60 s window = 21k–42k live entries × 100–200 KB | **~2–8 GB fleet-wide** (a range, not a point estimate) |
 | **Redis** | Lease reconciliation, not per-request: 24 pods × 20 buckets × 1 Hz | **~500 ops/s** — single 3-node cluster, vastly under-utilized |
 | **Network** | 100 MB/s egress ≈ 800 Mbps + comparable ingest | Budget **2 Gbps** sustained |
 
-**Two memory pools, not one.** For a cache-miss join the same rows briefly exist in both, so they
-are **additive: ~25–31 GB combined.**
+**Transient memory — `Σ (in-flight per class × working set per class)`.** In-flight counts come
+from Little's Law on [§6.1](#61-baseline)'s mix; working set is what one executing request holds:
 
-| | Materialization (23 GB) | Result cache (2–8 GB) |
+| Class | In flight (`L = λW`) | Working set each | Total |
+|---|---|---|---|
+| Result-cache hit | 300 × 0.020 = **6** | ~0 — served from the resident copy, nothing new held | ~0 |
+| Single-source miss | 550 × 0.270 = **148** | ~200 KB of fetched rows | **~30 MB** |
+| Cross-app join | 150 × 0.600 = **90** | **256 MB** (DuckDB `memory_limit`) | **~23 GB** |
+| | **245 in flight** | | **~23 GB** |
+
+⚠️ **74% of all memory rests on that 256 MB**, which is DuckDB's configured *cap* used as if it
+were the *mean*. It is unmeasured — see [§6.4](#64-the-sensitivity-that-actually-matters).
+
+**Resident memory — `live entries × bytes/entry`.** Live entries is where the model and the
+implementation currently disagree:
+
+| Term | Intended | Actual |
+|---|---|---|
+| Live entries | `700 misses/s × 60 s TTL` = **21k–42k** | **Every distinct key the process has ever seen.** `freshness.Cache` is a plain map — no `delete`, no LRU, no size cap. Expired entries are retained *deliberately*, so their ETag can drive a cheap 304 revalidation |
+| Bytes/entry | 100–200 KB (pre-mask, pre-trim rows) | **Untested** — the load script's query matches no rows, so measured entries are ~2 bytes |
+| **Total** | **~2–8 GB fleet-wide** | **A floor, not a bound** |
+
+⚠️ **The TTL term does no work without eviction.** As built, resident memory grows monotonically
+with distinct keys for the process lifetime, and per-principal keying ([ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement))
+makes that cardinality large. An eviction policy is required before the 2–8 GB figure means
+anything — and it must preserve the ETag of what it evicts, or it silently converts free 304s
+into full refetches and spends connector quota to save memory.
+
+**The two are additive, not alternatives.** For a cache-miss join the same rows briefly exist in
+both pools: **~25–31 GB combined**.
+
+| | Transient (23 GB) | Resident (2–8 GB) |
 |---|---|---|
 | Holds | Working memory for an *active* join — both sides plus hash intermediates | Past fetch results for a *future* request |
-| Lifecycle | Torn down after ~0.6 s | Lives until `max_staleness` (~60 s) |
+| Lifecycle | Torn down after ~0.6 s | Until evicted — **today, never** |
+| Scales with | Concurrency (request rate × duration) | Key cardinality × TTL |
 | Applies to | Only the 15% join share | All traffic |
 | Purpose | Compute a result | Avoid re-doing work |
 
@@ -501,14 +555,19 @@ are **additive: ~25–31 GB combined.**
 3. Pods for QPS: 1,000 / 100 = **10**.
 4. **Binding constraint: max(12, 10) = 12** — join concurrency, not QPS. Both sit under the 20–24
    range, so the headline doesn't change; *which constraint binds* does.
-5. Peak live heap: 2 GB + ~0.4 GB (cache slice) + ~0.1 GB (stacks, pools) ≈ **2.5 GB**.
+5. Peak live heap ≈ **2.5 GB**, and the terms scale independently:
+   **2 GB transient** (K × 256 MB — moves with traffic) + **~0.4 GB resident** (this pod's slice
+   of the cache — moves with key cardinality, and is unbounded until eviction exists) +
+   **~0.1 GB** stacks and connection pools.
 6. GC headroom (`GOGC=100` wants ~2× live heap): **5 GB**.
 7. Container/OS/sidecar overhead ~15%: **5.75 GB derived minimum**.
 8. Target 72% utilization (28% headroom, applied up front): 5.75 ÷ 0.72 ≈ **8 GB**.
 
 **8 GB is an output of this chain, not an assertion checked after the fact.** Steps 5–6 are the
 planning assumptions worth re-verifying with real data; step 8's headroom target is the only
-genuinely arbitrary choice, and is labelled as one.
+genuinely arbitrary choice, and is labelled as one. **Note which term binds:** the pod is sized by
+*transient* join memory, so the 8 GB survives a hit-ratio collapse — but it does *not* survive
+unbounded cache growth, because step 5's 0.4 GB has no ceiling as built.
 
 ### 6.4 The sensitivity that actually matters
 
@@ -523,7 +582,29 @@ degrades as users-per-tenant grows.
 
 **Concurrency is tolerant — it moves 30%. Connector call volume is not**, and connector quota is a
 hard external ceiling we cannot autoscale past. At 10%, the binding constraint stops being our
-fleet and becomes vendor rate limits. **The single most important number to measure in M2.**
+fleet and becomes vendor rate limits.
+
+**Its blast radius is narrower than "it sets `W`, which sets `L`" suggests**, and the distinction
+decides what to measure first:
+
+| Moves materially with hit ratio | Barely moves |
+|---|---|
+| [§6.2](#62-derived-sizing) **connector concurrency** — the `0.55 × 1000` term *is* the non-cache-hit single-source share | [§6.2](#62-derived-sizing) **planner sidecars** — sized by the *plan* cache's ~90% hit, a different cache and a different number |
+| [§6.2](#62-derived-sizing) **resident cache memory** — misses × TTL × bytes/entry | [§6.3](#63-gateway-pod-size--worked-backwards-not-asserted) **pod size** — the cache slice is 0.4 GB of a 2.5 GB peak heap; join working set is 2 GB. Drive hit ratio to zero and the 8 GB pod stands |
+| [§10.4](#104-cost-guardrails) **cost levers** (#1) and [§12.5](#125-budget) **budget** — egress and vendor calls both scale with miss rate | [§6.1](#61-baseline) **concurrency `L`** — moves ~30% across the whole range above, which the fleet absorbs |
+| [§12.4](#124-risk-register) top risk · [§12.3](#123-milestones) M2 gate · [§13](#13-decisions-we-are-least-confident-about) least-confident #2 | |
+| [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement) is the **cause**; [ADR-005](#adr-005--freshness-watermark-capability-ladder)'s tenant snapshots are the **fallback** | |
+
+**Two unknowns, biggest in different ways — and the order to measure them follows from that.**
+Hit ratio is the most *consequential*: it drives connector calls into a ceiling we can neither
+autoscale nor buy past, so being wrong breaks the product at scale. [§6.2](#62-derived-sizing)'s
+~23 GB is the largest by *magnitude*: `90 joins × 256 MB`, where 256 MB is DuckDB's `memory_limit`
+— a cap used as the mean, 74% of total memory, entirely unmeasured. If joins average 25 MB the
+fleet is oversized ~2.5×; at the cap, sizing is right with no headroom — a **~10× swing against
+hit ratio's ~40%**. But memory is purchasable and quota is not, and the current harness cannot
+measure joins anyway (instant mocks never reach realistic concurrency; the load query runs none).
+**Measure hit ratio first because being wrong is worse; join working set next because being wrong
+is bigger.**
 
 **A percentile trap worth stating.** At 90% plan-cache hit ratio, *the miss population is the P95* —
 the 95th-percentile request is by definition a miss, so planner latency lands in the SLO
@@ -533,9 +614,8 @@ targets set against mean latency will silently fail a percentile SLO.**
 ### 6.5 Autoscaling, backpressure, overload
 
 **Scaling signal: concurrency, not CPU.** HPA tracks in-flight requests per pod. The workload is
-I/O-bound — pods spend most of a request blocked on a connector response with idle CPU — so CPU
-utilization stays low right up until the pod is saturated with waiting work. Scaling on it would
-under-provision badly and react late.
+I/O-bound, so CPU stays low right up until a pod is saturated with waiting work — scaling on it
+would under-provision badly and react late.
 
 **Why the two thresholds are asymmetric:**
 
@@ -556,15 +636,11 @@ Each stage absorbs what it can and pushes the remainder back one step:
 | 3 | **Admission control** | Queue depth passes its bound | Stops accepting new work rather than letting the queue grow without limit |
 | 4 | **Client** | — | `429 RATE_LIMIT_EXHAUSTED` + `Retry-After` + the `Prefer: respond-async` option |
 
-**Why bound the queue at all, rather than just letting it grow?** An unbounded queue converts a
-fast rejection into a slow failure: the request waits, the caller's deadline expires anyway, and
-whatever connector quota was spent on it is wasted. A `429` at second zero is strictly better than
-a `SOURCE_TIMEOUT` at second thirty — same outcome for the caller, none of the wasted quota.
-
-**Overload sheds the newest low-priority work first.** A request already partway through has
-*already spent* connector quota; killing it wastes that quota and returns nothing for it. Shedding
-the newest arrivals preserves the work closest to completing — the opposite of the intuitive
-"drop the oldest, it's been waiting longest" rule, which here would maximize wasted quota.
+**Both bounds exist to protect spent quota.** An unbounded queue turns a fast rejection into a
+slow failure — the caller's deadline expires anyway and the quota spent is wasted, so a `429` at
+second zero beats a `SOURCE_TIMEOUT` at second thirty. For the same reason overload sheds the
+**newest** work first: a request already in flight has already spent quota, so killing it wastes
+that quota and returns nothing — the opposite of the intuitive "drop the oldest" rule.
 
 ---
 
@@ -663,7 +739,7 @@ residency tags make global routing a *compliance* problem, not just a traffic pr
 |---|---|---|
 | **Rate-limit flood** | `rate_limit_rejections` spike on one connector | Identify tenant via per-tenant counters → reduce that lease slice → escalate to vendor if the budget itself is wrong |
 | **Connector auth failure** | `CONNECTOR_AUTH_FAILED` spike | Distinguish expired refresh (re-consent) / revoked grant (tenant action) / vendor outage. **Never auto-retry a revoked grant** — it accelerates lockout |
-| **Cache stampede** | Connector calls/s spikes with flat QPS | Singleflight should prevent it; if it fires the cause is usually synchronized TTL expiry → jitter, then find why keys aligned |
+| **Cache stampede** | Connector calls/s spikes with flat QPS | **Singleflight is specified but not implemented** — the cache releases its lock across the fetch, so every concurrent request for one cold key misses and fetches. Amplification is `1 + (requests/s on one key × fetch duration)`: ~**1.1× at design scale** (1k QPS over 10k principals), but **4–11× when one principal bursts** several parallel queries at a cold key, and worst on a fleet restart when every key is cold at once. A single-hot-key probe measured 112× (README) — a magnifier, not a forecast. Until it is built, the mitigations are TTL jitter and per-connector concurrency caps |
 | **Off-boarding verification** | Scheduled attestation | DEKs destroyed · KEK disabled · grants revoked · jobs cancelled · caches invalidated · audit tokens unmapped |
 
 ### 10.4 Cost guardrails
@@ -805,20 +881,20 @@ a capacity problem simultaneously.
 
 ## 14. Rejected alternatives, by decision
 
-What each ADR turned down, and why in one line. Full steelman cases for every option — including
-ones argued at length before being dropped — are in
-[`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md).
+What each ADR turned down. The **steelman case for every option** — why it was credible, what
+it would have cost, and what would revive it — is [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md),
+which exists for exactly this and covers it at four times the depth.
 
-| ADR | Rejected | Why not |
-|---|---|---|
-| [**001** Planner](#adr-001--planner-runtime-proposed) | • Trino<br>• DataFusion<br>• Steampipe/FDW<br>• Go-native parser<br>• GraalVM-native Calcite<br>• Spark | Trino on connector model + credential scoping; **DataFusion is the closest runner-up, rejected on team capability, not merit**; Steampipe/FDW has no policy-injection hook; a hand-rolled Go parser re-implements a solved problem; GraalVM-native Calcite is immature for this surface; Spark is a batch scheduler, never a candidate at a 500 ms P50 |
-| [**002** Entitlements](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement) | • Post-filter in Go<br>• Inject into compiled Substrait<br>• OPA as a blob store<br>• Zanzibar / OpenFGA<br>• Cedar | Post-filtering means rows leave the source before being discarded — the leak *plus* wasted quota; Substrait uses positional field refs, so rewriting a compiled plan fails silently under column reordering; OPA-as-blob-store wastes OPA (the planner would re-implement Rego); Zanzibar is better for *mirroring* permission graphs, but A1 means nothing needs mirroring — **revisit hard if A1 breaks**; Cedar is conceptually right (residual-to-SQL is its own motivating example) but both partial evaluators sit behind experimental flags |
-| [**003** Caching](#adr-003--caching-plan-cache--result-cache) | • Plan cache: none<br>• Plan cache: key on SQL text alone<br>• Plan cache: key on `(sql, user)`<br>• Result cache: per-pod only, no shared tier<br>• Result cache: sticky routing instead of a shared store | No cache re-plans every request *and* loses the correctness property; keying on SQL text alone lets a plan built under one policy version serve another — **the privilege-escalation vector**; keying on `(sql, user)` fixes that but destroys hit ratio; per-pod-only means N pods do N duplicate fetches of the same rows; sticky routing needs intelligent query routing no ADR designs, and rebalances badly on scale events |
-| [**004** Build vs buy](#adr-004--connector-strategy-build-vs-buy) | • Build all<br>• Buy all (Merge / Nango / Airbyte) | 1,000 connectors against unversioned vendor APIs is not a six-month program — schema drift alone would consume the team; buying all normalizes away per-field pushdown and per-user delegated auth, the two things the SLO and [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement) depend on |
-| [**005** Freshness](#adr-005--freshness-watermark-capability-ladder) | • Centralized CDC / data lake<br>• `SELECT MAX(updated_at)` probes | A cross-tenant lake violates on-demand federated execution and complicates crypto-shredding — *per-tenant* bounded snapshots survive as the quota-hostile-connector escape hatch; `MAX(updated_at)` assumes SaaS REST APIs accept SQL (they don't) and is **blind to hard deletes**, so a deleted record stays cached indefinitely |
-| [**006** Rate limits](#adr-006--rate-limiting-and-multi-tenant-fairness) | • In-memory per-pod buckets<br>• Redis on every decision<br>• Envoy ratelimit service | Per-pod buckets make the effective limit N × configured under autoscaling — the failure mode is the connector **banning our API key**, a cross-tenant outage; Redis on every decision adds an RTT to every request and creates shared fate; Envoy is solid but doesn't model per-connector budgets shared across sync *and* async paths |
-| [**007** Joins](#adr-007--join-strategy-a-four-tier-escalation-ladder) | • Naive dual full fetch<br>• Container-per-join DuckDB<br>• Always-on shared ClickHouse<br>• Spark-only from day one<br>• Disk spill in tiers 0–1<br>• Native same-source join pushdown (SOQL subqueries) | Dual full fetch is 505 calls vs. 17 on our fixture, and only competitive at poor selectivity where the semi-join loses too; container-per-join cold start alone can eat the 1.5 s budget; an always-on shared ClickHouse recreates the noisy-neighbour problem and idles between jobs; Spark-only pays distributed-shuffle overhead for jobs that are mostly "pod-ceiling-plus-a-bit"; disk spill inside the SLO trades a fast failure for a slow one; SOQL subqueries are real unexploited capability, rejected because the SDK contract would carry a second per-connector notion of "which join shapes push down" for 1,000s of apps that mostly have no equivalent |
-| [**008** Tenant lifecycle](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api) | • `terraform apply` per tenant onboard/offboard | Doesn't scale to hundreds of customers; makes off-boarding latency a function of a plan/apply cycle; **crypto-shredding cannot be gated on Terraform state** |
-| [**009** Streaming](#adr-009--streaming-timeouts-partial-results) | • Chunked transfer + status code<br>• HTTP trailers | Once bytes are on the wire the status is committed, so a mid-stream `SOURCE_TIMEOUT` can't surface as an error status; trailers solve it on paper but are inconsistently supported by intermediaries |
-| [**010** Crypto-shred](#adr-010--keys-crypto-shredding-and-the-audit-conflict) | • "Instantly destroy the KMS key"<br>• Shred the audit trail under the tenant key | KMS enforces a 7–30 day destruction window — instant destruction isn't an API that exists; shredding audit under the tenant key destroys the very record proving we handled that tenant's data correctly, which is the obligation that must *survive* off-boarding |
-| [**011** Identity](#adr-011--identity-tenant-derivation-attribute-resolution) | • Trust `tenant_id` / `roles` from token claims<br>• Direct federation<br>• mTLS / client certificates | Trusting claims makes `tenant_id` forgeable by any IdP admin — **a cross-tenant read**; direct federation is viable and simpler (**kept as the fallback** for tenants who require it) but pushes per-IdP claim quirks into OPA, the planner, and audit forever; mTLS has wrong ergonomics for end users and carries no attributes |
+| ADR | Rejected |
+|---|---|
+| [**001** Planner](#adr-001--planner-runtime-proposed)| • Trino<br>• DataFusion<br>• Steampipe/FDW<br>• Go-native parser<br>• GraalVM-native Calcite<br>• Spark |
+| [**002** Entitlements](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)| • Post-filter in Go<br>• Inject into compiled Substrait<br>• OPA as a blob store<br>• Zanzibar / OpenFGA<br>• Cedar |
+| [**003** Caching](#adr-003--caching-plan-cache--result-cache)| • Plan cache: none<br>• Plan cache: key on SQL text alone<br>• Plan cache: key on `(sql, user)`<br>• Result cache: per-pod only, no shared tier<br>• Result cache: sticky routing instead of a shared store |
+| [**004** Build vs buy](#adr-004--connector-strategy-build-vs-buy)| • Build all<br>• Buy all (Merge / Nango / Airbyte) |
+| [**005** Freshness](#adr-005--freshness-watermark-capability-ladder)| • Centralized CDC / data lake<br>• `SELECT MAX(updated_at)` probes |
+| [**006** Rate limits](#adr-006--rate-limiting-and-multi-tenant-fairness)| • In-memory per-pod buckets<br>• Redis on every decision<br>• Envoy ratelimit service |
+| [**007** Joins](#adr-007--join-strategy-a-four-tier-escalation-ladder)| • Naive dual full fetch<br>• Container-per-join DuckDB<br>• Always-on shared ClickHouse<br>• Spark-only from day one<br>• Disk spill in tiers 0–1<br>• Native same-source join pushdown (SOQL subqueries) |
+| [**008** Tenant lifecycle](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api)| • `terraform apply` per tenant onboard/offboard |
+| [**009** Streaming](#adr-009--streaming-timeouts-partial-results)| • Chunked transfer + status code<br>• HTTP trailers |
+| [**010** Crypto-shred](#adr-010--keys-crypto-shredding-and-the-audit-conflict)| • "Instantly destroy the KMS key"<br>• Shred the audit trail under the tenant key |
+| [**011** Identity](#adr-011--identity-tenant-derivation-attribute-resolution)| • Trust `tenant_id` / `roles` from token claims<br>• Direct federation<br>• mTLS / client certificates |

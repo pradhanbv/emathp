@@ -5,11 +5,11 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 
 | Doc | For | Read time |
 |---|---|---|
-| **This file** | Orientation, quickstart, what's proven and what isn't | ~7 min |
-| [`DESIGN.md`](./DESIGN.md) | All 11 ADRs, both capability ladders, capacity math, six-month plan | ~25 min |
+| **This file** | Orientation, quickstart, what's proven and what isn't | **~10 min**, + an ~11 min command appendix you run rather than read |
+| [`DESIGN.md`](./DESIGN.md) | All 11 ADRs, both capability ladders, capacity math, six-month plan | ~35 min |
 | [`DESIGN_FULL.md`](./DESIGN_FULL.md) | Canonical — worked derivations, full rejection reasoning, 16 diagrams | ~90 min |
-| [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md) | Every option considered and turned down, with its steelman | ~15 min |
-| [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) | The TDD build log, cycle by cycle | ~20 min |
+| [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md) | Every option considered and turned down, with its steelman | ~10 min |
+| [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) | The TDD build log, cycle by cycle | ~15 min |
 
 ---
 
@@ -107,48 +107,55 @@ See [Afterthought: connector authoring is the real bottleneck](#afterthought-con
 
 ---
 
-## Measured: the number the design is least sure about
+## Measured: cache locality under real connector latency
 
-Per-principal cache hit ratio is *"the single most consequential unknown"* in the design.
-Per-user delegated tokens make entitlements correct essentially for free, but force per-principal
-cache keys and collapse locality. **The capacity model assumes 30%.** The k6 script is
-parameterized by distinct principal count, so this is measured rather than assumed — every row
-below is **500 req/s for 60 s (30,001 requests), 0 failures**, gateway restarted between runs so
-a warm cache can't inflate the next:
+Per-user delegated tokens make entitlements correct essentially for free, but force
+per-principal cache keys and collapse locality. The k6 script is parameterized by distinct
+principal count and by **queries per user** — 10 widgets each, the shape of a dashboard or of a
+join whose probe side chunks into several `IN`-list fetches. The mocks inject **200 ms–1 s** of
+latency so a cache miss costs what a real connector round trip costs (assumption A4) rather than
+the ~1 ms an in-process mock answers in:
 
 ```bash
-docker compose --profile testing run --rm -e PRINCIPALS=100 k6   # then 1000, then 10000
+SF_LATENCY_MIN=200ms SF_LATENCY_MAX=1s docker compose --profile core --profile mocks up -d
+docker compose --profile testing run --rm -e PRINCIPALS=10 -e QUERIES=10 k6   # then 100, then 1000
 ```
 
-| Distinct principals | `result_cache_hit_ratio` | Connector calls (of 30,001) | p95 |
-|---|---|---|---|
-| 1 | 99.99% | 3 | 398 µs |
-| 100 | 99.33% | 200 | 420 µs |
-| 1,000 | 93.33% | 2,000 | 491 µs |
-| **10,000** | **33.33%** | **20,000** | **713 µs** |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./docs/hit-ratio-dark.svg">
+  <img alt="Two stacked charts sharing an x-axis of distinct cache keys (100, 1,000, 10,000). Top: result cache hit ratio falls from 98.00% to 34.16%. Bottom: p95 latency rises with it from about 1 ms to 941 ms, stepping up once the miss rate passes 5%." src="./docs/hit-ratio-light.svg" width="720">
+</picture>
 
-- **Connector calls track distinct principals exactly** — `principals × 2` in every row: each
-  principal misses once on first fetch, once more when its 30 s `max_staleness` expires midway
-  through the 60 s run.
-- **Cross-checked three ways** — k6's client-side `meta.cache_hit`, the gateway's
-  `result_cache_requests_total{outcome}`, and `connector_request_duration_seconds_count`. All
-  three agree exactly on the 10,000-principal run (10,001 hits / 20,000 misses / 20,000 calls).
-- **What it means:** hit ratio holds well past the model's 30% assumption — *but only while
-  principal count stays small relative to request volume.* At 10,000 principals it falls to 33%,
-  and p95 rises in step, because a miss is a real connector call. At 10M users principal count
-  dominates request volume by orders of magnitude, so **connector quota — not our fleet — becomes
-  the binding constraint**, and quota can't be autoscaled past.
-- **Latency caveat:** sub-millisecond p95 against in-process mocks says nothing about the 1.5 s
-  SLO, which real SaaS latency dominates. The p95 column is good for its *shape* (it moves with
-  miss rate), not its magnitude.
+| Users | Distinct keys | `result_cache_hit_ratio` | Cache misses | *ideal* | p95 | In flight (`L=λW`) |
+|---|---|---|---|---|---|---|
+| 10 | 100 | 98.00% | 597 | *200* | 1 ms | 6 |
+| 100 | 1,000 | 93.28% | 2,000 | *2,000* | **403 ms** | 20 |
+| **1,000** | **10,000** | **34.16%** | **19,269** | *20,000* | **941 ms** | **198** |
 
-**A real bug, found while building this table.** Two requests sharing a cached plan (same SQL
-shape, different `WHERE` literal) were silently serving whichever literal built the plan — the
-plan cache's own hit-ratio pressure triggered it on any two same-shaped, differently-valued
-queries. `$principal.<attr>` values were already resolved lazily per call; ordinary literals were
-not, until this table required varying one. Fixed, and pinned by
-`TestPlanCacheHitsOnSameShapeDifferentValue` (`internal/plancache`), which asserts a cache hit
-must not reuse the first query's literal value.
+<sub>10 queries per user, 500 req/s for 60 s, cold cache each run, `max_staleness` 30 s, sources
+delayed 200 ms–1 s. *Ideal* = `keys × ⌈duration/TTL⌉`, the fetches a perfect cache would make.
+Request totals fall short of 30,001 as k6 sheds iterations under load (91 → 732).</sub>
+
+### What the run establishes
+
+| Finding | Evidence | Consequence |
+|---|---|---|
+| **Distinct keys is the variable — not users, not query shape** | 10 users × 10 widgets (100 keys) matched 100 users × 1 query to within 0.1 pp and 4 ms across every column | Cache locality is governed by `keys vs. requests × TTL window`. A dashboard multiplying widgets per user costs exactly what the same number of extra users would — which is why [ADR-002](./DESIGN.md#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)'s per-principal keying is the lever, and why query variety compounds it |
+| **p95 tracks miss rate** | 1 ms → 403 ms → **941 ms**, a ~900× swing | Only visible against a realistic connector. Against instant mocks a miss costs microseconds, so latency cannot move with miss rate at all — **any latency claim measured against fast mocks is untestable, not confirmed** |
+| **It is a step, not a slope** — the percentile trap, live | p95 is a *cache hit* at 98.00% (2.0% miss) and a *cache miss* at 93.28% (6.7% miss) | Exactly what [§6.4](./DESIGN.md#64-the-sensitivity-that-actually-matters) predicts: once miss rate passes 5%, the 95th-percentile request *is* a miss. Latency does not degrade gracefully — it steps |
+| **Concurrency scales with misses** | 6 → 20 → **198** in flight (`L = λW`, from measured mean latency) | A 33× swing in in-flight work from cache behaviour alone. This is the mechanism [§6.1](./DESIGN.md#61-baseline)'s capacity model rests on, and the load generator began shedding iterations (21 → 800) as it bit |
+| **A cold key gets fetched many times over, not once** | At 100 keys the run made **597** fetches where a perfect cache needs **200** — **3.0×**. By 1,000 keys it is 1.0× and gone. Amplification is `1 + (requests/s on one key × fetch duration)`, so it tracks burst shape, not traffic volume | The cache releases its lock across the fetch — `read → unlock → **fetch** → write` — so every request arriving in that up-to-1 s window also misses and fetches independently. This is a **cache stampede**, and [§10.3](./DESIGN.md#10-deployment-and-operations)'s runbook says *"singleflight should prevent it"* — but **no singleflight exists in the code**. **At design scale it is nearly harmless** (1k QPS across 10k principals ≈ 0.1 req/s per key ≈ **1.1×**); it bites on *bursts against a cold key* — a page load firing 3–10 parallel queries (4–11×), a retry storm, or a fleet restart where every principal's first burst multiplies at once |
+| **Found a real correctness bug** — *fixed* | Same SQL shape + different `WHERE` literal served whichever literal built the cached plan | Plan now carries `$param.N`, bound per request. **36 passing tests missed it**; pinned by `TestPlanCacheHitsOnSameShapeDifferentValue` |
+
+### What the run does not cover
+
+| Not covered | Why | Consequence |
+|---|---|---|
+| **Hit ratio itself is arithmetic** | `hit = 1 − (N × ⌈D/T⌉) / R` predicts the ratio exactly wherever the fetch window is narrow relative to per-key spacing (N ≥ 1,000 here) | The *ratio* is a tautology of TTL and key cardinality — a formula gets it for free. What the run adds is everything the formula cannot predict: latency, concurrency, and the stampede |
+| **What the cache costs** | The load query (`status = 'open-<principal>'`) matches no row, so every entry caches **0 rows / 2 bytes** — a query hitting real data returns ~26 KB. Distinct keys are manufactured by the literal, which is what makes the cardinality sweep work at all | The run exercises lookup bookkeeping — key construction, hit/miss accounting, TTL expiry, revalidation — but never entry **size**. So §6.2's *100–200 KB per entry* (and the 2–8 GB range built on it), assumption **A2**'s ~100 KB payload, serialization and GC pressure, and egress — [§12.5](./DESIGN.md#125-budget)'s dominant budget line — are all untested here |
+| **The plan cache** | `meta.cache_hit` is the **result/freshness** cache | The plan cache is a separate ~90% number, and it sizes planner sidecars in [§6.2](./DESIGN.md#62-derived-sizing) |
+| **Memory** | Working set dominates: **23 GB** materialization vs **2–8 GB** cache; **2 GB of a 2.5 GB** per-pod heap | Pod size follows join concurrency and DuckDB's `memory_limit`. Drive hit ratio to zero and the 8 GB pod stands |
+| **256 MB of working set per join** — *the larger unknown* | DuckDB's **cap** used as the **mean**; 74% of total memory, ~10× sensitivity vs hit ratio's ~40% | Still unmeasured. The latency flags added for this run are half of what it needs; the rest is a joins-only workload and a real `materialization_memory_bytes` |
 
 ---
 
@@ -267,7 +274,7 @@ scroll up if you jumped straight to this section.
 
 ### Recreate: async reroute
 
-`Prefer: respond-async` (previously only provable by reading `TestAsyncReroute`). It doesn't
+`Prefer: respond-async`, which `TestAsyncReroute` also proves in-process. It doesn't
 require actually exhausting a connector's budget first - the header reroutes to the in-memory job
 queue on request, the same path a client would fall back to after a `429 RATE_LIMIT_EXHAUSTED`
 (see the next section for that path itself).

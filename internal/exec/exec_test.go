@@ -112,7 +112,7 @@ func enforcedRegionCatalog(t *testing.T) *catalog.Catalog {
 type queryResult struct {
 	Code           int
 	Columns        []string
-	Rows           []map[string]string
+	Rows           [][]string
 	ErrorCode      string
 	FetchedColumns []string
 }
@@ -173,7 +173,8 @@ func defaultCatalog(t *testing.T) *catalog.Catalog {
 func TestCLSMaskApplied(t *testing.T) {
 	res := runQuery(t, "support", "SELECT email FROM sf.accounts", defaultCatalog(t), newFakeSource(defaultRows()))
 
-	require.Equal(t, sha256hex("dana@acme-corp.example"), res.Rows[0]["email"])
+	require.Equal(t, []string{"email"}, res.Columns)
+	require.Equal(t, sha256hex("dana@acme-corp.example"), res.Rows[0][0])
 }
 
 // TestResidualColumnStripped: region is fetched to satisfy the local RLS

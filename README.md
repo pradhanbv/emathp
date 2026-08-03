@@ -18,7 +18,7 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 
 ```bash
 docker compose --profile core --profile mocks up -d --build   # gateway + 2 mock SaaS sources
-go test ./...                                                 # 36 tests, ~1s
+go test ./...                                                 # 39 tests, ~1s
 docker compose --profile testing run --rm k6                  # load test: 500 req/s for 60s
 
 docker compose --profile "*" down                             # tear down — see note below

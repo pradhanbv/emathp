@@ -70,7 +70,22 @@ func (f *Filter) Children() []Node { return []Node{f.Child} }
 type ProjectCol struct {
 	Name string
 	Mask *string
+	// Side is which join input this column came from - JoinLeft or
+	// JoinRight - and is empty for a single-table plan. A join merges both
+	// sides' rows into one map, so a column name present on both (mocksf
+	// and mockzd both expose "id") would otherwise resolve to whichever
+	// side was written last. The alias is known at plan time
+	// (projectionQualified requires one for any joined query); Side is how
+	// it survives to projection instead of being discarded there.
+	Side string
 }
+
+// Join sides, used as ProjectCol.Side and as the namespace prefix exec
+// applies when merging join rows.
+const (
+	JoinLeft  = "L"
+	JoinRight = "R"
+)
 
 type Project struct {
 	Child Node

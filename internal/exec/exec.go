@@ -20,7 +20,7 @@ import (
 
 type Result struct {
 	Columns []string
-	Rows    []map[string]string
+	Rows    [][]string
 	Debug   Debug
 
 	// JoinStrategy and NaiveCallEstimate are set only when the plan had a
@@ -320,18 +320,32 @@ func hashJoin(build, probe []connector.Row, on plan.Equi) []connector.Row {
 	for _, pr := range probe {
 		k := pr[on.RightCol]
 		for _, br := range byKey[k] {
+			// Namespace each side rather than flattening. Both sources can
+			// expose the same column name (mocksf and mockzd both have
+			// "id"), and a flat merge silently resolved every such column
+			// to whichever side was copied last - so `a.id` returned the
+			// ticket's id. Over-projection widens this: OPA residuals and
+			// masks add columns to each side's scan, so more names can
+			// clash. Those extra columns are consumed per-side before this
+			// point (fetchScanRows), so filtering was never affected; only
+			// the final projection was, which is what sideKey fixes.
 			merged := make(connector.Row, len(br)+len(pr))
 			for c, v := range br {
-				merged[c] = v
+				merged[sideKey(plan.JoinLeft, c)] = v
 			}
 			for c, v := range pr {
-				merged[c] = v
+				merged[sideKey(plan.JoinRight, c)] = v
 			}
 			out = append(out, merged)
 		}
 	}
 	return out
 }
+
+// sideKey namespaces a join row's column by the side it came from. Single
+// -table plans never call it - their ProjectCol.Side is empty and project
+// reads the bare name.
+func sideKey(side, col string) string { return side + "\x00" + col }
 
 // securityPredicateNeedsColumn is the fail-closed check from
 // TestMissingPredicateColumnFailsClosed: a source hiding a column a user
@@ -402,12 +416,23 @@ func applyLocalFilters(rows []connector.Row, filters []*plan.Filter, attrs map[s
 	return out, nil
 }
 
-func project(rows []connector.Row, cols []plan.ProjectCol) ([]map[string]string, error) {
-	out := make([]map[string]string, 0, len(rows))
+// project trims each row to the output columns, in projection order, and
+// applies any mask. Rows are positional - a []string parallel to Columns -
+// not a map keyed by column name: a join can legitimately project the same
+// name from both sides (SELECT a.id, t.id), which a map cannot represent at
+// all, since the second entry overwrites the first. Position carries the
+// identity instead, which is also the shape the response envelope already
+// uses, so nothing has to be flattened later.
+func project(rows []connector.Row, cols []plan.ProjectCol) ([][]string, error) {
+	out := make([][]string, 0, len(rows))
 	for _, r := range rows {
-		o := make(map[string]string, len(cols))
-		for _, c := range cols {
-			v := r[c.Name]
+		vals := make([]string, len(cols))
+		for i, c := range cols {
+			name := c.Name
+			if c.Side != "" {
+				name = sideKey(c.Side, c.Name)
+			}
+			v := r[name]
 			if c.Mask != nil {
 				masked, err := applyMask(*c.Mask, v)
 				if err != nil {
@@ -415,9 +440,9 @@ func project(rows []connector.Row, cols []plan.ProjectCol) ([]map[string]string,
 				}
 				v = masked
 			}
-			o[c.Name] = v
+			vals[i] = v
 		}
-		out = append(out, o)
+		out = append(out, vals)
 	}
 	return out, nil
 }

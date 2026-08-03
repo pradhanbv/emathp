@@ -354,17 +354,20 @@ func buildJoin(sel *sqlparser.Select, je *sqlparser.JoinTableExpr, cat *catalog.
 	outCols := make([]ProjectCol, len(projCols))
 	for i, c := range projCols {
 		var table string
+		side := ""
 		switch c.Alias {
 		case leftAlias:
 			table = leftTable
 			leftProject = append(leftProject, c.Column)
+			side = JoinLeft
 		case rightAlias:
 			table = rightTable
 			rightProject = append(rightProject, c.Column)
+			side = JoinRight
 		default:
 			return nil, fmt.Errorf("%w: unknown table alias %q", ErrUnsupportedStatement, c.Alias)
 		}
-		outCols[i] = ProjectCol{Name: c.Column}
+		outCols[i] = ProjectCol{Name: c.Column, Side: side}
 		for _, m := range masks {
 			if m.Table == table && m.Column == c.Column {
 				fn := m.Fn

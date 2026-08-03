@@ -372,7 +372,7 @@ func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req Query
 		result, err = exec.Run(ctx, p, sources, principal.Attributes, params)
 		if err == nil {
 			frame.Columns = result.Columns
-			frame.Rows = rowsToAny(result.Columns, result.Rows)
+			frame.Rows = rowsToAny(result.Rows)
 		}
 	}
 
@@ -528,12 +528,12 @@ func connectorPrefix(table string) string {
 // rowsToAny converts exec's []map[string]string rows into the response
 // envelope's positional [][]any shape (column order fixed by columns) -
 // shared by the JSON and NDJSON response paths.
-func rowsToAny(columns []string, rows []map[string]string) [][]any {
+func rowsToAny(rows [][]string) [][]any {
 	out := make([][]any, len(rows))
 	for i, row := range rows {
-		vals := make([]any, len(columns))
-		for j, col := range columns {
-			vals[j] = row[col]
+		vals := make([]any, len(row))
+		for j, v := range row {
+			vals[j] = v
 		}
 		out[i] = vals
 	}
@@ -541,7 +541,7 @@ func rowsToAny(columns []string, rows []map[string]string) [][]any {
 }
 
 func resultOutcome(traceID string, result *exec.Result, fresh freshnessSummary, rlStatus map[string]string) outcome {
-	rows := rowsToAny(result.Columns, result.Rows)
+	rows := rowsToAny(result.Rows)
 
 	var meta *Meta
 	if fresh.CacheHit || fresh.Revalidated || result.JoinStrategy != "" {

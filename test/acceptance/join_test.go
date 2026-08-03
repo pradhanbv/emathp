@@ -124,3 +124,33 @@ func TestJoinDoesNotLeakOverProjectedColumnAcrossSides(t *testing.T) {
 	require.Equal(t, "open", res.Body.Rows[0][0],
 		"a.status is the account's own value, not the probe side's over-projected predicate column")
 }
+
+// TestOuterJoinsRejectedNotSilentlyDowngraded: LEFT/RIGHT/NATURAL JOIN parse
+// into the same *sqlparser.JoinTableExpr as INNER, so before this check they
+// ran through the same hand-rolled hash join and returned inner-join results
+// under a 200 - a LEFT JOIN silently losing every unmatched left row, which
+// is the one thing the caller asked to keep. v1's executor is a stand-in for
+// ADR-007 tier 1 (in-process DuckDB); rejecting is the honest boundary until
+// a real SQL engine runs the join, and it matches how the SQL surface already
+// treats cross-source disjunctions (UNSUPPORTED_PREDICATE rather than a
+// silent full scan).
+func TestOuterJoinsRejectedNotSilentlyDowngraded(t *testing.T) {
+	sf := mocksf.Start(t, mocksf.Accounts(5, "EMEA"))
+	zd := mockzd.Start(t, mockzd.Tickets(20, "open"), mockzd.MaxInList(200))
+	gw := harness.Start(t, testDepsJoin(t, sf, zd))
+
+	for _, join := range []string{"LEFT JOIN", "RIGHT JOIN", "NATURAL JOIN"} {
+		res := gw.Query("admin", `
+			SELECT a.name, t.subject FROM sf.accounts a `+join+`
+			zd.tickets t ON t.organization_id = a.external_id
+			WHERE t.status = 'open'`)
+		require.Equal(t, 400, res.Code, join+" must be rejected, not run as an inner join")
+	}
+
+	// The supported form still works.
+	res := gw.Query("admin", `
+		SELECT a.name, t.subject FROM sf.accounts a JOIN zd.tickets t
+		ON t.organization_id = a.external_id WHERE t.status = 'open'`)
+	require.Equal(t, 200, res.Code)
+	require.NotEmpty(t, res.Body.Rows)
+}

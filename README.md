@@ -18,7 +18,7 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 
 ```bash
 docker compose --profile core --profile mocks up -d --build   # gateway + 2 mock SaaS sources
-go test ./...                                                 # 39 tests, ~1s
+go test ./...                                                 # 40 tests, ~1s
 docker compose --profile testing run --rm k6                  # load test: 500 req/s for 60s
 
 docker compose --profile "*" down                             # tear down — see note below
@@ -96,7 +96,8 @@ single per-ADR verdict would flatten into one misleading word.
 | **🟢 Built & verified**<br>real code, real tests, real HTTP round trips | Go planner + capability classification · RLS/CLS injection + plan-time invariant + runtime verification filter (002) · parameterized role-isolated plan cache (003) · semi-join rewrite, 505→17 calls (007) · tenant from verified `iss`, never a claim (011) · real Prometheus histogram + real OTel trace · result cache keyed by principal |
 | **🟡 Partial**<br>real mechanism, deliberately narrowed scope | Freshness rungs 1 & 4 + `max_staleness` only (005) · rate limits: single-node bucket, `429`, async reroute — no Redis lease, no fair queue, **no per-tenant dimension** (006) · NDJSON + `SOURCE_TIMEOUT` terminal frame, thin coverage (009) · policy injection real, OPA mocked (002) · identity derivation real, signature verification mocked (011) |
 | **⚪ Mocked / not built**<br>infrastructure a reviewer can assume | Salesforce + Zendesk connectors are mocks (004) · Calcite sidecar + Substrait IR deferred to M1 spike (001) · materialization is an in-memory Go hash join, not DuckDB (007) · tenant lifecycle API (008) · per-tenant KMS + crypto-shred (010) · **audit trail (010) — no access log exists; nothing to review post-incident** |
-| **🔵 Open question**<br>not decided, not just unbuilt | `LIMIT`/`OFFSET` — same implementation layer as projection but less MVP value, which is likely why the gap wasn't caught; still undecided past the grammar (007) · `RESULT_TOO_LARGE` — guardrail specified in 007, never implemented. **The sharper risk: a skewed join can exhaust memory today** |
+| **🔵 Open question**<br>not decided, not just unbuilt | `RESULT_TOO_LARGE` — guardrail specified in 007, never implemented. **The sharper risk: a skewed join can exhaust memory today** · `LIMIT`/`OFFSET` — in the grammar, undecided past it (007) |
+| **🟠 Executor limits**<br>one cause, one fix | The v1 executor is a hand-rolled Go hash join standing in for **ADR-007 tier 1's in-process DuckDB**, and a hand-rolled executor only does what it was written to do. So `LIMIT`/`OFFSET` and `ORDER BY` parse and are ignored, and **outer joins are now rejected rather than silently run as inner joins** (they also defeat the semi-join rewrite — pushing the build side's keys as an `IN`-list is precisely what makes unmatched keys invisible). All three land together when a real SQL engine runs the join |
 
 **The pattern.** Every unbuilt ADR maps to a requirement about *infrastructure* — a JVM sidecar,
 a vendor contract, Terraform, a KMS call. Every built one maps to a requirement about *behaviour

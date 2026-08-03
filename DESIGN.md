@@ -152,7 +152,19 @@ WHERE <conjunctive predicates>
 - Conjunctive `WHERE` only.
 - Cross-source disjunctions rejected at plan time with `UNSUPPORTED_PREDICATE` — **a full scan of
   a SaaS API is a quota incident, not a slow query.**
-- `LIMIT`/`OFFSET` parse but are not executed — see [§13](#13-decisions-we-are-least-confident-about), item 5.
+- **Three limits share one cause: the v1 executor is a hand-rolled Go hash join**, standing in for
+  [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) tier 1's in-process DuckDB — and
+  a hand-rolled executor does only what it was explicitly written to do.
+  - `LIMIT`/`OFFSET` parse but are not executed — see [§13](#13-decisions-we-are-least-confident-about), item 5.
+  - `ORDER BY` parses but is not executed either.
+  - `LEFT`/`RIGHT`/`NATURAL JOIN` are **rejected**, not silently downgraded. They parse into the
+    same node as `INNER`, so they previously ran as inner joins and returned a *smaller* result
+    under a `200` — for a `LEFT JOIN`, dropping exactly the unmatched rows the caller asked to
+    keep. They also defeat the semi-join rewrite outright: pushing the build side's keys as an
+    `IN`-list is what makes unmatched keys invisible, so outer joins need a different execution
+    strategy, not a bigger hash join.
+
+  All three are answered by building tier 1, not by extending the stand-in.
 
 ---
 

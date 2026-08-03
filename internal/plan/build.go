@@ -311,6 +311,22 @@ func checkMaskingSupported(cat *catalog.Catalog, table string, maskCols []string
 // mirrors Build's single-table logic per side (buildSideTree), then
 // combines both sides under one Join node.
 func buildJoin(sel *sqlparser.Select, je *sqlparser.JoinTableExpr, cat *catalog.Catalog, residuals policy.Residuals, masks policy.Masks) (*Plan, error) {
+	// v1 executes joins with a hand-rolled hash join (exec.hashJoin), a
+	// stand-in for ADR-007 tier 1's in-process DuckDB. A hand-rolled
+	// executor only implements what it was explicitly written to do, and
+	// this one does INNER JOIN. LEFT/RIGHT/NATURAL parse into the same
+	// JoinTableExpr, so without this check they ran as inner joins and
+	// silently returned a *smaller* result than asked for - unmatched left
+	// rows dropped, with a 200. Reject rather than mislead: outer joins
+	// also defeat the semi-join rewrite outright, since pushing the build
+	// side's keys as an IN-list is exactly what makes unmatched keys
+	// invisible. Both limitations disappear when tier 1 lands and DuckDB
+	// runs the join for real.
+	if je.Join != sqlparser.NormalJoinType {
+		return nil, fmt.Errorf("%w: only INNER JOIN is supported in v1 (got %q); outer joins arrive with ADR-007 tier 1's DuckDB executor",
+			ErrUnsupportedStatement, je.Join.ToString())
+	}
+
 	leftTable, err := tableName(je.LeftExpr)
 	if err != nil {
 		return nil, err

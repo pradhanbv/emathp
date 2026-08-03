@@ -187,17 +187,16 @@ policies, secrets, audit.
 | Policy store (authoring, versioning) | Policy Decision sidecar (OPA, partial eval) |
 | Secrets & KMS key lifecycle | Connector workers |
 | Rate-limit *policy* definitions | Rate-limit *enforcement* (token buckets) |
-| Audit sink, residency tags | Async job runners (tier 2: on-demand ClickHouse; tier 3: Spark serverless) |
+| Audit sink, residency tags | Async job runners (tier 2: shared ClickHouse cluster; tier 3: Spark serverless) |
 
 **All four join tiers are data plane - the split below is about provisioning, not plane.**
 Tiers 0-1 (DuckDB, in-process) run inside the Query Gateway pods that are already in this table;
 they add no new row and no new fleet, because their memory is already part of the gateway pod
 budget Section 5.2 derives. Tiers 2-3 (ClickHouse, Spark) are real, separate compute, but
-provisioned on demand per escalated query rather than as a standing fleet - the async job runner
-spins one up only when a query actually escalates, then tears it down (ADR-007). That's why
-neither gets its own always-on row here either, but for the opposite reason: not because it's
-folded into the gateway pods, but because there's no persistent fleet to list. Either way, tiers
-2-3's resource footprint is genuinely outside Section 5.2's gateway pod sizing, not counted in it.
+standing compute driven by the async job runner (ADR-007): a warm ClickHouse cluster and a
+serverless Spark account, both fed by S3 staging. They appear as their own data-plane row rather
+than folded into the gateway pods, and their resource footprint sits outside Section 5.2's gateway
+pod sizing, which counts only tiers 0-1.
 
 **One deliberate exception.** The **Egress Token Broker** sits in neither plane. By the rule
 above it is data plane - it is in the egress path - but it holds refresh tokens, which must
@@ -232,7 +231,8 @@ flowchart TB
  CW["Connector Workers<br/>Connector SDK"]
  MAT["Materialization<br/>DuckDB in-proc, tenant-keyed"]
  RC["Result Cache<br/>keyed by principal"]
- JOB["Async Job Runners"]
+ JOB["Async Job Runners - stage, admit, dispatch, reap<br/>tier 2: shared ClickHouse warm pool<br/>tier 3: Spark serverless"]
+ S3[("Async staging<br/>per-tenant S3 prefix, tenant KEK")]
  end
 
  subgraph cb["CREDENTIAL BOUNDARIES - separate trust domains"]
@@ -264,6 +264,8 @@ flowchart TB
  CW --> NN
  GW --> MAT
  GW -->|"overflow"| JOB
+ JOB --> S3
+ S3 -.->|"tenant KEK"| SEC
  GW -.->|"every access"| AUD
  CW -->|"workload identity<br/>(principal, connector, purpose)"| BRK
  BRK -.->|"refresh tokens"| SEC
@@ -274,7 +276,7 @@ flowchart TB
  classDef dpStyle fill:#ecfdf5,stroke:#059669,color:#064e3b
  classDef extStyle fill:#fef3c7,stroke:#d97706,color:#78350f
  class REG,CAT,POL,SEC,LIFE,AUD cpStyle
- class GW,PC,PL,OPA,RL,CW,MAT,RC,JOB dpStyle
+ class GW,PC,PL,OPA,RL,CW,MAT,RC,JOB,S3 dpStyle
  class SF,ZD,NN extStyle
  classDef cbStyle fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
  class BRK,IDB cbStyle
@@ -1096,14 +1098,14 @@ count, and never a runtime "try small, retry bigger on failure" loop.
 | Tier | What fits and what doesn't fit | How it solves it |
 |---|---|---|
 | **0. Single-table (no join)** | • Fits: every query with no join at all<br>• Doesn't fit: anything with two or more tables → tier 1 | • Straight connector fetch + pushdown, returned as the response<br>• No local engine invoked - nothing to combine, nothing to hold beyond one request |
-| **1. DuckDB (in-process, any join)** | • Fits: any join - 2-table today, N-way once the planner supports it - whose estimated working set stays within the gateway pod's shared memory budget<br>• Doesn't fit: estimate exceeds that budget → `RESULT_TOO_LARGE`, or if it would fit tier 2, suggest `Prefer: respond-async` | • Embedded DuckDB, explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset after every query<br>• The semi-join rewrite (below) decides how much data actually has to be loaded, which keeps most joins cheap enough to never need to escalate<br>• Nothing survives past the request - nothing to crypto-shred |
-| **2. ClickHouse (on-demand, async)** | • Fits: estimate exceeds the gateway-pod ceiling but stays within what one (larger) node can comfortably hold<br>• Doesn't fit: estimate exceeds what one node can hold, or the join genuinely needs distributed shuffle → tier 3 | • Fresh, single-tenant instance spun up per job, free to use its own local disk (spill/merge) since there's no latency SLO left to protect<br>• Whole instance destroyed after the job - nothing persists, so no separate per-tenant KMS key is needed at this tier |
+| **1. DuckDB (in-process, any join)** | • Fits: any join - 2-table in the MVP executor, N-way by design - whose estimated working set stays within the gateway pod's shared memory budget<br>• Doesn't fit: estimate exceeds that budget → `RESULT_TOO_LARGE`, or if it would fit tier 2, suggest `Prefer: respond-async` | • Embedded DuckDB, explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset after every query<br>• The semi-join rewrite (below) decides how much data actually has to be loaded, which keeps most joins cheap enough to never need to escalate<br>• Nothing survives past the request - nothing to crypto-shred |
+| **2. ClickHouse (warm pool, async)** | • Fits: estimate exceeds the gateway-pod ceiling but stays within what one (larger) node can hold **in memory**<br>• Doesn't fit: estimate exceeds one node's memory, or the join genuinely needs distributed shuffle → tier 3 | • A warm pool running **one job at a time per node** - not an instance per job, not concurrent tenants<br>• **Strictly in-memory, like tier 1** - external sort/aggregation disabled, so the ceiling stays a number the planner can estimate against<br>• Input staged as Parquet on S3 under a per-tenant prefix, SSE-KMS with the tenant's KEK; nothing reaches local disk, so that staged input is the whole shred surface (ADR-010) |
 | **3. Spark serverless (async)** | • Fits: estimate exceeds single-node comfort - genuinely needs distributed shuffle<br>• Doesn't fit: nothing, technically - the only remaining limit is cost | • Managed serverless job (EMR Serverless / Databricks job clusters / Dataproc Serverless); ephemeral executors, one tenant per job<br>• Shuffle spill lives on ephemeral executor disk, destroyed at teardown; the job's output goes to Parquet on S3 with per-tenant SSE-KMS - the same mechanism ADR-010 uses everywhere else |
 
 **Three resource boundaries, not four arbitrary tiers.** Tiers 0 and 1 share the gateway pod's
 memory budget (Section 5.2's ~23 GB materialization pool, ~8 GB pod size) - they run in the same
 process, not separately provisioned infrastructure. Tier 2 is bounded by whichever single node
-the on-demand ClickHouse instance is provisioned on, sized independently of gateway pods since it
+the shared ClickHouse cluster runs on, sized independently of gateway pods since it
 isn't sharing memory with request-handling. Tier 3 has no memory ceiling at all; cost is the only
 backstop.
 
@@ -1135,15 +1137,36 @@ hit rate, and abandon the rewrite if it is poor.
 **Why in-process and not a container per join, for tier 1.** Container cold start alone can
 consume the entire 1.5 s P95 budget. Rejected.
 
-**Why ClickHouse over DuckDB for tier 2, and why on-demand rather than always-on.** ClickHouse
-is a server, with a lifecycle and a footprint that made it wrong for tier 1 - we need a join
-engine we can create and destroy in milliseconds inside the sync request. Tier 2 has no such
-constraint: async has no completion SLO, so a fresh instance's few-second startup cost is
-immaterial. On-demand, single-tenant instances - rather than one always-on shared cluster -
-sidestep two problems an always-on shared instance would create: multi-tenant contention (the
-same noisy-neighbor problem already found in the rate limiter, ADR-006) and a fixed provisioned
-cost that idles between jobs. It also makes crypto-shred trivial - see the tier table above and
-ADR-010.
+**Why ClickHouse over DuckDB for tier 2, why a warm pool rather than an instance per job, and why
+it stays in memory.** ClickHouse is a server, with a lifecycle and a footprint that made it wrong for tier 1 - we
+need a join engine we can create and destroy in milliseconds inside the sync request. Tier 2 has
+no such constraint, since async carries no completion SLO.
+
+An earlier draft concluded from that that tier 2 should provision a fresh single-tenant instance
+per job, reasoning about idle cost and multi-tenant contention. That reasoning never checked the
+arrival rate, and the arithmetic refutes it. At the risk register's own trigger - `RESULT_TOO_LARGE`
+on >5% of cross-app joins - escalations run ~7.5/s; 5% of *all* traffic would be 50/s. Against a
+10-30 s startup (container, schema creation, data load), Little's Law gives **75-1,500 instances
+permanently mid-provision**. That is a fleet either way, and one paying a cold start on every job
+that had already been escalated for being too big.
+
+So tier 2 is a **warm pool running one job at a time per node**, and it stays **strictly in
+memory** - external sort and aggregation disabled, ClickHouse's `MEMORY_LIMIT_EXCEEDED` mapped onto
+`RESULT_TOO_LARGE` and escalation to tier 3. Two consequences follow. Serialization is what makes
+the node single-tenant for the job's duration: concurrent tenants would co-mingle rows in one
+process heap, which no S3 prefix or key separates, and a restart between jobs clears it. It costs
+little, since a tier-2 job is defined as one exceeding the pod ceiling and so monopolizes a node
+regardless. And keeping tier 2 in memory preserves the one rule running through the whole ladder
+below tier 3 - fit in memory or escalate - which also keeps the tier-2/tier-3 boundary estimable at
+plan time, because a hard memory ceiling is a number the cardinality estimate can compare against
+and "node RAM plus however much disk" is not. Tier 2's value was never the disk beneath it: it is
+the ~1,000x jump from tier 1's 256 MB `memory_limit` to a memory-optimized node's hundreds of
+gigabytes. Compute fairness still comes from the per-tenant semaphores and weighted fair queues
+ADR-006 specifies for connector concurrency - the same shape of problem, one scarce shared resource
+allocated across tenants, so the same mechanism applies. Serialization does pin node count to
+concurrent job count, so tier 2 stops being economical well before tier 3 does; that governs
+whether tier 2 is provisioned at all - which the risk register's trigger already gates - and never
+how an individual query is routed.
 
 **Why Spark for tier 3, and not just a bigger ClickHouse node.** ClickHouse's cluster mode is
 built for scatter-gather aggregation; a genuine large-large distributed join needs `GLOBAL JOIN`
@@ -1161,17 +1184,20 @@ scales by adding executors, not by fitting on one node.
   - *Fall back from federated execution to a materialized intermediate* - yes, that is tier 1
     above, and it is the reading we take.
   - *Spill to disk when memory is exhausted mid-join*, in the database-systems sense - **no,
-    deliberately, for tiers 0-1.** Spilling inside a 1.5 s/4 s budget trades a fast failure for a
-    slow one - the latency argument alone is sufficient here. The answer to memory exhaustion at
-    this level is rejection, not disk.
+    deliberately, for tiers 0-2.** For tiers 0-1, spilling inside a 1.5 s/4 s budget trades a fast
+    failure for a slow one - the latency argument alone is sufficient there. The answer to memory
+    exhaustion at this level is rejection, not disk.
 
-    **Tiers 2-3 have no completion SLO, so that latency argument doesn't carry over - and it
-    would be dishonest to reuse it there.** Tier 2 (ClickHouse) is in fact free to spill to its
-    own local disk mid-query - there's no SLO to protect, and it's a mature engine that already
-    solves temp-file lifecycle and crash-safe cleanup, so we aren't building that capability
-    ourselves. Tier 3 (Spark) goes further and writes real output to Parquet on S3. Neither
-    reintroduces the "second execution-engine capability" cost this ADR was originally avoiding,
-    because in both cases the disk-handling is the vendor engine's problem, not ours.
+    **Tiers 2-3 have no completion SLO, so that latency argument doesn't carry over - and it would
+    be dishonest to reuse it there.** Tier 2 nevertheless stays in memory, for a different reason:
+    a hard memory ceiling is a number the plan-time cardinality estimate can compare against, and
+    "node RAM plus however much disk, at unpredictable speed" is not - so letting tier 2 spill
+    would blur the tier-2/tier-3 boundary this ADR routes on. Tier 2's value is the ~1,000x jump
+    from tier 1's 256 MB `memory_limit` to a memory-optimized node, not the disk beneath it, so
+    disabling external sort and aggregation costs it almost nothing. **Tier 3 is the ladder's only
+    spilling tier** - shuffle spill on ephemeral executor disk, plus real output written to Parquet
+    on S3. It doesn't reintroduce the "second execution-engine capability" cost this ADR was
+    originally avoiding, because the disk-handling is the vendor engine's problem, not ours.
 - Memory guardrails mean a join whose estimate exceeds the tier-1 ceiling is **rejected or
  rerouted, not spilled in-process**: `RESULT_TOO_LARGE` with the offending cardinality estimate
  and a suggested narrowing, or - if the estimate would fit tier 2's larger, independently-sized
@@ -1180,23 +1206,33 @@ scales by adding executors, not by fitting on one node.
  grounds, and every reroute is a suggestion the caller opts into, never an automatic switch of
  execution mode they didn't ask for.
 - **Crypto-shred differs by tier, spelled out per-tier in the table above** (full treatment in
- ADR-010): tiers 0-1 hold nothing past the request; tier 2's whole on-demand instance is
- destroyed after the job, so there's no separate tenant key to manage; tier 3's ephemeral
- executor disk dies with the job and its actual output uses the same per-tenant SSE-KMS
- mechanism as everything else durable in this design.
+ ADR-010): tiers 0-2 hold nothing on local disk at all - tier 1 is in-process, tier 2 runs
+ strictly in memory. What tiers 2-3 leave is the staged input on S3 under a per-tenant prefix
+ encrypted with that tenant's KEK, with tier 3's output written back the same way, so one envelope
+ covers both directions; tier 3's ephemeral executor disk is the ladder's only spill surface and
+ dies with the job.
 - Materialization at any tier beyond 0 moves data into our compute layer: egress cost, and a
  residency obligation (Section 4.3) that federated execution avoids.
-- **The 2-table join is a demonstrated instance of this strategy, not its ceiling.** All four
- tiers' engines (DuckDB, ClickHouse, Spark) are inherently N-way-join-capable; the two-table cap
- lives entirely in the v1/v2 planner's plan-construction logic, not in any execution tier.
- Building N-way support is a planner project - join ordering, multi-way cardinality estimation -
- not a new tier. It also makes tier-routing *harder*, not easier: cardinality-estimate error,
- already a known risk at 2 tables (see the semi-join section above), compounds as more tables
- chain together, so N-way joins will misroute between tiers more often than 2-way joins do.
+
+
+**Scope: what is built versus what is designed.** The 2-table cap lives in the hand-rolled Go
+executor - one build side, one probe side - and a v1 parse restriction that accepts a single join
+node. It does not live in the planner: Calcite was chosen partly *for* its cost-based join ordering
+(ADR-001), and tier 1's DuckDB orders joins itself when handed the query. Nor does it live in any
+execution tier - DuckDB, ClickHouse and Spark are all inherently N-way capable. Everything between
+the parse and the join is already N-agnostic: source decomposition, OPA residual injection,
+over-projection and the runtime verification filter all apply **per scan**, in a loop that never
+counts tables. So lifting the cap is mostly deleting a restriction and handing the join to an engine
+that already does N-way. What genuinely remains is optimization rather than capability: generalizing
+the semi-join rewrite from one build/probe pair to a fetch order across a join graph, and estimating
+an N-way working set well enough to route between tiers. That second one also makes routing
+*harder*, not easier - cardinality-estimate error, already a known risk at 2 tables (see the
+semi-join section above), compounds as more tables chain together, so N-way joins will misroute
+between tiers more often than 2-way joins do.
 
 **Revisit if.** > 20% of joins fall back past tier 0; tier-1 memory rejections become a common
 support burden; tier-2 rejections become common enough that tier 3 stops being a rare escape
-hatch; N-way join volume justifies building planner support for it; or a wrong cardinality
+hatch; N-way join volume justifies lifting the MVP executor's 2-table cap; or a wrong cardinality
 estimate routes a job to a tier too small for it often enough to need a runtime escalation/retry
 path, which does not exist today.
 
@@ -1337,10 +1373,15 @@ choice and it is the kind of thing an auditor will ask about.
 - Emit a completion attestation with timestamps for each step.
 
 **Cross-tenant materialization tiers (ADR-007) don't add a new shred surface.** Tiers 0-1
-(in-process, sync) hold nothing past the request. Tier 2's on-demand ClickHouse instance and
-tier 3's Spark executors are single-tenant and destroyed at job teardown - there's no separate
-per-tenant key to manage for either, because nothing from them outlives the job. The one place
-tier 3 writes anything durable - its Parquet output on S3 - uses the same per-tenant KEK/DEK
+(in-process, sync) hold nothing past the request. Tiers 2-3 stage their input as Parquet on S3
+under a **per-tenant prefix encrypted with that tenant's KEK**, and tier 3 writes its output back
+the same way - so one envelope covers both directions and shredding the key makes both unreadable.
+An earlier draft claimed these tiers needed no per-tenant key because the compute was destroyed at
+teardown; that was wrong twice over, since the input has to reach them through durable storage
+regardless, and a shared tier-2 cluster is never torn down at all. Tier 2 leaves nothing on local disk to reason about, because it runs strictly
+in memory (ADR-007) - external sort and aggregation disabled, escalating to tier 3 rather than
+spilling. Tier 3's shuffle spill is the ladder's only local-disk surface and dies with its
+ephemeral executors. The rest uses the same per-tenant KEK/DEK
 envelope this ADR already defines, so shredding that tenant's key covers it too. See ADR-007's
 Consequences for the full per-tier breakdown.
 
@@ -1557,7 +1598,7 @@ Weighted mean **W ~ 245 ms**. By **Little's Law**, L = lambda x W:
 ### 5.2 Derived sizing
 
 **Scope: this entire section sizes the gateway pod fleet only - tiers 0-1 of ADR-007's join
-ladder.** Tier 2 (on-demand ClickHouse) and tier 3 (Spark serverless) are provisioned
+ladder.** Tier 2 (shared ClickHouse cluster) and tier 3 (Spark serverless) are provisioned
 independently, per escalated job, outside this fleet - see ADR-007 and Section 2.1. Nothing
 below bounds their footprint; a fleet-wide accounting of tier 2/3 spend belongs in cost
 guardrails (Section 8.4), not gateway pod sizing.
@@ -1941,7 +1982,7 @@ to exist before an adapter can be tested against it. **The result cache's shared
 waits for M5, not M2**, because a per-pod cache is enough to produce the M2 hit-ratio
 measurement that actually matters (Section 5.3) - the shared tier's value is consistency and
 fairness *across* pods, which has no signal worth building for until M5's multi-tenant
-hardening gives it a real workload to prove itself against. **Tiers 2-3 of ADR-007 (on-demand
+hardening gives it a real workload to prove itself against. **Tiers 2-3 of ADR-007 (shared
 ClickHouse, Spark serverless) are deliberately absent from every milestone here** - they are
 designed, not scheduled. Building either before M4 establishes tier-1's real `RESULT_TOO_LARGE`
 rate would be guessing at a problem we haven't measured yet, which is exactly the mistake
@@ -1963,7 +2004,7 @@ into scope early.
 | Single-tenant operational load | Med | Med | Conformance test that both provisioning paths produce identical tenants (ADR-008) | Infra | >5 single-tenant customers |
 | Customer IdP variability (Entra group-overage, missing custom claims) blocks onboarding | High | Med | Attribute resolution independent of claim contents; per-attribute owner in tenant config (ADR-011) | Security | Any tenant needing an unmappable attribute |
 | Team unfamiliarity with Calcite | Med | Med | Spike in M1; keep planner rules minimal; DX owns internal docs | BE(2) | M2 slips >2 weeks |
-| Tier-1 `RESULT_TOO_LARGE` rate high enough to need ADR-007's tier 2 (ClickHouse) before GA | Med | Med | Not built by default (see Sequencing rationale); pull forward into M5/M6 if triggered, on-demand per-job so no standing infra cost until then | BE(1) | `RESULT_TOO_LARGE` fires on >5% of cross-app joins in M4 |
+| Tier-1 `RESULT_TOO_LARGE` rate high enough to need ADR-007's tier 2 (ClickHouse) before GA | Med | Med | Not built by default (see Sequencing rationale); pull forward into M5/M6 if triggered - a warm cluster plus S3 staging and the async orchestrator, so a real standing cost, which is why the trigger gates it | BE(1) | `RESULT_TOO_LARGE` fires on >5% of cross-app joins in M4 |
 
 ### 10.4 Budget and infra assumptions
 
@@ -1971,8 +2012,8 @@ into scope early.
 Postgres with a cross-region replica, 2 Gbps sustained egress, plus the unified-API vendor
 per-call fee for the long tail (ADR-004). Egress and vendor calls dominate - both scale with
 cache miss rate, which is why Section 5.3 is the number that drives the budget as well as the
-architecture. **Excludes ADR-007's tiers 2-3** (on-demand ClickHouse, Spark serverless): neither
-is built by default in this plan, and both are on-demand per escalated job rather than standing
+architecture. **Excludes ADR-007's tiers 2-3** (shared ClickHouse cluster, Spark serverless): neither
+is built by default in this plan; once escalation volume justifies them they become a standing
 infra, so there is no fleet-wide line to size until the risk register's trigger above pulls them
 into scope.
 

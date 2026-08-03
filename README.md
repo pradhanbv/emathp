@@ -232,13 +232,20 @@ behaves. So the validation harness that makes generated connectors safe to accep
 having been built for a reason that had nothing to do with LLMs. That removes the obvious
 objection to this idea; it isn't what prompted it.
 
-Three places to try it, in the order I'd attempt them:
+Four places to try it, in the order I'd attempt them:
 
 | # | Where | Why there first |
 |---|---|---|
 | 1 | **Capability discovery** — draft the `ENFORCED`/`ADVISORY` map from whatever docs exist (OpenAPI in the tidy case; prose and workflow descriptions in the common one) | Declarative output, not code, validated by the gate that already exists. `testdata/catalog/sf.accounts.json` is a handful of hand-written lines for *one* table — the authoring cost at n=1,000 is visible from n=2 |
 | 2 | **Schema-drift triage** — diff spec versions, classify breaking vs. additive, draft the patch | Attacks the cost ADR-004 itself calls decisive: *"schema drift alone would consume the team"* |
 | 3 | **Request translation** — plan → SOQL/GraphQL/REST/ES DSL | Placed *after* policy injection, so the model only ever **executes** a security decision already made — never makes one |
+| 4 | **Cross-source query generation** — intent + the schema registry → federated SQL | Runs *before* policy injection, so the model sits in the **user's** seat: L1 object authz, RLS/CLS and the verification filter all still apply to whatever it emits. The registry gives it per-tenant ground truth — including the `sf.external_id` ↔ `zd.organization_id` correspondence, which is schema matching, a thing models do well and hand-written mappings do tediously |
+
+**The rule both ends obey: the model never sits between policy and execution.** Item 3 is
+downstream of that line, item 4 upstream — one executes a decision already made, the other is
+subject to one made afterwards. Item 4 is the least ready of the four, and its risk is not a
+security one: a hallucinated join returns a plausible **wrong answer**, not unauthorised data,
+and nothing below catches that. It also isn't in the brief, which asks for SQL in and rows out.
 
 How connectors get deployed and versioned — independent of who or what authors one — is a
 separate question from this suggestion, not a consequence of it: see ADR-004 in

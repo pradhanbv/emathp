@@ -42,9 +42,11 @@ repo's sharpest findings came from.
 |---|---|
 | *"nowhere in the THP is pure in-memory a requirement"* | An internal constraint was masquerading as a brief requirement — and it surfaced that one of THP's three named materialization options was never addressed |
 | *"fine to reject disk spill on SLO grounds — but there is no SLO for async"* | A real non sequitur: a latency argument reused in the one place latency doesn't apply. Produced the four-tier join ladder |
-| *"what are your assumptions — always-on, or created on demand?"* | An **unstated and wrong** assumption (always-on ClickHouse). Flipping it to on-demand also solved multi-tenant contention and crypto-shred |
+| *"what are your assumptions — always-on, or created on demand?"* | An **unstated** assumption — and the first answer was wrong too: it flipped to on-demand-per-job, which a later arrival-rate check overturned. Two rounds to reach a warm pool. The question was right both times; the answers weren't |
 | *"isn't spinning up Spark as easy as maintaining ClickHouse?"* | The ops-cost argument compared self-managed to self-managed and ignored serverless. It mostly evaporated |
 | *"this measures the plan cache — but working set is the majority of memory"* | **Two errors in a table just written**: planner sidecars attributed to the wrong cache, pod-size dependency overstated 5× |
+| *"even if only 5% of jobs go async, spinning up 50 ClickHouse a second is unrealistic — this is a shared infra problem"* | I had chosen on-demand-per-job **without ever checking the arrival rate**. At the design's own trigger that is ~7.5 escalations/s against a 10–30 s startup — Little's Law puts **75–1,500 instances permanently mid-provision** |
+| *"this is an MVP limitation, not the planner"* | The 2-table cap was blamed on Calcite — which was chosen partly *for* cost-based join ordering. It actually lives in a hand-rolled Go executor and one parse restriction; decomposition, OPA residuals, over-projection and verification are all already per-scan, in a loop that never counts tables |
 
 ### 3. Supplying the frame that was missing
 
@@ -54,6 +56,15 @@ repo's sharpest findings came from.
 - **"add 10 query varieties — a dashboard has 2–3 widgets"** — made the workload realistic *and*
   produced a finding neither of us had: **distinct keys is the variable; how they arise is
   irrelevant.** 10 users × 10 widgets behaves identically to 100 users × 1 query.
+- **"keep tier 2 strictly in-memory — it still gives orders of magnitude more room than DuckDB's
+  256 MB"** — the reframing that collapsed an entire design branch. I had been defending tier 2's
+  *disk*, and rejected "just disable spill" as gutting it. Wrong axis: tier 2's value is the
+  **~1,000× memory jump**, not the disk beneath it. Disabling spill deleted a scratch-volume
+  scheme, per-tenant CMKs, an orphaned-volume reaper and an open crypto-shred residual — and left
+  the ladder with one rule: fit in memory or escalate.
+- **"run one job at a time per ClickHouse node"** — better than what I had proposed (single-tenant
+  deployments), and it fixed something I hadn't raised at all: concurrent tenants co-mingle rows in
+  one **process heap**, which no storage prefix or key separates.
 - **"why isn't sort in the key? is it in memory even after a hit?"** — two questions that found
   the **no-eviction defect** and the undisclosed `ORDER BY` gap.
 
@@ -65,6 +76,9 @@ repo's sharpest findings came from.
   **three times** in three paragraphs, which nobody had noticed while it was prose. The Measured
   section went from nine bold-led paragraphs to two three-column tables and got shorter, clearer,
   and easier to attack.
+- **"do these belong to 'consequences we accept'?"** — three of four bullets didn't. One was a
+  requirement interpretation, one a rejected option, and one argued the 2-table cap *isn't* a real
+  limitation — filed under costs we accept.
 - **"keep `DESIGN_FULL.md` alongside the read-time-optimised versions"** — the most useful
   structural decision of the project, for a reason specific to working with LLMs. Context windows
   compact. Across two or three compactions and several sessions, a model working from its own
@@ -95,8 +109,11 @@ And the failure modes being corrected were consistent rather than random:
    applied to a tier that has no SLO.
 3. **Conflating similar-sounding quantities** — two caches, two memory pools, two kinds of
    "biggest," the plan-cache hit ratio versus the result-cache hit ratio.
+4. **Elaborating a mechanism instead of questioning the requirement** — faced with
+   tenant-mingled disk spill, the response was encrypted scratch volumes, per-tenant CMKs and a
+   volume reaper. The answer was to not spill.
 
-Knowing those three in advance is what made review efficient. The productive question was almost
+Knowing those four in advance is what made review efficient. The productive question was almost
 never "is this well written" — it was **"is that specific number actually true, and how would we
 know?"** Nearly every correction above came from asking that of one figure, not from knowing the
 answer in advance. That is the part that generalises.

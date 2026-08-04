@@ -20,7 +20,26 @@ import (
 type HTTPSource struct {
 	BaseURL string
 	Client  *http.Client
+
+	// pageGate is consulted before every outbound HTTP request, including
+	// each page of a paginated fetch. It is how rate limiting gets counted
+	// where the calls actually happen: a vendor bills per HTTP request, so
+	// spending one token per logical Fetch under-counts the budget by the
+	// pagination factor - optimistically, which is the direction that gets
+	// an API key banned (ADR-006). Set once at startup via SetPageGate,
+	// never per request, since a shared source is used concurrently.
+	pageGate func() error
 }
+
+// PageGated is implemented by any source that issues more than one
+// outbound call per Fetch and therefore has to account for each of them.
+// server.New wires it at construction so a future paginating connector
+// participates without touching the composition root again.
+type PageGated interface {
+	SetPageGate(func() error)
+}
+
+func (s *HTTPSource) SetPageGate(fn func() error) { s.pageGate = fn }
 
 func NewHTTPSource(baseURL string) *HTTPSource {
 	return &HTTPSource{BaseURL: strings.TrimSuffix(baseURL, "/")}
@@ -31,6 +50,17 @@ func (s *HTTPSource) Fetch(ctx context.Context, req FetchRequest) ([]Row, FetchM
 	offset := 0
 	etag := ""
 	for {
+		if s.pageGate != nil {
+			if err := s.pageGate(); err != nil {
+				// Exhausting mid-pagination fails the query rather than
+				// returning the pages already collected. A SQL result that
+				// silently omits rows is worse than an error; ADR-009's
+				// partial-result path is explicit and opt-in, and this is
+				// not that path. Tokens already spent stay spent - they
+				// bought real API calls.
+				return nil, FetchMeta{}, err
+			}
+		}
 		page, hasMore, meta, err := s.fetchPage(ctx, req, offset)
 		if err != nil {
 			return nil, FetchMeta{}, err

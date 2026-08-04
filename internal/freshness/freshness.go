@@ -18,7 +18,6 @@ import (
 
 	"github.com/pradhanbv/emathp/internal/connector"
 	"github.com/pradhanbv/emathp/internal/obs"
-	"github.com/pradhanbv/emathp/internal/ratelimit"
 )
 
 // Cache holds the last fetched rows per distinct outbound request
@@ -55,9 +54,24 @@ func New() *Cache {
 	return &Cache{entries: make(map[string]*entry), Now: time.Now}
 }
 
+// SetClock replaces the cache's clock. Tests fast-forward past a
+// staleness window with it instead of really sleeping; it takes the same
+// mutex as the entry map because a test that swaps the clock while
+// requests are in flight is otherwise a data race on Now itself - which
+// is what the race detector reports first, before it ever reaches the
+// entry state the test was actually written to exercise.
+func (c *Cache) SetClock(fn func() time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Now = fn
+}
+
 func (c *Cache) now() time.Time {
-	if c.Now != nil {
-		return c.Now()
+	c.mu.Lock()
+	fn := c.Now
+	c.mu.Unlock()
+	if fn != nil {
+		return fn()
 	}
 	return time.Now()
 }
@@ -66,17 +80,25 @@ func (c *Cache) now() time.Time {
 // fresh per request (MaxStaleness varies per query; Cache and RateLimit are
 // the long-lived, shared state behind it).
 //
-// A hit within MaxStaleness returns stored rows: no outbound call, no
-// rate-limit spend. A miss or stale entry spends exactly one rate-limit
-// token and makes one live call - conditional on the stored ETag when one
-// exists, so a confirmed-unchanged response ("revalidated") still counts
-// against quota. That's the detail worth getting right: a 304 looks free
+// A hit within MaxStaleness returns stored rows and never delegates
+// inward, so it makes no outbound call and spends no quota - the property
+// ADR-005's cache exists for. A miss or stale entry delegates, and the
+// quota is spent per outbound HTTP request down in the connector
+// (connector.PageGated), not once per logical Fetch: an HTTPSource
+// paginates internally, so one Fetch of 1,200 rows at a 500-row page size
+// is three billable requests. Counting it here, above that loop,
+// under-counted the budget by the pagination factor.
+//
+// A stale entry still re-fetches conditionally on the stored ETag, so a
+// confirmed-unchanged response ("revalidated") costs a token like any
+// other request. That's the detail worth getting right: a 304 looks free
 // (no new bytes) but a real API bills it as a call, and freshness that
-// quietly stops paying for it is a quota leak with good PR.
+// quietly stops paying for it is a quota leak with good PR. It falls out
+// of the per-page gate rather than needing its own rule - the conditional
+// request is an outbound request.
 type Source struct {
 	Inner        connector.Source
 	Cache        *Cache
-	RateLimit    *ratelimit.Limiter
 	Connector    string
 	Principal    string        // tenant_id + "|" + principal sub - see Cache's doc comment
 	MaxStaleness time.Duration // 0 = no caching, always live
@@ -88,55 +110,75 @@ type Source struct {
 
 func (s *Source) Fetch(ctx context.Context, req connector.FetchRequest) ([]connector.Row, connector.FetchMeta, error) {
 	if s.MaxStaleness <= 0 {
-		if !s.RateLimit.Allow(s.Connector) {
-			return nil, connector.FetchMeta{}, &ratelimit.ExhaustedError{Connector: s.Connector}
-		}
 		return s.timedFetch(ctx, req)
 	}
 
 	key := cacheKey(req, s.Principal)
 	now := s.Cache.now()
 
+	// Copy the entry's fields out under the lock and never dereference the
+	// pointer afterwards. Entries are immutable once published: a
+	// revalidation below publishes a *new* entry rather than mutating this
+	// one. Holding the pointer instead - the previous shape - raced two
+	// unsynchronized accesses against each other, this path's read of
+	// fetchedAt against the revalidation path's write of it, for any two
+	// concurrent requests on one key. That is the ordinary case for a
+	// shared cache under load, not an exotic one.
 	s.Cache.mu.Lock()
 	e, ok := s.Cache.entries[key]
+	var (
+		rows      []connector.Row
+		etag      string
+		fetchedAt time.Time
+	)
+	if ok {
+		rows, etag, fetchedAt = e.rows, e.etag, e.fetchedAt
+	}
 	s.Cache.mu.Unlock()
 
 	if ok {
-		age := now.Sub(e.fetchedAt)
+		age := now.Sub(fetchedAt)
 		if age <= s.MaxStaleness {
 			s.CacheHit = true
 			s.AgeMS = age.Milliseconds()
 			recordResultCacheOutcome(s.Connector, "hit")
-			return e.rows, connector.FetchMeta{}, nil
+			return rows, connector.FetchMeta{}, nil
 		}
-		req.ETag = e.etag
+		req.ETag = etag
 	}
 	recordResultCacheOutcome(s.Connector, "miss")
 
-	if !s.RateLimit.Allow(s.Connector) {
-		return nil, connector.FetchMeta{}, &ratelimit.ExhaustedError{Connector: s.Connector}
-	}
-
-	rows, meta, err := s.timedFetch(ctx, req)
+	fresh, meta, err := s.timedFetch(ctx, req)
 	if err != nil {
 		return nil, connector.FetchMeta{}, err
 	}
 
 	if meta.NotModified {
+		// A 304 is only meaningful in reply to a conditional request, and
+		// we only send one when we hold an entry to be conditional about.
+		// A connector answering 304 anyway has nothing for us to serve -
+		// the same declared-behaviour-versus-real-behaviour divergence
+		// ADR-002's verification filter exists for, arriving through the
+		// caching path instead of the predicate one. Previously this
+		// dereferenced a nil entry and panicked, which on the async path
+		// (server.go's detached goroutine) takes the process with it.
+		if !ok {
+			return nil, connector.FetchMeta{}, fmt.Errorf(
+				"connector %s returned 304 Not Modified without a conditional request", s.Connector)
+		}
 		s.Revalidated = true
 		s.AgeMS = 0
-		e.fetchedAt = now
 		s.Cache.mu.Lock()
-		s.Cache.entries[key] = e
+		s.Cache.entries[key] = &entry{rows: rows, etag: etag, fetchedAt: now}
 		s.Cache.mu.Unlock()
-		return e.rows, connector.FetchMeta{}, nil
+		return rows, connector.FetchMeta{}, nil
 	}
 
 	s.AgeMS = 0
 	s.Cache.mu.Lock()
-	s.Cache.entries[key] = &entry{rows: rows, etag: meta.ETag, fetchedAt: now}
+	s.Cache.entries[key] = &entry{rows: fresh, etag: meta.ETag, fetchedAt: now}
 	s.Cache.mu.Unlock()
-	return rows, connector.FetchMeta{}, nil
+	return fresh, connector.FetchMeta{}, nil
 }
 
 // timedFetch calls Inner.Fetch inside its own "connector.fetch" span - the

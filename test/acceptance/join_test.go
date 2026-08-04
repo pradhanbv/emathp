@@ -110,7 +110,7 @@ func TestSemiJoinReturnsEveryMatchingRow(t *testing.T) {
 // per side, all strictly before hashJoin - so this was never an entitlement
 // bypass. It was the output being drawn from the wrong side.
 func TestJoinDoesNotLeakOverProjectedColumnAcrossSides(t *testing.T) {
-	sf := mocksf.Start(t, mocksf.Accounts(5, "EMEA"))              // status "open"
+	sf := mocksf.Start(t, mocksf.Accounts(5, "EMEA")) // status "open"
 	zd := mockzd.Start(t, mockzd.Tickets(20, "pending"), mockzd.MaxInList(200))
 	gw := harness.Start(t, testDepsJoin(t, sf, zd))
 

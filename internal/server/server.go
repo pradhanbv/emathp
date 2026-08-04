@@ -59,7 +59,19 @@ type Server struct {
 	jobs sync.Map // jobID string -> *asyncJob
 }
 
-func New(deps Deps) *Server { return &Server{deps: deps} }
+// New wires per-page rate limiting into any source that paginates. Done
+// here, at the composition root and exactly once, because the sources map
+// is shared across concurrent requests - setting the gate per request
+// would race. The closure needs only the connector name, which is
+// request-independent, so once is enough.
+func New(deps Deps) *Server {
+	for name, src := range deps.Sources {
+		if g, ok := src.(connector.PageGated); ok {
+			g.SetPageGate(ratelimit.Gate(deps.RateLimit, name))
+		}
+	}
+	return &Server{deps: deps}
+}
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -222,7 +234,6 @@ func (s *Server) buildAndRoute(req QueryRequest, principal identity.Principal, r
 		sources[name] = &freshness.Source{
 			Inner:        source,
 			Cache:        s.deps.Freshness,
-			RateLimit:    s.deps.RateLimit,
 			Connector:    name,
 			Principal:    principal.Tenant + "|" + principal.Sub,
 			MaxStaleness: maxStaleness,
@@ -489,6 +500,22 @@ func (s *Server) startAsync(ctx context.Context, req QueryRequest, principal ide
 
 	go func() {
 		defer span.End()
+		// net/http recovers a panic on the handler goroutine; it cannot
+		// recover one here, in a goroutine the handler spawned - an
+		// unrecovered panic on this path takes the whole process down,
+		// along with every in-flight request on it. That asymmetry matters
+		// more than it looks: ADR-006 reroutes overload to async, so the
+		// path with the worse failure mode is deliberately handed the
+		// hardest queries. Fail the one job instead.
+		defer func() {
+			if r := recover(); r != nil {
+				job.mu.Lock()
+				job.done = true
+				job.out = errorOutcome(obs.TraceIDFrom(bgCtx), http.StatusInternalServerError,
+					"INTERNAL", fmt.Sprintf("async job failed: %v", r))
+				job.mu.Unlock()
+			}
+		}()
 		o := s.run(bgCtx, req, principal, role)
 		job.mu.Lock()
 		job.done = true

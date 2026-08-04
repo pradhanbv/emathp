@@ -80,3 +80,16 @@ type ExhaustedError struct {
 func (e *ExhaustedError) Error() string {
 	return fmt.Sprintf("rate limit exhausted for connector %q", e.Connector)
 }
+
+// Gate returns the per-outbound-call permission check a paginating source
+// consults before each HTTP request (connector.PageGated). Keeping the
+// closure here means connector never imports this package - it just holds
+// a func() error.
+func Gate(l *Limiter, connector string) func() error {
+	return func() error {
+		if !l.Allow(connector) {
+			return &ExhaustedError{Connector: connector}
+		}
+		return nil
+	}
+}

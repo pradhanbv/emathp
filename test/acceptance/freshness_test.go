@@ -46,7 +46,7 @@ func TestETagRevalidationSpendsBudget(t *testing.T) {
 	gw.QueryFresh("support", simpleSQL, "60s")
 
 	staleAt := time.Now().Add(90 * time.Second)
-	deps.Freshness.Now = func() time.Time { return staleAt }
+	deps.Freshness.SetClock(func() time.Time { return staleAt })
 
 	before := deps.RateLimit.Remaining("sf")
 	res := gw.QueryFresh("support", simpleSQL, "60s")

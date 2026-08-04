@@ -141,13 +141,22 @@ behalf of the calling user, under that user's own source-side permissions.
 
 ### 1.2 Assumptions we are making explicit
 
-| # | Assumption | Why it matters | If false |
-|---|---|---|---|
-| A1 | Connectors expose per-user delegated OAuth, not just service accounts | Source-side ACLs are our primary entitlement substrate (ADR-002) | Fall back to service-account + mirrored permission graph; materially worse (Section 11) |
-| A2 | Average result payload ~ 100 KB (100 MB/s / 1k QPS) | Drives egress, buffer, and materialization sizing (Section 5) | Re-derive Section 5 entirely |
-| A3 | ~70% of queries are single-source with full predicate pushdown | The P95 < 1.5 s SLO is scoped to these | SLO must be renegotiated per query class |
-| A4 | Connector p95 latency 200-800 ms; a long tail of sources exceed 2 s | Drives timeout, partial-result, and async design (ADR-009) | Timeout budget shifts |
-| A5 | Tenants tolerate seconds-to-minutes staleness for most query classes | Makes caching viable at all (ADR-005) | Cache hit ratio -> 0, cost and quota pressure rise sharply |
+The brief fixes four numbers - **10M users, ~1k QPS peak, ~100 MB/s, and P95 < 1.5 s for
+single-source pushdown queries** - and then asks for *"sizing math for 1k QPS: concurrency limits,
+connector latency percentiles, cache hit ratios."* Every input that math needs beyond those four is
+ours. The **Source** column separates them, so a reviewer can tell at a glance which numbers are
+checkable against the brief and which are judgment calls a measurement could overturn. Four of the
+six below are invented; that is not a defect, since the brief demands arithmetic it deliberately
+does not supply inputs for - but it should be visible rather than implied.
+
+| # | Assumption | Source | Why it matters | If false |
+|---|---|---|---|---|
+| A1 | Connectors expose per-user delegated OAuth, not just service accounts | **Assumed** - the brief says entitlements derive from "source permissions and tenant policy" but never says how those permissions are reached | Source-side ACLs are our primary entitlement substrate (ADR-002) | Fall back to service-account + mirrored permission graph; materially worse (Section 11) |
+| A2 | Average result payload ~ 100 KB | **Derived** - 100 MB/s / 1k QPS, both given | Drives egress, buffer, and materialization sizing (Section 5) | Re-derive Section 5 entirely |
+| A3 | The P95 < 1.5 s SLO covers **single-source pushdown queries only**; cross-app joins carry a separate 4 s SLI | **Given** - the brief scopes its SLO in exactly those words. What the brief does *not* give is how traffic splits between the classes, which is A6 | Without the scope, one slow query class consumes the error budget for all of them | SLO must be renegotiated per query class |
+| A4 | Connector p95 latency 200-800 ms; a long tail of sources exceed 2 s | **Assumed** - the brief asks for "connector latency percentiles" and supplies none | Drives timeout, partial-result, and async design (ADR-009) | Timeout budget shifts |
+| A5 | Tenants tolerate seconds-to-minutes staleness for most query classes | **Assumed** - the brief requires "avoid materially stale data vs. sources" without defining *materially* | Makes caching viable at all (ADR-005) | Cache hit ratio -> 0, cost and quota pressure rise sharply |
+| A6 | Query mix is **~30% result-cache hit / 55% single-source / 15% cross-app join** | **Assumed, and the most load-bearing assumption in this document** - the brief names no mix, and the sizing math it asks for cannot begin without one | Every figure in Section 5 is weighted by it. The 15% join share alone sets K=8, pod count (ceil(90/8) = 12, which is the *binding* constraint, not QPS) and the ~23 GB materialization term; the 30% hit ratio is what Section 5.4 calls the weakest number in the section | Re-derive Section 5 entirely - the same blast radius as A2 |
 
 ### 1.3 Non-goals for v1
 
@@ -1583,7 +1592,9 @@ at execution.
 
 From the targets: **100 MB/s / 1,000 QPS = ~100 KB average result payload** (A2).
 
-Query mix and mean service time:
+Query mix and mean service time. The mix is **assumed, not given** (A6): the brief supplies
+1k QPS and 100 MB/s and asks for sizing math, but names no split between query classes, and the
+math cannot proceed without one.
 
 | Class | Share | Mean service time W |
 |---|---|---|
@@ -1607,7 +1618,7 @@ guardrails (Section 8.4), not gateway pod sizing.
 |---|---|---|
 | **Gateway pods** | I/O-bound Go; ~100 QPS/pod, 4 vCPU. Memory (8 GB) derived below, not asserted | **20-24 pods**, 3 AZs, N+1 per AZ |
 | **Planner sidecars** | Only cache misses reach it: 10% x 1,000 = 100 plans/s; Calcite ~25 ms -> L = 2.5 concurrent | **4-6 pods**, floored by HA and warm spares rather than by load. Uncached, 1,000 plans/s -> L = 25 concurrent -> ~10-12 pods. The cache saves **~2-3x**, not an order of magnitude - see ADR-003 for why the fleet saving is *not* the main reason it exists. |
-| **Connector concurrency** | Calls/s = 0.55x1000 + 0.15x2x1000 + ~10% probes ~ **935 calls/s**; at connector p95 0.8 s -> L = 748 | **~750 concurrent outbound**, allocated per connector by semaphore (ADR-006) |
+| **Connector concurrency** | Calls/s = 0.55x1000 single-source + 0.15x1000 x **C** joins + ~10% probes, where **C = 1 build fetch + ceil(distinct build keys / MaxInList) probe chunks**, each of which may be several *billable* requests since quota is spent per page (ADR-006). At **C = 2** that is **935 calls/s**; at connector p95 0.8 s -> L = 748. **C = 2 is the floor used as the mean** - it holds only when the build side fits one IN-list chunk and neither side paginates. ADR-007's reference fixture (500 accounts, MaxInList 200) measures **17 calls for one join**. At C = 4 the total is ~1,235 calls/s (L = 990); at C = 17 it is ~3,185 (L = 2,550). Build-side cardinality is unmeasured, and under-counting is the dangerous direction: Section 5.4 calls connector quota a hard external ceiling we cannot autoscale past | **~750 concurrent outbound** at C = 2, allocated per connector by semaphore (ADR-006) |
 | **Materialization memory (tiers 0-1 only)** | Joins = 150 QPS x 0.6 s = 90 concurrent x 256 MB `memory_limit`, which multiplies **only under instance-per-query** (ADR-007) - one shared instance per pod would divide a single 256 MB pool 90 ways | **~23 GB fleet-wide**; capped at 8 concurrent joins/pod (2 GB), excess queued then shed. Off-heap, so it takes RSS but no GC multiplier (Section 6.3) |
 | **Result/freshness cache memory** | Miss rate 70% x 1,000 = 700/s; over a 60 s staleness window, 21,000-42,000 live entries x 100-200 KB/entry | **~2-8 GB fleet-wide**; a range, not a point estimate - see derivation below |
 | **Redis** | Lease reconciliation, not per-request: ~24 pods x ~20 buckets x 1 Hz ~ **500 ops/s** | Single 3-node cluster, vastly under-utilized |

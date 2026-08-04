@@ -125,13 +125,21 @@ cannot take on faith.**
 
 ## 2. Assumptions and non-goals
 
-| # | Assumption | Why it matters | If false |
-|---|---|---|---|
-| **A1** | Connectors expose per-user delegated OAuth, not just service accounts | Source ACLs are the primary entitlement substrate ([ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)) | Fall back to service-account + mirrored permission graph — materially worse |
-| **A2** | Average result payload ~100 KB (100 MB/s ÷ 1k QPS) | Drives egress, buffer, materialization sizing | Re-derive [§6](#6-capacity-and-performance) entirely |
-| **A3** | ~70% of queries are single-source with full pushdown | The P95 < 1.5 s SLO is scoped to these | SLO renegotiated per query class |
-| **A4** | Connector p95 200–800 ms; long tail exceeds 2 s | Drives timeout, partial-result, async design | Timeout budget shifts |
-| **A5** | Tenants tolerate seconds-to-minutes staleness | Makes caching viable at all | Hit ratio → 0; quota pressure rises sharply |
+**What the brief gives, and what we invented.** The brief fixes four numbers — **10M users, ~1k
+QPS peak, ~100 MB/s, P95 < 1.5 s for single-source pushdown queries** — then asks for *"sizing math
+for 1k QPS: concurrency limits, connector latency percentiles, cache hit ratios."* Every input that
+math needs beyond those four is ours. The table separates them, because a reviewer should be able
+to tell which numbers can be checked against the brief and which are judgment calls that a
+measurement could overturn.
+
+| # | Assumption | Source | Why it matters | If false |
+|---|---|---|---|---|
+| **A1** | Connectors expose per-user delegated OAuth, not just service accounts | **Assumed** — the brief says entitlements derive from *"source permissions and tenant policy"* but not how they are reached | Source ACLs are the primary entitlement substrate ([ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)) | Fall back to service-account + mirrored permission graph — materially worse |
+| **A2** | Average result payload ~100 KB | **Derived** — `100 MB/s ÷ 1k QPS`, both given | Drives egress, buffer, materialization sizing | Re-derive [§6](#6-capacity-and-performance) entirely |
+| **A3** | The P95 < 1.5 s SLO covers **single-source pushdown queries only**; joins get a separate 4 s SLI | **Given** — the brief scopes its SLO in exactly those words. The *split* between classes is A6 | Without the scope, one slow class consumes the budget for all of them | Renegotiate per query class |
+| **A4** | Connector p95 200–800 ms; long tail exceeds 2 s | **Assumed** — the brief asks for *"connector latency percentiles"* and supplies none | Drives timeout, partial-result, async design | Timeout budget shifts |
+| **A5** | Tenants tolerate seconds-to-minutes staleness | **Assumed** — the brief requires *"avoid materially stale data"* without defining *materially* | Makes caching viable at all | Hit ratio → 0; quota pressure rises sharply |
+| **A6** | Query mix is **~30% result-cache hit / 55% single-source / 15% cross-app join** | **Assumed, and the most load-bearing of these** — the brief names no mix, but the sizing math it asks for cannot be done without one | Every number in [§6](#6-capacity-and-performance) is weighted by it: the 15% share alone sets K=8, pod count (`⌈90/8⌉ = 12`, the *binding* constraint) and the ~23 GB memory term; the 30% is what [§6.4](#64-the-sensitivity-that-actually-matters) calls the weakest number in the section | Re-derive [§6](#6-capacity-and-performance) entirely — same blast radius as A2 |
 
 **Non-goals for v1:** DML, DDL, window functions, CTEs, subqueries, cross-tenant queries, joins
 wider than two sources, and anything requiring a persistent copy of customer data.
@@ -513,6 +521,10 @@ issuer** — key rotation, JWKS publication, and our own signing key's blast rad
 
 100 MB/s ÷ 1,000 QPS = **~100 KB average payload** (A2).
 
+The mix below is **assumed, not given** — see [A6](#2-assumptions-and-non-goals). The brief
+supplies 1k QPS and 100 MB/s and asks for sizing math; it names no query mix, and the math cannot
+proceed without one.
+
 | Query class | Share | Mean service time W |
 |---|---|---|
 | Cache hit | 30% | 20 ms |
@@ -541,7 +553,7 @@ the wrong variable.
 |---|---|---|
 | **Gateway pods** | I/O-bound Go, ~100 QPS/pod at 4 vCPU; memory derived in 6.3 | **20–24 pods**, 3 AZs, N+1 per AZ |
 | **Planner sidecars** | Only plan-cache misses reach it: **10%** × 1,000 = 100 plans/s; Calcite ~25 ms → L = 2.5. Deliberately pessimistic — [§6.4](#64-the-sensitivity-that-actually-matters) targets ≥95% hit, which would give 50 plans/s; the count is floored by HA either way | **4–6 pods** — floored by HA, not load. Uncached would be ~10–12; the cache saves ~2–3×, **not** an order of magnitude |
-| **Connector concurrency** | 0.55×1000 + 0.15×2×1000 + ~10% probes ≈ **935 calls/s**; at p95 0.8 s → L = 748 | **~750 concurrent outbound**, per-connector semaphore |
+| **Connector concurrency** | `0.55×1000` single-source + `0.15×1000 × C` joins + ~10% probes, where **C = 1 build fetch + ⌈distinct build keys ÷ `MaxInList`⌉ probe chunks** — each of which may be several *billable* requests, since quota is spent per page. At **C = 2** that is **935 calls/s**; at p95 0.8 s → L = 748 | **~750 concurrent outbound**, per-connector semaphore |
 | **Redis** | Lease reconciliation, not per-request: 24 pods × 20 buckets × 1 Hz | **~500 ops/s** — single 3-node cluster, vastly under-utilized |
 | **Network** | 100 MB/s egress ≈ 800 Mbps + comparable ingest | Budget **2 Gbps** sustained |
 
@@ -554,6 +566,22 @@ from Little's Law on [§6.1](#61-baseline)'s mix; working set is what one execut
 | Single-source miss | 550 × 0.270 = **148** | ~200 KB of fetched rows | **~30 MB** |
 | Cross-app join | 150 × 0.600 = **90** | **256 MB** (DuckDB `memory_limit`) | **~23 GB** |
 | | **245 in flight** | | **~23 GB** |
+
+⚠️ **`C = 2` is the floor used as the mean** — the same shape of error as the 256 MB cap below.
+It holds only when the build side fits one `IN`-list chunk *and* neither side paginates.
+[ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder)'s own reference fixture — 500
+accounts, `MaxInList` 200 — measures **17 calls for one join**, and `TestSemiJoinReducesProbeCalls`
+bounds the probe side at 20. `C` is set by build-side cardinality, which is unmeasured:
+
+| `C` | Joins contribute | Total calls/s | Concurrent outbound |
+|---|---|---|---|
+| **2** — floor, and what the row above plans on | 300 | ~935 | ~750 |
+| **4** — build side spans two chunks | 600 | ~1,235 | ~990 |
+| **17** — [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder)'s fixture | 2,550 | ~3,185 | ~2,550 |
+
+Under-counting is the dangerous direction here: [§6.4](#64-the-sensitivity-that-actually-matters)
+calls connector quota *"a hard external ceiling we cannot autoscale past"*, so believing we have
+headroom we don't is worse than over-provisioning pods.
 
 ⚠️ **74% of all memory rests on that 256 MB**, which is DuckDB's configured *cap* used as if it
 were the *mean*. It is unmeasured — see [§6.4](#64-the-sensitivity-that-actually-matters).
@@ -630,10 +658,10 @@ has no ceiling as built.
 
 ### 6.4 The sensitivity that actually matters
 
-The 30% hit ratio is the **weakest** number here — [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)'s per-principal keying means it
+The 30% hit ratio ([A6](#2-assumptions-and-non-goals)) is the **weakest** number here — [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)'s per-principal keying means it
 degrades as users-per-tenant grows.
 
-| Hit ratio | Mean W | Concurrency L | Connector calls/s |
+| Hit ratio | Mean W | Concurrency L | Connector calls/s (at `C = 2`) |
 |---|---|---|---|
 | 30% (planned) | 245 ms | 245 | ~935 |
 | 10% (pessimistic) | 308 ms | 308 | ~1,200 |

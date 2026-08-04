@@ -181,7 +181,7 @@ Request totals fall short of 30,001 as k6 sheds iterations under load (91 → 73
 |---|---|
 | **Entitlement enforcement (RLS/CLS)** | The two-identity demo in Quickstart above |
 | **Async reroute** | `Prefer: respond-async` header → returns a `poll_url`; poll it for the result. Doesn't require exhausting a budget first — the header reroutes on request, the same path a client falls back to after a `429` |
-| **Rate-limit exhaustion** | Compose runs unlimited by default. Start a second gateway with a budget: `go run ./cmd/gateway --addr :8090 --sf-url http://localhost:8081 --zd-url http://localhost:8082 --sf-limit 3`, then send 4 requests → 3× `200`, then `429` + `Retry-After: 1` |
+| **Rate-limit exhaustion** | Compose runs unlimited by default. Start a second gateway with `--sf-limit 12`, then send 4 requests → 3× `200`, then `429` + `Retry-After: 1`. The budget is **12, not 3**, because quota is spent per outbound HTTP request and compose serves 2,000 rows at 500/page — so one query costs 4 tokens |
 | **Freshness control** | Vary `max_staleness` across calls and watch `freshness_ms` and the cold/warm/revalidated states in the response |
 | **Load / hit ratio** | `docker compose --profile testing run --rm -e PRINCIPALS=10000 k6` |
 
@@ -330,7 +330,10 @@ docker compose --profile mocks up -d   # just the two mocks - the compose gatewa
 # execs the compiled binary as a *child*, so killing the go run job leaves the real
 # gateway holding :8090, and every re-run then fails with "address already in use".
 go build -o /tmp/emathp-gw ./cmd/gateway
-/tmp/emathp-gw --addr :8090 --sf-url http://localhost:8081 --zd-url http://localhost:8082 --sf-limit 3 &
+# --sf-limit 12, not 3: quota is spent per outbound HTTP request, and compose serves
+# 2,000 rows at 500 rows/page, so a single query costs 4 tokens. At 3 the *first* query
+# exhausts mid-pagination and 429s - correct behaviour, but it demonstrates nothing.
+/tmp/emathp-gw --addr :8090 --sf-url http://localhost:8081 --zd-url http://localhost:8082 --sf-limit 12 &
 GW=$!   # the gateway's own pid, directly killable
 
 for i in 1 2 3 4; do
@@ -415,10 +418,13 @@ mocksf ./cmd/mocksf`), not a unit test asserting internal state - showing the be
 describing it.
 
 Start it with the defaults (250 rows, page-size 100, `status` enforced - `cmd/mocksf/main.go`
-always sets that last one regardless of flags):
+always sets that last one regardless of flags). **On port 18081, not the default 8081**: if the
+compose stack is up it already owns 8081 with a *different* fixture (2,000 rows, 500/page), and
+the collision fails in the worst way - `mocksf` exits with `bind: address already in use`, the
+`curl`s below still return `200`, and every count is wrong. A free port removes the trap:
 
 ```
-$ ./mocksf &
+$ ./mocksf --addr :18081 &
 ```
 
 **Pagination** - 250 rows requested at `page-size=100` come back as three pages, the last one
@@ -426,11 +432,11 @@ short, each carrying an explicit `has_more` rather than the client having to gue
 row count:
 
 ```
-$ curl -s "http://localhost:8081/accounts?fields=id&offset=0"   | jq '{count: (.rows | length), has_more}'
+$ curl -s "http://localhost:18081/accounts?fields=id&offset=0"   | jq '{count: (.rows | length), has_more}'
 { "count": 100, "has_more": true }
-$ curl -s "http://localhost:8081/accounts?fields=id&offset=100" | jq '{count: (.rows | length), has_more}'
+$ curl -s "http://localhost:18081/accounts?fields=id&offset=100" | jq '{count: (.rows | length), has_more}'
 { "count": 100, "has_more": true }
-$ curl -s "http://localhost:8081/accounts?fields=id&offset=200" | jq '{count: (.rows | length), has_more}'
+$ curl -s "http://localhost:18081/accounts?fields=id&offset=200" | jq '{count: (.rows | length), has_more}'
 { "count": 50, "has_more": false }
 ```
 
@@ -448,10 +454,10 @@ three calls to the mock, matching the call-count assertion in the test.
 issued gets a 304, not a re-fetch of the full body:
 
 ```
-$ ETAG=$(curl -sI "http://localhost:8081/accounts" | grep -i '^etag' | tr -d '\r' | sed 's/.*: //')
+$ ETAG=$(curl -sI "http://localhost:18081/accounts" | grep -i '^etag' | tr -d '\r' | sed 's/.*: //')
 $ echo $ETAG
 7eaf965187fa89ec
-$ curl -s -o /dev/null -w "%{http_code}\n" -H "If-None-Match: $ETAG" "http://localhost:8081/accounts"
+$ curl -s -o /dev/null -w "%{http_code}\n" -H "If-None-Match: $ETAG" "http://localhost:18081/accounts"
 304
 ```
 
@@ -459,7 +465,7 @@ $ curl -s -o /dev/null -w "%{http_code}\n" -H "If-None-Match: $ETAG" "http://loc
 a value no row has returns zero rows, not the whole table:
 
 ```
-$ curl -s "http://localhost:8081/accounts?fields=id,status&status=closed" | jq '.rows | length'
+$ curl -s "http://localhost:18081/accounts?fields=id,status&status=closed" | jq '.rows | length'
 0
 ```
 
@@ -469,9 +475,9 @@ needs a second mock instance with different flags, so stop the first one before 
 same port, same "address already in use" failure as the Docker one earlier if you don't:
 
 ```
-$ kill %1   # or: pkill -f mocksf - stop the instance started above, it's still on :8081
-$ ./mocksf --rows 10 --lie-about region &
-$ curl -s "http://localhost:8081/accounts?fields=id,region&region=nonexistent-region" | jq '.rows | length'
+$ kill %1   # or: pkill -f mocksf - stop the instance started above, it still holds :18081
+$ ./mocksf --addr :18081 --rows 10 --lie-about region &
+$ curl -s "http://localhost:18081/accounts?fields=id,region&region=nonexistent-region" | jq '.rows | length'
 10
 ```
 

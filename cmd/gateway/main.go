@@ -11,6 +11,7 @@ import (
 
 	"github.com/pradhanbv/emathp/internal/catalog"
 	"github.com/pradhanbv/emathp/internal/connector"
+	"github.com/pradhanbv/emathp/internal/exec"
 	"github.com/pradhanbv/emathp/internal/freshness"
 	"github.com/pradhanbv/emathp/internal/identity/fixtures"
 	"github.com/pradhanbv/emathp/internal/obs"
@@ -28,6 +29,9 @@ func main() {
 	sfLimit := flag.Int("sf-limit", 0, "sf connector call budget for this process's lifetime (0 = unlimited)")
 	zdURL := flag.String("zd-url", "http://localhost:8082", "Zendesk mock connector URL")
 	zdLimit := flag.Int("zd-limit", 0, "zd connector call budget for this process's lifetime (0 = unlimited)")
+	joinEngine := flag.String("join-engine", "go", `join merge engine: "go" (default, cgo-free in-process hash join) or "duckdb" (ADR-007 tier 1, embedded DuckDB)`)
+	joinMemLimit := flag.String("join-memory-limit", "256MB", "per-join memory ceiling, duckdb engine only (DESIGN.md Section 6.2's K x 256 MB assumes one instance per query)")
+	joinThreads := flag.Int("join-threads", 1, "intra-query parallelism, duckdb engine only; K concurrent joins each claiming a core oversubscribes the pod")
 	otlpEndpoint := flag.String("otlp-endpoint", "", "OTLP/HTTP collector for traces, host:port with no scheme (e.g. jaeger:4318); empty disables tracing")
 	flag.Parse()
 
@@ -67,6 +71,20 @@ func main() {
 	}
 
 	// The issuer registry is control-plane state that would come from the
+	var engine exec.JoinEngine
+	switch *joinEngine {
+	case "go", "":
+		engine = exec.GoJoin{}
+	case "duckdb":
+		// One instance per query and threads capped low are not tuning
+		// choices: Section 6.2's K x 256 MB is only a real per-join ceiling
+		// if each join gets its own buffer manager, and DuckDB parallelises
+		// within a query. Both properties live in exec.DuckJoin.
+		engine = exec.DuckJoin{MemoryLimit: *joinMemLimit, Threads: *joinThreads}
+	default:
+		log.Fatalf("unknown --join-engine %q (want \"go\" or \"duckdb\")", *joinEngine)
+	}
+
 	// tenant registry in a real deployment; the fixtures package is the
 	// same one the test suite uses (see internal/identity/fixtures).
 	s := server.New(server.Deps{
@@ -80,6 +98,7 @@ func main() {
 			"sf": connector.NewHTTPSource(*sfURL),
 			"zd": connector.NewHTTPSource(*zdURL),
 		},
+		JoinEngine: engine,
 	})
 
 	httpServer := &http.Server{Addr: *addr, Handler: s.Handler()}

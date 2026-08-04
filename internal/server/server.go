@@ -52,6 +52,11 @@ type Deps struct {
 	RateLimit *ratelimit.Limiter
 	Freshness *freshness.Cache
 	Sources   map[string]connector.Source // connector prefix (e.g. "sf") -> source
+
+	// JoinEngine performs the merge step of a cross-app join (ADR-007
+	// tier 1). Nil means exec's default, the cgo-free in-process hash join.
+	// Set it to exec.DuckJoin{} to run the merge in an embedded DuckDB.
+	JoinEngine exec.JoinEngine
 }
 
 type Server struct {
@@ -306,7 +311,7 @@ func (s *Server) run(ctx context.Context, req QueryRequest, principal identity.P
 		defer cancel()
 	}
 
-	result, err := exec.Run(ctx, p, sources, principal.Attributes, params)
+	result, err := exec.Run(ctx, p, sources, principal.Attributes, params, exec.WithJoinEngine(s.deps.JoinEngine))
 	if err != nil {
 		status, code, retryAfter := classifyError(err, http.StatusBadGateway, "CONNECTOR_AUTH_FAILED")
 		message := err.Error()
@@ -380,7 +385,7 @@ func (s *Server) runStream(w http.ResponseWriter, ctx context.Context, req Query
 		frame.RateLimitStatus = rateLimitStatus(s.deps.RateLimit, sources)
 
 		var result *exec.Result
-		result, err = exec.Run(ctx, p, sources, principal.Attributes, params)
+		result, err = exec.Run(ctx, p, sources, principal.Attributes, params, exec.WithJoinEngine(s.deps.JoinEngine))
 		if err == nil {
 			frame.Columns = result.Columns
 			frame.Rows = rowsToAny(result.Rows)
@@ -576,6 +581,7 @@ func resultOutcome(traceID string, result *exec.Result, fresh freshnessSummary, 
 			CacheHit:          fresh.CacheHit,
 			Revalidated:       fresh.Revalidated,
 			JoinStrategy:      result.JoinStrategy,
+			JoinEngine:        result.JoinEngine,
 			NaiveCallEstimate: result.NaiveCallEstimate,
 		}
 	}

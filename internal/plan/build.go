@@ -15,7 +15,6 @@ import (
 type Plan struct {
 	Root     Node
 	verdicts map[string]Verdict
-	scans    map[string]*Scan
 
 	// security is a pre-mutation snapshot of every security-origin
 	// predicate Build injected. Only needed because tests simulate an
@@ -34,18 +33,18 @@ func (p *Plan) VerdictFor(expr string) Verdict {
 	return p.verdicts[normalizeExpr(expr)]
 }
 
-func (p *Plan) Scan(table string) *Scan {
-	return p.scans[table]
-}
-
-// PrimaryScan returns the plan's one Scan for a single-table plan. A join
-// plan has two - use PrimaryJoin and ScanIn(join.Left)/ScanIn(join.Right)
-// instead.
+// PrimaryScan returns the first Scan in tree order - the only one, for a
+// single-table plan. A join plan has one per side; use PrimaryJoin and
+// ScanIn(side.Root) instead, which is the only way to get the right one once
+// two aliases can name the same table.
+//
+// Derived from the tree rather than a parallel map. The map it replaced was
+// keyed by table name, so a self-join silently kept one side's Scan and
+// dropped the other's, and PrimaryScan read it by ranging - which Go
+// randomises, so with more than one entry the answer was not even stable.
+// The tree is the single source of truth; nothing can now disagree with it.
 func (p *Plan) PrimaryScan() *Scan {
-	for _, s := range p.scans {
-		return s
-	}
-	return nil
+	return ScanIn(p.Root)
 }
 
 // PrimaryJoin returns the plan's Join node, or nil for a single-table plan.
@@ -182,7 +181,7 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals, masks p
 		return nil, err
 	}
 
-	root, scan, verdicts, security, err := buildSideTree(table, wheres, residuals, cat, "", projectCols, maskCols)
+	root, _, verdicts, security, err := buildSideTree(table, wheres, residuals, cat, "", projectCols, maskCols)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +193,6 @@ func Build(sql string, cat *catalog.Catalog, residuals policy.Residuals, masks p
 	return &Plan{
 		Root:     root,
 		verdicts: verdicts,
-		scans:    map[string]*Scan{table: scan},
 		security: security,
 	}, nil
 }
@@ -221,6 +219,21 @@ type whereCond struct {
 // always fetched even if it's neither an output column nor a predicate
 // column (the semi-join needs it after fetch to key the in-memory match);
 // pass "" for a non-join build.
+// buildSideTreeMulti is buildSideTree for a side that may carry more than
+// one join key. A middle table in an N-way chain is both a probe (for the
+// link that reaches it) and a build side (for the link that leaves it), so
+// every key column it participates in has to survive over-projection.
+func buildSideTreeMulti(table string, wheres []whereCond, residuals policy.Residuals, cat *catalog.Catalog, joinKeyCols, outputCols, maskCols []string) (Node, *Scan, map[string]Verdict, []securityPredicate, error) {
+	root, scan, v, sec, err := buildSideTree(table, wheres, residuals, cat, "", outputCols, maskCols)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	for _, k := range joinKeyCols {
+		scan.Project = appendUnique(scan.Project, k)
+	}
+	return root, scan, v, sec, nil
+}
+
 func buildSideTree(table string, wheres []whereCond, residuals policy.Residuals, cat *catalog.Catalog, joinKeyCol string, outputCols, maskCols []string) (Node, *Scan, map[string]Verdict, []securityPredicate, error) {
 	scan := &Scan{Table: table}
 	verdicts := make(map[string]Verdict)
@@ -310,166 +323,189 @@ func checkMaskingSupported(cat *catalog.Catalog, table string, maskCols []string
 // one equi-join ON condition, alias-qualified SELECT and WHERE columns. It
 // mirrors Build's single-table logic per side (buildSideTree), then
 // combines both sides under one Join node.
+// flattenJoins walks the left-deep tree sqlparser builds for
+// `A JOIN B ON .. JOIN C ON ..` - ((A JOIN B) JOIN C) - collecting leaf
+// tables in FROM order alongside the ON condition that attaches each one.
+// It returns one more table than condition, which is what makes N-1 links.
+func flattenJoins(e sqlparser.TableExpr) ([]*sqlparser.AliasedTableExpr, []*sqlparser.JoinCondition, error) {
+	switch t := e.(type) {
+	case *sqlparser.AliasedTableExpr:
+		return []*sqlparser.AliasedTableExpr{t}, nil, nil
+	case *sqlparser.JoinTableExpr:
+		if t.Join != sqlparser.NormalJoinType {
+			return nil, nil, fmt.Errorf("%w: only INNER JOIN is supported (got %q); an outer join needs null-extending semantics the semi-join rewrite cannot express",
+				ErrUnsupportedStatement, t.Join.ToString())
+		}
+		if t.Condition == nil || t.Condition.On == nil {
+			return nil, nil, fmt.Errorf("%w: join requires an ON condition", ErrUnsupportedStatement)
+		}
+		tables, conds, err := flattenJoins(t.LeftExpr)
+		if err != nil {
+			return nil, nil, err
+		}
+		right, ok := t.RightExpr.(*sqlparser.AliasedTableExpr)
+		if !ok {
+			return nil, nil, fmt.Errorf("%w: the right side of a join must be a table, not a nested join", ErrUnsupportedStatement)
+		}
+		return append(tables, right), append(conds, t.Condition), nil
+	default:
+		return nil, nil, ErrUnsupportedStatement
+	}
+}
+
+func appendUnique(ss []string, s string) []string {
+	for _, x := range ss {
+		if x == s {
+			return ss
+		}
+	}
+	return append(ss, s)
+}
+
+// buildJoin handles an N-way inner equi-join: N aliased tables, N-1 ON
+// conditions, alias-qualified SELECT and WHERE columns. It mirrors Build's
+// single-table logic per side (buildSideTreeMulti), then combines every side
+// under one Join node.
+//
+// Outer joins are rejected in flattenJoins rather than downgraded.
+// LEFT/RIGHT/NATURAL parse into the same JoinTableExpr, so without that check
+// they would run as inner joins and silently return a *smaller* result than
+// asked for, with a 200. They also defeat the semi-join rewrite outright:
+// pushing a side's keys as an IN-list is precisely what makes unmatched keys
+// invisible.
 func buildJoin(sel *sqlparser.Select, je *sqlparser.JoinTableExpr, cat *catalog.Catalog, residuals policy.Residuals, masks policy.Masks) (*Plan, error) {
-	// v1 executes joins with a hand-rolled hash join (exec.hashJoin), a
-	// stand-in for ADR-007 tier 1's in-process DuckDB. A hand-rolled
-	// executor only implements what it was explicitly written to do, and
-	// this one does INNER JOIN. LEFT/RIGHT/NATURAL parse into the same
-	// JoinTableExpr, so without this check they ran as inner joins and
-	// silently returned a *smaller* result than asked for - unmatched left
-	// rows dropped, with a 200. Reject rather than mislead: outer joins
-	// also defeat the semi-join rewrite outright, since pushing the build
-	// side's keys as an IN-list is exactly what makes unmatched keys
-	// invisible. Both limitations disappear when tier 1 lands and DuckDB
-	// runs the join for real.
-	if je.Join != sqlparser.NormalJoinType {
-		return nil, fmt.Errorf("%w: only INNER JOIN is supported in v1 (got %q); outer joins arrive with ADR-007 tier 1's DuckDB executor",
-			ErrUnsupportedStatement, je.Join.ToString())
-	}
-
-	leftTable, err := tableName(je.LeftExpr)
+	ates, conds, err := flattenJoins(je)
 	if err != nil {
 		return nil, err
 	}
-	rightTable, err := tableName(je.RightExpr)
-	if err != nil {
-		return nil, err
+	n := len(ates)
+
+	aliases := make([]string, n)
+	tables := make([]string, n)
+	byAlias := make(map[string]int, n)
+	for i, ate := range ates {
+		tbl, err := tableName(ate)
+		if err != nil {
+			return nil, err
+		}
+		alias := ate.As.String()
+		if alias == "" {
+			alias = tbl
+		}
+		if _, dup := byAlias[alias]; dup {
+			return nil, fmt.Errorf("%w: alias %q used twice; every join side needs a distinct alias", ErrUnsupportedStatement, alias)
+		}
+		aliases[i], tables[i], byAlias[alias] = alias, tbl, i
 	}
 
-	leftAte, ok := je.LeftExpr.(*sqlparser.AliasedTableExpr)
-	if !ok {
-		return nil, ErrUnsupportedStatement
-	}
-	rightAte, ok := je.RightExpr.(*sqlparser.AliasedTableExpr)
-	if !ok {
-		return nil, ErrUnsupportedStatement
-	}
-	leftAlias := leftAte.As.String()
-	if leftAlias == "" {
-		leftAlias = leftTable
-	}
-	rightAlias := rightAte.As.String()
-	if rightAlias == "" {
-		rightAlias = rightTable
-	}
-
-	if je.Condition == nil || je.Condition.On == nil {
-		return nil, fmt.Errorf("%w: join requires an ON condition", ErrUnsupportedStatement)
-	}
-	leftKeyCol, rightKeyCol, err := equiJoinKeys(je.Condition.On, leftAlias, rightAlias)
-	if err != nil {
-		return nil, err
+	// Each ON condition attaches ates[i+1] to a side already in the join.
+	// Requiring that side to be strictly earlier in FROM order is what keeps
+	// the cascade fetchable: the IN-list pushed into a probe is always built
+	// from rows already retrieved.
+	links := make([]Link, 0, n-1)
+	keyCols := make([][]string, n) // join keys per side, for over-projection
+	for i, cond := range conds {
+		to := i + 1
+		aAlias, aCol, bAlias, bCol, err := equiJoinKeysAny(cond.On, byAlias)
+		if err != nil {
+			return nil, err
+		}
+		var from int
+		var fromCol, toCol string
+		switch {
+		case byAlias[bAlias] == to:
+			from, fromCol, toCol = byAlias[aAlias], aCol, bCol
+		case byAlias[aAlias] == to:
+			from, fromCol, toCol = byAlias[bAlias], bCol, aCol
+		default:
+			return nil, fmt.Errorf("%w: the ON condition joining %q must reference %q", ErrUnsupportedStatement, aliases[to], aliases[to])
+		}
+		if from >= to {
+			return nil, fmt.Errorf("%w: %q joins to a table appearing later in the FROM clause; reorder so each join references an earlier table",
+				ErrUnsupportedStatement, aliases[to])
+		}
+		probe, ok := cat.Table(tables[to])
+		if !ok || !probe.JoinKeyInList {
+			return nil, fmt.Errorf("%w: %s does not declare join_key_in_list - a semi-join probe side must accept a chunked IN-list",
+				ErrUnsupportedStatement, tables[to])
+		}
+		links = append(links, Link{From: from, FromCol: fromCol, To: to, ToCol: toCol, MaxInList: probe.MaxInList})
+		keyCols[from] = appendUnique(keyCols[from], fromCol)
+		keyCols[to] = appendUnique(keyCols[to], toCol)
 	}
 
 	projCols, err := projectionQualified(sel.SelectExprs)
 	if err != nil {
 		return nil, err
 	}
-
-	var leftProject, rightProject []string
+	perSideProject := make([][]string, n)
 	outCols := make([]ProjectCol, len(projCols))
 	for i, c := range projCols {
-		var table string
-		side := ""
-		switch c.Alias {
-		case leftAlias:
-			table = leftTable
-			leftProject = append(leftProject, c.Column)
-			side = JoinLeft
-		case rightAlias:
-			table = rightTable
-			rightProject = append(rightProject, c.Column)
-			side = JoinRight
-		default:
+		si, ok := byAlias[c.Alias]
+		if !ok {
 			return nil, fmt.Errorf("%w: unknown table alias %q", ErrUnsupportedStatement, c.Alias)
 		}
-		outCols[i] = ProjectCol{Name: c.Column, Side: side}
+		perSideProject[si] = appendUnique(perSideProject[si], c.Column)
+		outCols[i] = ProjectCol{Name: c.Column, Side: aliases[si]}
 		for _, m := range masks {
-			if m.Table == table && m.Column == c.Column {
+			if m.Table == tables[si] && m.Column == c.Column {
 				fn := m.Fn
 				outCols[i].Mask = &fn
 			}
 		}
 	}
 
-	var leftWhere, rightWhere []whereCond
+	perSideWhere := make([][]whereCond, n)
 	if sel.Where != nil {
 		conjuncts, err := splitConjuncts(sel.Where.Expr)
 		if err != nil {
 			return nil, err
 		}
 		// Param placeholders are numbered by i, the conjunct's position in
-		// the ORIGINAL (unsplit) list - not its position after being
-		// bucketed into leftWhere/rightWhere - so it lines up with
-		// ExtractParams, which re-parses the same original list without
-		// ever routing by alias.
+		// the ORIGINAL (unsplit) list - not its position after being bucketed
+		// by alias - so it lines up with ExtractParams, which re-parses the
+		// same original list without ever routing by alias.
 		for i, c := range conjuncts {
 			alias, col, op, value, err := comparisonPartsQualified(c)
 			if err != nil {
 				return nil, err
 			}
-			wc := whereCond{Col: col, Op: op, Literal: value, Param: paramPlaceholder(i)}
-			switch alias {
-			case leftAlias:
-				leftWhere = append(leftWhere, wc)
-			case rightAlias:
-				rightWhere = append(rightWhere, wc)
-			default:
+			si, ok := byAlias[alias]
+			if !ok {
 				return nil, fmt.Errorf("%w: unknown table alias %q", ErrUnsupportedStatement, alias)
 			}
+			perSideWhere[si] = append(perSideWhere[si], whereCond{Col: col, Op: op, Literal: value, Param: paramPlaceholder(i)})
 		}
 	}
 
-	leftMaskCols := maskColsFor(leftTable, masks)
-	rightMaskCols := maskColsFor(rightTable, masks)
-	if err := checkMaskingSupported(cat, leftTable, leftMaskCols); err != nil {
-		return nil, err
-	}
-	if err := checkMaskingSupported(cat, rightTable, rightMaskCols); err != nil {
-		return nil, err
-	}
-
-	probeTable, ok := cat.Table(rightTable)
-	if !ok || !probeTable.JoinKeyInList {
-		return nil, fmt.Errorf("%w: %s does not declare join_key_in_list - v1 only supports a semi-join probe side that accepts a chunked IN-list",
-			ErrUnsupportedStatement, rightTable)
-	}
-
-	leftRoot, leftScan, leftVerdicts, leftSecurity, err := buildSideTree(leftTable, leftWhere, residuals, cat, leftKeyCol, leftProject, leftMaskCols)
-	if err != nil {
-		return nil, err
-	}
-	rightRoot, rightScan, rightVerdicts, rightSecurity, err := buildSideTree(rightTable, rightWhere, residuals, cat, rightKeyCol, rightProject, rightMaskCols)
-	if err != nil {
-		return nil, err
+	sides := make([]JoinSide, n)
+	verdicts := map[string]Verdict{}
+	var security []securityPredicate
+	for i := 0; i < n; i++ {
+		maskCols := maskColsFor(tables[i], masks)
+		if err := checkMaskingSupported(cat, tables[i], maskCols); err != nil {
+			return nil, err
+		}
+		root, _, v, sec, err := buildSideTreeMulti(tables[i], perSideWhere[i], residuals, cat, keyCols[i], perSideProject[i], maskCols)
+		if err != nil {
+			return nil, err
+		}
+		// The Scan lives in root's subtree and is reached with ScanIn. There
+		// is deliberately no side table of scans: two aliases can name one
+		// table, so any map keyed by table name would drop a side.
+		sides[i] = JoinSide{Alias: aliases[i], Table: tables[i], Root: root}
+		for k, vv := range v {
+			verdicts[k] = vv
+		}
+		security = append(security, sec...)
 	}
 
-	join := &Join{
-		Left:      leftRoot,
-		Right:     rightRoot,
-		On:        Equi{LeftCol: leftKeyCol, RightCol: rightKeyCol},
-		MaxInList: probeTable.MaxInList,
-	}
-
+	join := &Join{Sides: sides, Links: links}
 	var root Node = join
 	if len(outCols) > 0 {
 		root = &Project{Child: join, Cols: outCols}
 	}
-
-	verdicts := make(map[string]Verdict, len(leftVerdicts)+len(rightVerdicts))
-	for k, v := range leftVerdicts {
-		verdicts[k] = v
-	}
-	for k, v := range rightVerdicts {
-		verdicts[k] = v
-	}
-
-	return &Plan{
-		Root:     root,
-		verdicts: verdicts,
-		scans:    map[string]*Scan{leftTable: leftScan, rightTable: rightScan},
-		security: append(leftSecurity, rightSecurity...),
-	}, nil
+	return &Plan{Root: root, verdicts: verdicts, security: security}, nil
 }
 
 // ParamPrefix is the marker exec's resolveValue recognizes for a
@@ -569,15 +605,24 @@ func ParseTables(sql string) ([]string, error) {
 	}
 
 	if je, ok := sel.From[0].(*sqlparser.JoinTableExpr); ok {
-		leftTable, err := tableName(je.LeftExpr)
+		// Every side, not just the outermost two. This feeds layer-1 object
+		// authz, so returning a subset would admit a denied table: the
+		// caller checks only what it is given. Erroring is the safe failure
+		// and a partial list is not - which is why flattenJoins is shared
+		// with buildJoin rather than re-derived here.
+		ates, _, err := flattenJoins(je)
 		if err != nil {
 			return nil, err
 		}
-		rightTable, err := tableName(je.RightExpr)
-		if err != nil {
-			return nil, err
+		out := make([]string, 0, len(ates))
+		for _, ate := range ates {
+			t, err := tableName(ate)
+			if err != nil {
+				return nil, err
+			}
+			out = appendUnique(out, t)
 		}
-		return []string{leftTable, rightTable}, nil
+		return out, nil
 	}
 
 	table, err := tableName(sel.From[0])
@@ -639,13 +684,21 @@ func Shape(sql string) (string, error) {
 }
 
 func joinShape(sel *sqlparser.Select, je *sqlparser.JoinTableExpr) (string, error) {
-	leftTable, err := tableName(je.LeftExpr)
+	ates, conds, err := flattenJoins(je)
 	if err != nil {
 		return "", err
 	}
-	rightTable, err := tableName(je.RightExpr)
-	if err != nil {
-		return "", err
+	names := make([]string, len(ates))
+	for i, ate := range ates {
+		t, err := tableName(ate)
+		if err != nil {
+			return "", err
+		}
+		alias := ate.As.String()
+		if alias == "" {
+			alias = t
+		}
+		names[i] = t + " " + alias
 	}
 
 	projCols, err := projectionQualified(sel.SelectExprs)
@@ -663,8 +716,8 @@ func joinShape(sel *sqlparser.Select, je *sqlparser.JoinTableExpr) (string, erro
 		if err != nil {
 			return "", err
 		}
-		for _, c := range conjuncts {
-			alias, col, op, _, err := comparisonPartsQualified(c)
+		for _, cj := range conjuncts {
+			alias, col, op, _, err := comparisonPartsQualified(cj)
 			if err != nil {
 				return "", err
 			}
@@ -672,7 +725,13 @@ func joinShape(sel *sqlparser.Select, je *sqlparser.JoinTableExpr) (string, erro
 		}
 	}
 
-	shape := "SELECT " + strings.Join(parts, ",") + " FROM " + leftTable + " JOIN " + rightTable
+	onShapes := make([]string, len(conds))
+	for i, cond := range conds {
+		onShapes[i] = sqlparser.String(cond.On)
+	}
+
+	shape := "SELECT " + strings.Join(parts, ",") + " FROM " + strings.Join(names, " JOIN ") +
+		" ON " + strings.Join(onShapes, " AND ")
 	if len(predShapes) > 0 {
 		shape += " WHERE " + strings.Join(predShapes, " AND ")
 	}
@@ -831,6 +890,29 @@ func comparisonPartsQualified(e sqlparser.Expr) (alias, col, op, value string, e
 // returning (leftTableCol, rightTableCol) regardless of which side each
 // one appears on in the source text - "t.org = a.ext" and "a.ext = t.org"
 // resolve to the same pair.
+// equiJoinKeysAny returns both sides of a column-to-column equality as
+// (alias, column) pairs, leaving orientation to the caller - an N-way join
+// discovers which side is already fetched rather than assuming left/right.
+func equiJoinKeysAny(e sqlparser.Expr, known map[string]int) (aAlias, aCol, bAlias, bCol string, err error) {
+	cmp, ok := e.(*sqlparser.ComparisonExpr)
+	if !ok || cmp.Operator != sqlparser.EqualOp {
+		return "", "", "", "", fmt.Errorf("%w: join condition must be a single column-to-column equality", ErrUnsupportedStatement)
+	}
+	lcn, lok := cmp.Left.(*sqlparser.ColName)
+	rcn, rok := cmp.Right.(*sqlparser.ColName)
+	if !lok || !rok {
+		return "", "", "", "", fmt.Errorf("%w: join condition must compare two columns", ErrUnsupportedStatement)
+	}
+	la, ra := lcn.Qualifier.Name.String(), rcn.Qualifier.Name.String()
+	if _, ok := known[la]; !ok {
+		return "", "", "", "", fmt.Errorf("%w: unknown table alias %q in join condition", ErrUnsupportedStatement, la)
+	}
+	if _, ok := known[ra]; !ok {
+		return "", "", "", "", fmt.Errorf("%w: unknown table alias %q in join condition", ErrUnsupportedStatement, ra)
+	}
+	return la, lcn.Name.String(), ra, rcn.Name.String(), nil
+}
+
 func equiJoinKeys(e sqlparser.Expr, leftAlias, rightAlias string) (leftCol, rightCol string, err error) {
 	cmp, ok := e.(*sqlparser.ComparisonExpr)
 	if !ok || cmp.Operator != sqlparser.EqualOp {

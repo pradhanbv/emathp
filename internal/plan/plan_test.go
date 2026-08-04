@@ -25,8 +25,8 @@ func TestCapabilityClassification(t *testing.T) {
 
 	require.Equal(t, plan.PushedEnforced, p.VerdictFor("status = 'open'").Disposition)
 	require.Equal(t, plan.Residual, p.VerdictFor("region = $principal.region").Disposition)
-	require.Contains(t, p.Scan("sf.accounts").Pushed, "status")
-	require.NotContains(t, p.Scan("sf.accounts").Pushed, "region")
+	require.Contains(t, p.PrimaryScan().Pushed, "status")
+	require.NotContains(t, p.PrimaryScan().Pushed, "region")
 }
 
 // TestSamePredicateDifferentCapabilityProfile is the cycle's literal "done

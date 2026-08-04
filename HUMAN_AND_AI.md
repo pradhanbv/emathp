@@ -67,6 +67,34 @@ repo's sharpest findings came from.
   one **process heap**, which no storage prefix or key separates.
 - **"why isn't sort in the key? is it in memory even after a hit?"** — two questions that found
   the **no-eviction defect** and the undisclosed `ORDER BY` gap.
+- **"why DuckDB and not SQLite?"** — SQLite appeared in **no document**, despite being the most
+  obvious alternative to an embedded engine. `REJECTED_ALTERNATIVES.md` opens by promising the
+  strongest case for *"every option that was genuinely in contention"* — but a register can only
+  hold options someone thought of, so it looks complete precisely because omissions leave no
+  trace. Answering it meant putting both engines against [§6](./DESIGN.md#6-capacity-and-performance)'s
+  own load, which is where the argument stopped being about speed:
+
+  At 1k QPS with a 15% join share that is **150 joins/s, 90 concurrent fleet-wide, 8 per pod** —
+  and the *concurrency* is what decides it. DuckDB gives each of those 8 its own buffer manager
+  and its own 256 MB ceiling. SQLite's heap limit is process-wide, so the same 2 GB arrives as
+  **one pool the 8 divide**. Same total memory, different shape — and in a shared pool the query
+  that fails is whichever is allocating when the pool runs out, so a 5 MB join fails because a
+  1.9 GB one is holding it and `RESULT_TOO_LARGE` names the wrong query. At one join at a time
+  the distinction would not exist; it exists because joins are concurrent.
+
+  The answer that survived was not the one I first gave. Not *"DuckDB is faster"* but
+  **"DuckDB degrades acceptably at both ends of the join-size distribution, SQLite only at the
+  small end"** — safe under uncertainty rather than better. Which end the traffic actually sits at
+  is the same unmeasured number [§6.4](./DESIGN.md#64-the-sensitivity-that-actually-matters) already
+  ranks first.
+- **Choosing "behind an interface, opt-in" when asked how far DuckDB should go.** The alternative
+  on offer was to make DuckDB *the* tier-1 executor, and that option's own description said
+  `delete hashJoin`. Taking it would have removed the Go join entirely — so "does the Go
+  implementation do N-way joins?" could not have been asked, let alone answered yes. Keeping both
+  forced the N-way contract to be *written down* as an interface (`sides`, `links`) instead of
+  living inside whichever implementation happened to survive. **The consequence only surfaced
+  three prompts later**, which makes it a different shape from the rest of this list: not a wrong
+  number caught, but a scope decision whose value was invisible when it was made.
 
 ### 4. Process and presentation
 

@@ -3,7 +3,7 @@
 Navigation for the implementation. The design lives in [`DESIGN.md`](./DESIGN.md); this is where
 each decision actually landed in code, and where the bodies are buried.
 
-**4,663 lines of Go, 1,713 of tests, 50 tests.** Run everything with `go test -race ./...` (~5 s).
+**5,140 lines of Go, 2,020 of tests, 56 tests.** Run everything with `go test -race ./...` (~6 s); `-tags duckdb` adds one more that exercises DuckDB directly.
 
 ---
 
@@ -14,7 +14,7 @@ each decision actually landed in code, and where the bodies are buried.
 | **The security argument**, end to end | [`exec.go:365`](internal/exec/exec.go#L365) `verifyPushedSecurityPredicates` | The runtime half of ADR-002. Re-applies every `ENFORCED` predicate after fetch, so a connector that lied about enforcing it fails closed rather than leaking |
 | **Whether the design is real** | [`plan/invariant.go:65`](internal/plan/invariant.go#L65) `AssertInvariant` | The plan-time half. Proves no security predicate went missing between policy and plan |
 | **One request, beginning to end** | [`server.go:118`](internal/server/server.go#L118) → the table below | ~200 lines covers admission, policy, planning, execution, envelope |
-| **The hardest thing here** | [`exec.go:107`](internal/exec/exec.go#L107) `runJoin` | Semi-join rewrite across two SaaS APIs, plus the chunking that makes it bounded |
+| **The hardest thing here** | [`exec.go`](internal/exec/exec.go) `runJoin` | The N-way semi-join cascade across SaaS APIs, plus the chunking that keeps each probe bounded |
 
 ---
 
@@ -29,7 +29,7 @@ Everything below happens inside one `POST /v1/query`. File references are the re
 | 3 | **Plan (or cache hit)** | [`server.go:194`](internal/server/server.go#L194) → [`plancache.go:77`](internal/plancache/plancache.go#L77) `Resolve` | Six-field key; RLS/CLS residuals injected as plan nodes (L2) |
 | 4 | **Bind literals** | [`build.go:596`](internal/plan/build.go#L596) `Shape` + `ExtractParams` | Cached plans hold `?` placeholders, so two literals share one plan and each still sees its own value |
 | 5 | **Wrap sources** | [`server.go:234`](internal/server/server.go#L234) `freshness.Source{}` | Per-request cache decorator over the shared connector |
-| 6 | **Execute** | [`exec.go:68`](internal/exec/exec.go#L68) `Run` | Single-table scan, or `runJoin` |
+| 6 | **Execute** | [`exec.go`](internal/exec/exec.go) `Run` | Single-table scan, or `runJoin` — an N-way semi-join cascade over the plan's sides and links |
 | 7 | **Fetch + verify (L3)** | [`exec.go:217`](internal/exec/exec.go#L217) | Verification filter, then `applyLocalFilters` — **per side, before any join merge** |
 | 8 | **Project** | [`exec.go:426`](internal/exec/exec.go#L426) `project` | Positional rows, so `a.id` and `t.id` are two slots rather than one overwritten map key |
 
@@ -48,9 +48,9 @@ Sizes are source lines excluding tests.
 
 | Package | Src | What it owns |
 |---|---|---|
-| [`plan`](internal/plan/) | **1,116** | Parse → capability-aware pushdown → residual injection → the invariant. `build.go` is 872 of it and is the densest file in the repo |
+| [`plan`](internal/plan/) | **1,227** | Parse → capability-aware pushdown → residual injection → the invariant. `build.go` is ~950 of it and is the densest file in the repo |
 | [`server`](internal/server/) | 681 | HTTP surface, admission, error vocabulary, sync + async + NDJSON paths |
-| [`exec`](internal/exec/) | 501 | Fetch, semi-join, verification filter, local filters, masking, projection |
+| [`exec`](internal/exec/) | 841 | Fetch, N-way semi-join cascade, two pluggable `JoinEngine`s (Go and DuckDB), verification filter, local filters, masking, projection |
 | [`connector`](internal/connector/) | 244 | The `Source` contract, HTTP implementation, pagination, ETags, per-page quota gate |
 
 ### Supporting
@@ -87,7 +87,7 @@ the predicate — the adversary the whole entitlement model is built against.
 | **003** Caching | [`plancache/`](internal/plancache/) and [`freshness/`](internal/freshness/) |
 | **005** Freshness | [`freshness.go`](internal/freshness/freshness.go) + ETag handling in [`httpsource.go`](internal/connector/httpsource.go) |
 | **006** Rate limits | [`ratelimit/`](internal/ratelimit/) + the page gate in [`httpsource.go`](internal/connector/httpsource.go) |
-| **007** Joins | [`exec.go:107`](internal/exec/exec.go#L107) `runJoin` — tier 0/1 only; tiers 2–3 are designed, not built |
+| **007** Joins | [`exec.go`](internal/exec/exec.go) `runJoin` + [`joinengine.go`](internal/exec/joinengine.go) / [`duckjoin.go`](internal/exec/duckjoin.go) — tier 1 is real (embedded DuckDB, `--join-engine=duckdb`). **`JoinEngine` deliberately stops at tier 1**: it passes rows in memory, and tiers 2–3 exist because rows don't fit. They need a `Submit`/`Poll` interface, not a wider one |
 | **009** Streaming | `runStream` in [`server.go`](internal/server/server.go), NDJSON terminal frame |
 | **011** Identity | [`identity/`](internal/identity/) |
 
@@ -107,6 +107,8 @@ ADR-004, 008 and 010 are design-only — no code. That is deliberate and
 | `TestPlanCacheDoesNotLeakAcrossRoles` | Privilege escalation via a shared plan |
 | `TestConcurrentResolvesDoNotBleedAcrossRoles` | The same, **under contention** |
 | `TestSemiJoinReducesProbeCalls` | 505 → 17 calls |
+| `TestFourTableJoinEndToEnd` | **N-way works** — 4 tables, 3 links over HTTP, through every engine in the build (`-tags duckdb` adds DuckDB and requires identical output) |
+| `TestJoinRejectsForwardReference` | Every join must reference an earlier table, so a probe's keys are always already fetched |
 | `TestSemiJoinReturnsEveryMatchingRow` | Exactly 2,500 rows across 3 chunks — the correctness half |
 | `TestJoinKeepsBothSidesOfCollidingColumns` | `a.id` and `t.id` both survive the merge |
 | `TestOuterJoinsRejectedNotSilentlyDowngraded` | `LEFT`/`RIGHT`/`CROSS` are refused, not run as inner |
@@ -126,7 +128,7 @@ These are real and deliberate. Claiming otherwise would be the actual defect.
 | **No plan-cache eviction** | [`plancache.go`](internal/plancache/plancache.go) `Cache` | Documented in the type comment. Resident memory grows with distinct keys |
 | **No singleflight** | [`freshness.go`](internal/freshness/freshness.go) | `TestConcurrentMissesOnOneKeyStampedeToTheConnector` **asserts the stampede** so the gap stays visible |
 | **Per-pod rate limit buckets** | [`ratelimit/`](internal/ratelimit/) | N pods = N× the limit. Design specifies Redis leases |
-| **2-table join cap** | [`build.go:313`](internal/plan/build.go#L313) | MVP executor limit, *not* a planner one — the per-scan pipeline never counts tables |
+| **Join order is FROM order** | [`build.go`](internal/plan/build.go) `buildJoin` | N-way works, but the cascade is left-deep in FROM order; cost-based ordering needs the planner ADR-001 defers |
 | **`LIMIT`/`OFFSET` unsupported** | [`build.go`](internal/plan/build.go) | Same layer as projection; parsed, not honoured |
 | **`extra` can clobber `pushed`** | `fetchScanRows` in [`exec.go`](internal/exec/exec.go) | Latent — unreachable until a catalog declares the join key filterable |
 
@@ -153,9 +155,10 @@ currently unreachable.
 ## Commands
 
 ```bash
-go test -race ./...                  # 50 tests, ~5s
+go test -race ./...                  # 56 tests, ~6s
 go test ./... -run 'LyingConnector|PlanCacheDoesNotLeak|SemiJoin|TenantDerived' -v
 go run ./cmd/gateway                 # needs mocksf + mockzd, see README Quickstart
+docker compose --profile duckdb up -d --build   # ADR-007 tier 1 on :8090 (cgo, 148MB vs 49.5MB)
 ```
 
 Full reproduction of every claim: [`README.md`](./README.md)'s recreate appendix.

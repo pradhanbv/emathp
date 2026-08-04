@@ -70,22 +70,19 @@ func (f *Filter) Children() []Node { return []Node{f.Child} }
 type ProjectCol struct {
 	Name string
 	Mask *string
-	// Side is which join input this column came from - JoinLeft or
-	// JoinRight - and is empty for a single-table plan. A join merges both
-	// sides' rows into one map, so a column name present on both (mocksf
-	// and mockzd both expose "id") would otherwise resolve to whichever
-	// side was written last. The alias is known at plan time
+	// Side is the SQL alias of the join input this column came from - "a",
+	// "t" - and is empty for a single-table plan. A join merges every side's
+	// rows into one map, so a column name present on more than one side
+	// (mocksf and mockzd both expose "id") would otherwise resolve to
+	// whichever side was written last. The alias is known at plan time
 	// (projectionQualified requires one for any joined query); Side is how
 	// it survives to projection instead of being discarded there.
+	//
+	// This was "L"/"R" while joins were two-table. An N-way join has no
+	// left and right, and the alias was already available - collapsing it
+	// to a side marker was what made the merge non-composable.
 	Side string
 }
-
-// Join sides, used as ProjectCol.Side and as the namespace prefix exec
-// applies when merging join rows.
-const (
-	JoinLeft  = "L"
-	JoinRight = "R"
-)
 
 type Project struct {
 	Child Node
@@ -100,17 +97,48 @@ type Equi struct {
 	RightCol string
 }
 
-// Join is a two-table equi-join. v1's only strategy is semi-join: Left is
-// always the build side (scanned in full) and Right the probe side (its
-// join-key values pushed as a chunked IN-list) - a positional rule (FROM
-// table = build, JOIN table = probe) rather than a cost-based choice,
-// since there are no cardinality stats to choose from. MaxInList is the
-// probe table's catalog-declared IN-list capacity, resolved at build time
-// since it's a static capability, not a runtime value.
-type Join struct {
-	Left, Right Node
-	On          Equi
-	MaxInList   int
+// JoinSide is one input to a join: an alias, the table it reads, and the
+// filtered subtree that produces its rows.
+type JoinSide struct {
+	Alias string
+	Table string
+	Root  Node
 }
 
-func (j *Join) Children() []Node { return []Node{j.Left, j.Right} }
+// Link joins one side to a side that is already part of the accumulated
+// result. From must be an index that appears earlier in the join order than
+// To, which is what makes the semi-join cascade possible: the keys pushed
+// into To's connector come from rows already fetched.
+//
+// MaxInList is To's catalog-declared IN-list capacity, resolved at build
+// time since it is a static capability rather than a runtime value.
+type Link struct {
+	From      int
+	FromCol   string
+	To        int
+	ToCol     string
+	MaxInList int
+}
+
+// Join is an N-way equi-join: Sides in the order they appear in the FROM
+// clause, and len(Sides)-1 Links describing how each side attaches to one
+// already joined.
+//
+// The strategy is a left-deep semi-join cascade. Sides[0] is scanned in
+// full; every later side is a probe whose join-key values are pushed as a
+// chunked IN-list built from rows already in hand. That is a positional
+// rule (FROM order) rather than a cost-based one, since there are no
+// cardinality statistics to order by - ADR-007 names choosing a fetch order
+// across a join graph as the optimisation that remains.
+type Join struct {
+	Sides []JoinSide
+	Links []Link
+}
+
+func (j *Join) Children() []Node {
+	out := make([]Node, 0, len(j.Sides))
+	for _, s := range j.Sides {
+		out = append(out, s.Root)
+	}
+	return out
+}

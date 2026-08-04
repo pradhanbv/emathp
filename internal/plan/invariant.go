@@ -48,8 +48,9 @@ func removeFilter(n Node, column string) Node {
 		t.Child = removeFilter(t.Child, column)
 		return t
 	case *Join:
-		t.Left = removeFilter(t.Left, column)
-		t.Right = removeFilter(t.Right, column)
+		for i := range t.Sides {
+			t.Sides[i].Root = removeFilter(t.Sides[i].Root, column)
+		}
 		return t
 	default:
 		return n

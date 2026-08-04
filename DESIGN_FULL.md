@@ -160,8 +160,8 @@ does not supply inputs for - but it should be visible rather than implied.
 
 ### 1.3 Non-goals for v1
 
-DML, DDL, window functions, CTEs, subqueries, cross-tenant queries, joins wider than two
-sources, and anything requiring a persistent copy of customer data. Materialization is
+DML, DDL, window functions, CTEs, subqueries, cross-tenant queries, joins whose ON clause
+references a table appearing later in the FROM clause, and anything requiring a persistent copy of customer data. Materialization is
 ephemeral by construction (ADR-007, ADR-010).
 
 ### 1.4 SQL surface (v1)
@@ -1107,7 +1107,7 @@ count, and never a runtime "try small, retry bigger on failure" loop.
 | Tier | What fits and what doesn't fit | How it solves it |
 |---|---|---|
 | **0. Single-table (no join)** | • Fits: every query with no join at all<br>• Doesn't fit: anything with two or more tables → tier 1 | • Straight connector fetch + pushdown, returned as the response<br>• No local engine invoked - nothing to combine, nothing to hold beyond one request |
-| **1. DuckDB (in-process, any join)** | • Fits: any join - 2-table in the MVP executor, N-way by design - whose estimated working set stays within the gateway pod's shared memory budget<br>• Doesn't fit: estimate exceeds that budget → `RESULT_TOO_LARGE`, or if it would fit tier 2, suggest `Prefer: respond-async` | • **One instance per query, not one shared per pod**: `memory_limit` binds a database instance's buffer manager, not a connection, so this is what makes Section 6.3's K x 256 MB a real per-join ceiling rather than a single pool 90 joins divide between<br>• **`threads` capped low**: DuckDB parallelises within a query, and K concurrent joins each claiming a core oversubscribes the pod. The vectorised execution model still wins single-threaded<br>• **Fed in Arrow batches, never row-at-a-time**: cgo cost is per boundary crossing, and row-granular ingestion puts millions of them inside a window that blocks an OS thread<br>• Explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset after every query<br>• The semi-join rewrite (below) decides how much data actually has to be loaded, which keeps most joins cheap enough to never need to escalate<br>• Nothing survives past the request - nothing to crypto-shred |
+| **1. DuckDB (in-process, any join)** | • Fits: any inner equi-join, N-way (four tables and three links are tested end to end), whose estimated working set stays within the gateway pod's shared memory budget<br>• Doesn't fit: estimate exceeds that budget → `RESULT_TOO_LARGE`, or if it would fit tier 2, suggest `Prefer: respond-async` | • **One instance per query, not one shared per pod**: `memory_limit` binds a database instance's buffer manager, not a connection, so this is what makes Section 6.3's K x 256 MB a real per-join ceiling rather than a single pool 90 joins divide between<br>• **`threads` capped low**: DuckDB parallelises within a query, and K concurrent joins each claiming a core oversubscribes the pod. The vectorised execution model still wins single-threaded<br>• **Bulk-loaded through DuckDB's appender, never row-at-a-time**: the appender writes into DuckDB's internal data chunks and flushes per vector, so the cgo boundary is crossed per chunk rather than per row or per `INSERT` statement. Arrow is the alternative, but ingesting through it requires an `array.RecordReader` - `apache/arrow-go` as a dependency, to describe data that is entirely `VARCHAR`<br>• Explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset after every query<br>• The semi-join rewrite (below) decides how much data actually has to be loaded, which keeps most joins cheap enough to never need to escalate<br>• Nothing survives past the request - nothing to crypto-shred |
 | **2. ClickHouse (warm pool, async)** | • Fits: estimate exceeds the gateway-pod ceiling but stays within what one (larger) node can hold **in memory**<br>• Doesn't fit: estimate exceeds one node's memory, or the join genuinely needs distributed shuffle → tier 3 | • A warm pool running **one job at a time per node** - not an instance per job, not concurrent tenants<br>• **Strictly in-memory, like tier 1** - external sort/aggregation disabled, so the ceiling stays a number the planner can estimate against<br>• Input staged as Parquet on S3 under a per-tenant prefix, SSE-KMS with the tenant's KEK; nothing reaches local disk, so that staged input is the whole shred surface (ADR-010) |
 | **3. Spark serverless (async)** | • Fits: estimate exceeds single-node comfort - genuinely needs distributed shuffle<br>• Doesn't fit: nothing, technically - the only remaining limit is cost | • Managed serverless job (EMR Serverless / Databricks job clusters / Dataproc Serverless); ephemeral executors, one tenant per job<br>• Shuffle spill lives on ephemeral executor disk, destroyed at teardown; the job's output goes to Parquet on S3 with per-tenant SSE-KMS - the same mechanism ADR-010 uses everywhere else |
 
@@ -1177,6 +1177,30 @@ concurrent job count, so tier 2 stops being economical well before tier 3 does; 
 whether tier 2 is provisioned at all - which the risk register's trigger already gates - and never
 how an individual query is routed.
 
+**Where the executor interface stops, and why.** `exec.JoinEngine` - the seam that lets the
+in-process merge be either the cgo-free Go hash join or an embedded DuckDB - takes
+`[]connector.Row` in and returns `[]connector.Row` out. Every row therefore has to fit the
+gateway's Go heap, and tiers 2-3 exist precisely because the working set does not. Routing to
+tier 2 through that interface would require first doing the thing tier 2 avoids.
+
+Three further properties invert at the same boundary. The call is synchronous, where tiers 2-3 are
+202-and-poll with no completion SLO. The result materialises in memory, where a tier-3 result can
+exceed the whole pod. And `JoinInput` carries a SQL alias but no tenant, which staging needs for
+the per-tenant S3 prefix and KEK (ADR-010). Widening a single interface across both would force
+tier 1 to pay job-submission overhead for a ~100 ms merge, or tier 2 to hold a request thread for
+minutes - a lowest-common-denominator abstraction serving neither.
+
+Tiers 2-3 therefore get a *second* interface rather than a wider one: `Submit(tenant, staged,
+links) -> JobID` with `Poll(JobID)`, and the tier router chooses. The split is cheap because two
+things carry across unchanged. The **join graph** is one: `plan.Link` holds indices into the side
+list rather than node pointers, so the same object describes the work whether DuckDB, ClickHouse
+or Spark executes it - and a future cost-based reorderer rewrites indices without touching any
+executor. The **fetch cascade** is the other: tiers 2-3 still fetch each side filtered, still get
+the semi-join reduction that decides how much is staged at all, and only then write Parquet
+instead of merging. The single signature change that split needs is a sink -
+`fetchSides(..., sink RowSink)`, an in-memory collector for tier 1 and a Parquet writer for
+tiers 2-3 - because at tier-3 scale one side alone may not fit in memory.
+
 **Why Spark for tier 3, and not just a bigger ClickHouse node.** ClickHouse's cluster mode is
 built for scatter-gather aggregation; a genuine large-large distributed join needs `GLOBAL JOIN`
 (broadcast the smaller side to every shard), which degenerates back to "one side must fit
@@ -1224,24 +1248,31 @@ scales by adding executors, not by fitting on one node.
  residency obligation (Section 4.3) that federated execution avoids.
 
 
-**Scope: what is built versus what is designed.** The 2-table cap lives in the hand-rolled Go
-executor - one build side, one probe side - and a v1 parse restriction that accepts a single join
-node. It does not live in the planner: Calcite was chosen partly *for* its cost-based join ordering
-(ADR-001), and tier 1's DuckDB orders joins itself when handed the query. Nor does it live in any
-execution tier - DuckDB, ClickHouse and Spark are all inherently N-way capable. Everything between
-the parse and the join is already N-agnostic: source decomposition, OPA residual injection,
-over-projection and the runtime verification filter all apply **per scan**, in a loop that never
-counts tables. So lifting the cap is mostly deleting a restriction and handing the join to an engine
-that already does N-way. What genuinely remains is optimization rather than capability: generalizing
-the semi-join rewrite from one build/probe pair to a fetch order across a join graph, and estimating
-an N-way working set well enough to route between tiers. That second one also makes routing
-*harder*, not easier - cardinality-estimate error, already a known risk at 2 tables (see the
-semi-join section above), compounds as more tables chain together, so N-way joins will misroute
-between tiers more often than 2-way joins do.
+**Scope: what is built versus what is designed.** N-way joins execute. Four tables and three
+links run end to end through both engines (`TestFourTableJoinEndToEnd`, which covers whichever
+engines the build includes), and
+`TestDuckDBIsNWayCapable` shows the engine was never the constraint.
+
+Getting there cost more than an earlier draft of this section predicted. It called lifting the
+2-table cap "mostly deleting a restriction"; in fact the cap spanned three layers - a parse
+restriction, `plan` collapsing join sides to left/right rather than carrying N aliases, and
+`JoinEngine` being 2-way by signature with an output shape that did not match its input shape.
+Deleting the parse check alone would have produced a plan the executor could not run. `Join` now
+carries `Sides` plus N-1 `Links`, and `ProjectCol.Side` holds the SQL **alias** instead of "L"/"R" -
+the alias was always available at plan time, and collapsing it is precisely what made the merge
+non-composable.
+
+What N-way still lacks is *ordering*, not capability. The cascade is left-deep in FROM order, and
+every join must reference an earlier table (`TestJoinRejectsForwardReference`) so the IN-list
+pushed into a probe is always built from rows already fetched. Choosing a better order needs
+cost-based join ordering - the planner ADR-001 defers - plus an N-way working-set estimate good
+enough to route between tiers. That estimate also makes routing *harder*, not easier:
+cardinality-estimate error, already a known risk at two tables, compounds as more tables chain
+together, so N-way joins will misroute between tiers more often than 2-way joins do.
 
 **Revisit if.** > 20% of joins fall back past tier 0; tier-1 memory rejections become a common
 support burden; tier-2 rejections become common enough that tier 3 stops being a rare escape
-hatch; N-way join volume justifies lifting the MVP executor's 2-table cap; or a wrong cardinality
+hatch; N-way join volume justifies cost-based join ordering rather than FROM order; or a wrong cardinality
 estimate routes a job to a tier too small for it often enough to need a runtime escalation/retry
 path, which does not exist today.
 

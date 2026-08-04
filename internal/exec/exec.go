@@ -24,10 +24,14 @@ type Result struct {
 	Rows    [][]string
 	Debug   Debug
 
-	// JoinStrategy and NaiveCallEstimate are set only when the plan had a
-	// Join (Cycle 10, ADR-007) - the pushdown-creativity evidence the
-	// gateway reports back in the response envelope's Meta.
+	// JoinStrategy, JoinEngine and NaiveCallEstimate are set only when the
+	// plan had a Join (Cycle 10, ADR-007) - the pushdown-creativity evidence
+	// the gateway reports back in the response envelope's Meta. JoinEngine
+	// names which JoinEngine performed the merge, so a caller can tell the
+	// Go and DuckDB paths apart from the response rather than from the flag
+	// the operator happened to set.
 	JoinStrategy      string
+	JoinEngine        string
 	NaiveCallEstimate int
 }
 
@@ -66,9 +70,9 @@ func (e *SourceTimeoutError) Unwrap() error { return context.DeadlineExceeded }
 // plan.ExtractParams(sql) run against the CURRENT request's own SQL text,
 // never the plan's - see whereCond's doc comment in the plan package for
 // the bug this indirection exists to prevent.
-func Run(ctx context.Context, p *plan.Plan, sources map[string]connector.Source, attrs map[string]string, params []string) (*Result, error) {
+func Run(ctx context.Context, p *plan.Plan, sources map[string]connector.Source, attrs map[string]string, params []string, opts ...option) (*Result, error) {
 	if join := p.PrimaryJoin(); join != nil {
-		return runJoin(ctx, p, join, sources, attrs, params)
+		return runJoin(ctx, p, join, sources, attrs, params, newRunConfig(opts).engine)
 	}
 
 	scan := p.PrimaryScan()
@@ -99,56 +103,78 @@ func Run(ctx context.Context, p *plan.Plan, sources map[string]connector.Source,
 	}, nil
 }
 
-// runJoin is the semi-join rewrite (ADR-007): fetch the build side (Left)
-// in full, chunk its distinct join-key values by the probe side's
-// catalog-declared IN-list capacity, and fetch the probe side (Right) one
-// chunk at a time instead of once per build row. The two fetched row sets
-// are then joined in memory - pushdown reduced which probe rows came back,
-// this just pairs what did.
-func runJoin(ctx context.Context, p *plan.Plan, join *plan.Join, sources map[string]connector.Source, attrs map[string]string, params []string) (*Result, error) {
-	buildScan := plan.ScanIn(join.Left)
-	probeScan := plan.ScanIn(join.Right)
-	if buildScan == nil || probeScan == nil {
-		return nil, fmt.Errorf("exec: join side has no scan")
-	}
+// runJoin is the semi-join cascade (ADR-007). Sides[0] is fetched in full;
+// each later side is a probe whose join-key values come from rows already in
+// hand, chunked by that side's catalog-declared IN-list capacity and pushed
+// as a filter - so the probe returns only rows that can possibly match,
+// instead of one call per key.
+//
+// The cascade is left-deep and follows FROM order. plan.buildJoin enforces
+// that every link reaches backwards (Link.From < Link.To), which guarantees
+// the keys for a probe are in hand when its turn comes. Choosing a better
+// order is the optimisation ADR-007 defers.
+func runJoin(ctx context.Context, p *plan.Plan, join *plan.Join, sources map[string]connector.Source, attrs map[string]string, params []string, engine JoinEngine) (*Result, error) {
+	n := len(join.Sides)
+	fetched := make([][]connector.Row, n)
+	inputs := make([]JoinInput, n)
+	var fetchedCols []string
+	naive := 0
 
-	buildSource, err := sourceFor(sources, buildScan.Table)
-	if err != nil {
-		return nil, err
-	}
-	probeSource, err := sourceFor(sources, probeScan.Table)
-	if err != nil {
-		return nil, err
-	}
-
-	buildRows, err := fetchScanRows(ctx, buildSource, buildScan, plan.FiltersIn(join.Left), attrs, params, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	keys := distinctValues(buildRows, join.On.LeftCol)
-	naiveCallEstimate := len(keys) // one call per build-side key, unbatched
-
-	chunkSize := join.MaxInList
-	if chunkSize <= 0 {
-		chunkSize = len(keys) // catalog declares no cap: one chunk
-	}
-
-	chunks := chunkStrings(keys, chunkSize)
-	probeFilters := plan.FiltersIn(join.Right)
-	var probeRows []connector.Row
-	for _, chunk := range chunks {
-		rows, err := fetchScanRows(ctx, probeSource, probeScan, probeFilters, attrs, params,
-			map[string][]string{join.On.RightCol: chunk})
+	for i, side := range join.Sides {
+		scan := plan.ScanIn(side.Root)
+		if scan == nil {
+			return nil, fmt.Errorf("exec: join side %q has no scan", side.Alias)
+		}
+		src, err := sourceFor(sources, scan.Table)
 		if err != nil {
 			return nil, err
 		}
-		probeRows = append(probeRows, rows...)
+		filters := plan.FiltersIn(side.Root)
+
+		if i == 0 {
+			rows, err := fetchScanRows(ctx, src, scan, filters, attrs, params, nil)
+			if err != nil {
+				return nil, err
+			}
+			fetched[i] = rows
+		} else {
+			var link *plan.Link
+			for k := range join.Links {
+				if join.Links[k].To == i {
+					link = &join.Links[k]
+					break
+				}
+			}
+			if link == nil {
+				return nil, fmt.Errorf("exec: join side %q has no link", side.Alias)
+			}
+			keys := distinctValues(fetched[link.From], link.FromCol)
+			naive += len(keys)
+			size := link.MaxInList
+			if size <= 0 {
+				size = len(keys)
+			}
+			chunks := chunkStrings(keys, size)
+			var rows []connector.Row
+			for _, chunk := range chunks {
+				got, err := fetchScanRows(ctx, src, scan, filters, attrs, params,
+					map[string][]string{link.ToCol: chunk})
+				if err != nil {
+					return nil, err
+				}
+				rows = append(rows, got...)
+			}
+			fetched[i] = rows
+			logSemiJoin(scan.Table, len(fetched[link.From]), keys, chunks, len(rows))
+		}
+		inputs[i] = JoinInput{Alias: side.Alias, Rows: fetched[i]}
+		fetchedCols = append(fetchedCols, scan.Project...)
 	}
 
-	joined := hashJoin(buildRows, probeRows, join.On)
-
-	logSemiJoin(buildScan.Table, len(buildRows), keys, chunks, len(probeRows))
+	joined, err := engine.Join(ctx, inputs, join.Links)
+	if err != nil {
+		return nil, err
+	}
 
 	outCols := p.OutputColumns()
 	outRows, err := project(joined, outCols)
@@ -159,9 +185,10 @@ func runJoin(ctx context.Context, p *plan.Plan, join *plan.Join, sources map[str
 	return &Result{
 		Columns:           colNames(outCols),
 		Rows:              outRows,
-		Debug:             Debug{FetchedColumns: append(append([]string{}, buildScan.Project...), probeScan.Project...)},
+		Debug:             Debug{FetchedColumns: fetchedCols},
 		JoinStrategy:      "semi_join",
-		NaiveCallEstimate: naiveCallEstimate,
+		JoinEngine:        engine.Name(),
+		NaiveCallEstimate: naive,
 	}, nil
 }
 
@@ -317,46 +344,6 @@ func logSemiJoin(buildTable string, buildRows int, keys []string, chunks [][]str
 		buildTable, buildRows, len(keys), len(chunks),
 		len(chunks), len(keys), probeRowsMatched, totalCalls, totalCallsNaive,
 		selectivity, reduction)
-}
-
-// hashJoin matches build and probe rows on their equi-join keys, merging
-// each matched pair's fields into one row. Build and probe columns are
-// merged into a single un-namespaced map, so a same-named column on both
-// sides would collide - not reachable in v1, since every join's output
-// columns are alias-qualified at plan time and no fixture gives both
-// tables a predicate/mask/key column of the same name that also appears
-// in the output.
-func hashJoin(build, probe []connector.Row, on plan.Equi) []connector.Row {
-	byKey := make(map[string][]connector.Row)
-	for _, r := range build {
-		k := r[on.LeftCol]
-		byKey[k] = append(byKey[k], r)
-	}
-
-	var out []connector.Row
-	for _, pr := range probe {
-		k := pr[on.RightCol]
-		for _, br := range byKey[k] {
-			// Namespace each side rather than flattening. Both sources can
-			// expose the same column name (mocksf and mockzd both have
-			// "id"), and a flat merge silently resolved every such column
-			// to whichever side was copied last - so `a.id` returned the
-			// ticket's id. Over-projection widens this: OPA residuals and
-			// masks add columns to each side's scan, so more names can
-			// clash. Those extra columns are consumed per-side before this
-			// point (fetchScanRows), so filtering was never affected; only
-			// the final projection was, which is what sideKey fixes.
-			merged := make(connector.Row, len(br)+len(pr))
-			for c, v := range br {
-				merged[sideKey(plan.JoinLeft, c)] = v
-			}
-			for c, v := range pr {
-				merged[sideKey(plan.JoinRight, c)] = v
-			}
-			out = append(out, merged)
-		}
-	}
-	return out
 }
 
 // sideKey namespaces a join row's column by the side it came from. Single

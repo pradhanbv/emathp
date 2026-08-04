@@ -19,7 +19,8 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 
 ```bash
 docker compose --profile core --profile mocks up -d --build   # gateway + 2 mock SaaS sources
-go test -race ./...                                           # 50 tests, ~5s
+go test -race ./...                                           # 56 tests, ~6s
+go test -race -tags duckdb ./...                              # 57 - adds the DuckDB engine
 docker compose --profile testing run --rm k6                  # load test: 500 req/s for 60s
 
 docker compose --profile "*" down                             # tear down — see note below
@@ -96,9 +97,9 @@ single per-ADR verdict would flatten into one misleading word.
 |---|---|
 | **🟢 Built & verified**<br>real code, real tests, real HTTP round trips | Go planner + capability classification · RLS/CLS injection + plan-time invariant + runtime verification filter (002) · parameterized role-isolated plan cache (003) · semi-join rewrite, 505→17 calls (007) · tenant from verified `iss`, never a claim (011) · real Prometheus histogram + real OTel trace · result cache keyed by principal |
 | **🟡 Partial**<br>real mechanism, deliberately narrowed scope | Freshness rungs 1 & 4 + `max_staleness` only (005) · rate limits: single-node bucket, `429`, async reroute — no Redis lease, no fair queue, **no per-tenant dimension** (006) · NDJSON + `SOURCE_TIMEOUT` terminal frame, thin coverage (009) · policy injection real, OPA mocked (002) · identity derivation real, signature verification mocked (011) |
-| **⚪ Mocked / not built**<br>infrastructure a reviewer can assume | Salesforce + Zendesk connectors are mocks (004) · Calcite sidecar + Substrait IR deferred to M1 spike (001) · materialization is an in-memory Go hash join, not DuckDB (007) · tenant lifecycle API (008) · per-tenant KMS + crypto-shred (010) · **audit trail (010) — no access log exists; nothing to review post-incident** |
+| **⚪ Mocked / not built**<br>infrastructure a reviewer can assume | Salesforce + Zendesk connectors are mocks (004) · Calcite sidecar + Substrait IR deferred to M1 spike (001) · Calcite/Substrait deferred, so N-way join *ordering* is FROM-order, not cost-based (001, 007) · tenant lifecycle API (008) · per-tenant KMS + crypto-shred (010) · **audit trail (010) — no access log exists; nothing to review post-incident** |
 | **🔵 Open question**<br>not decided, not just unbuilt | `RESULT_TOO_LARGE` — guardrail specified in 007, never implemented. **The sharper risk: a skewed join can exhaust memory today** · `LIMIT`/`OFFSET` — in the grammar, undecided past it (007) |
-| **🟠 Executor limits**<br>one cause, one fix | The v1 executor is a hand-rolled Go hash join standing in for **ADR-007 tier 1's in-process DuckDB**, and a hand-rolled executor only does what it was written to do. So `LIMIT`/`OFFSET` and `ORDER BY` parse and are ignored, and **outer joins are now rejected rather than silently run as inner joins** (they also defeat the semi-join rewrite — pushing the build side's keys as an `IN`-list is precisely what makes unmatched keys invisible). All three land together when a real SQL engine runs the join |
+| **🟠 Executor limits**<br>narrower than they were | **DuckDB is real now**: `--join-engine=duckdb` runs the merge in an embedded DuckDB (ADR-007 tier 1), one instance per query, `threads=1`; the cgo-free Go hash join stays the default and both are held to the same contract by `TestEnginesAgreeOnFourWayJoin`. **N-way joins work** — 4 tables, 3 links, either engine. What remains: `LIMIT`/`OFFSET` and `ORDER BY` parse and are ignored; outer joins are **rejected**, not downgraded; join *order* follows the FROM clause, since cost-based ordering needs the planner ADR-001 defers |
 
 **The pattern.** Every unbuilt ADR maps to a requirement about *infrastructure* — a JVM sidecar,
 a vendor contract, Terraform, a KMS call. Every built one maps to a requirement about *behaviour
@@ -182,6 +183,7 @@ Request totals fall short of 30,001 as k6 sheds iterations under load (91 → 73
 | **Entitlement enforcement (RLS/CLS)** | The two-identity demo in Quickstart above |
 | **Async reroute** | `Prefer: respond-async` header → returns a `poll_url`; poll it for the result. Doesn't require exhausting a budget first — the header reroutes on request, the same path a client falls back to after a `429` |
 | **Rate-limit exhaustion** | Compose runs unlimited by default. Start a second gateway with `--sf-limit 12`, then send 4 requests → 3× `200`, then `429` + `Retry-After: 1`. The budget is **12, not 3**, because quota is spent per outbound HTTP request and compose serves 2,000 rows at 500/page — so one query costs 4 tokens |
+| **N-way joins** | A 3- or 4-table `JOIN … ON … JOIN … ON …` against the same two mock sources. `meta.join_engine` names which engine merged, and `naive_call_estimate` shows what the semi-join cascade avoided |
 | **Freshness control** | Vary `max_staleness` across calls and watch `freshness_ms` and the cold/warm/revalidated states in the response |
 | **Load / hit ratio** | `docker compose --profile testing run --rm -e PRINCIPALS=10000 k6` |
 
@@ -410,6 +412,85 @@ request went out) while `revalidated: true` is the point worth noticing: ADR-005
 request is a request" made concrete. The connector still saw a call and the rate-limit budget
 still moved, even though no new bytes came back. `TestMaxStalenessServesCache` proves states 1-2
 in-process; `TestETagRevalidationSpendsBudget` proves state 3's budget accounting.
+
+### Recreate: N-way joins and the two join engines
+
+Four tables, three links, over HTTP. The compose fixtures are enough — `sf.accounts` and
+`zd.tickets` each appear twice under different aliases, which is also the case that breaks any
+implementation keyed on table name rather than alias.
+
+```bash
+docker compose --profile core --profile mocks up -d
+
+curl -s localhost:8080/v1/query \
+  -H "Authorization: Bearer $(cat testdata/tokens/root.jwt)" \
+  -d '{"sql":"SELECT a.name, t.subject, b.name, u.subject FROM sf.accounts a JOIN zd.tickets t ON t.organization_id = a.external_id JOIN sf.accounts b ON b.external_id = a.external_id JOIN zd.tickets u ON u.organization_id = b.external_id"}' \
+  | jq '{rows: (.rows | length), columns: (.columns | length), meta}'
+```
+
+```
+{
+  "rows": 500000,
+  "columns": 4,
+  "meta": {
+    "join_strategy": "semi_join",
+    "join_engine": "go",
+    "naive_call_estimate": 6000
+  }
+}
+```
+
+**`naive_call_estimate: 6000` is what the semi-join avoided.** Without it, every link fetches its
+probe side one call per distinct join key — about 2,000 keys on each of the three links. The
+cascade pushes those keys as `IN`-lists instead, chunked at the probe table's declared
+`max_in_list` of 200, so each link costs roughly 10 calls rather than 2,000.
+
+**500,000 rows is not a bug — it is fanout.** `b` re-joins accounts that already matched, and `u`
+re-joins their tickets, so each link multiplies the row count rather than narrowing it. All
+500,000 rows are held in gateway memory at once. That is the case
+[ADR-007](./DESIGN.md#adr-007--join-strategy-a-four-tier-escalation-ladder) sizes tier 1's memory
+ceiling for, and the case `RESULT_TOO_LARGE` is meant to reject — but that guardrail is specified
+and not built, so today the query just succeeds. Drop `u` for a 3-way join and the result is
+100,000 rows.
+
+**Swapping in DuckDB** (ADR-007 tier 1's real engine) is its own compose profile, because the
+DuckDB build is cgo and needs a different base image than the default static one:
+
+```bash
+docker compose --profile core --profile mocks --profile duckdb up -d --build
+
+# :8080 is the default Go engine, :8090 is DuckDB - both against the same mocks
+curl -s localhost:8090/v1/query \
+  -H "Authorization: Bearer $(cat testdata/tokens/root.jwt)" \
+  -d '{"sql":"SELECT a.name, t.subject, b.name, u.subject FROM sf.accounts a JOIN zd.tickets t ON t.organization_id = a.external_id JOIN sf.accounts b ON b.external_id = a.external_id JOIN zd.tickets u ON u.organization_id = b.external_id"}' \
+  | jq '{rows: (.rows | length), columns: (.columns | length), meta}'
+```
+
+```
+{
+  "rows": 500000,
+  "columns": 4,
+  "meta": {
+    "join_strategy": "semi_join",
+    "join_engine": "duckdb",
+    "naive_call_estimate": 6000
+  }
+}
+```
+
+Same row count, same columns, same call estimate — only `join_engine` differs. Send the same
+query to `:8080` and `:8090` to compare them directly.
+
+**Why a separate service rather than a flag on the existing one.** The DuckDB binary is
+`CGO_ENABLED=1 -tags duckdb`, and DuckDB is a C++ library, so it needs libstdc++ at runtime -
+`distroless/cc-debian12` rather than the `distroless/static-debian12` the other three images use.
+The builder is pinned to `golang:1.26-bookworm` to match that runtime's glibc. **The measured
+cost is 49.5 MB → 148 MB**, which is why the default `--profile core` gateway stays static and
+cgo is something you opt into by naming a profile.
+
+Without the tag the flag still exists and fails with a sentence telling you what to do, rather
+than an unknown-flag error. `TestFourTableJoinEndToEnd` runs this query through every engine compiled into the build; with
+`go test -tags duckdb ./...` that is both, and it requires identical output from each.
 
 ### Recreate: connector SDK mechanics (pagination, ETag, the lying connector)
 

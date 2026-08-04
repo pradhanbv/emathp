@@ -42,6 +42,22 @@ services:
     # export-failure log lines, never a startup failure or blocked request.
     command: ["--sf-url", "http://mocksf:8081", "--zd-url", "http://mockzd:8082", "--otlp-endpoint", "jaeger:4318"]
 
+  # ADR-007 tier 1's real engine. A separate service rather than a flag on the
+  # one above, because the DuckDB build is cgo and needs a different base
+  # image - so `--profile core` stays a static binary and you opt into cgo by
+  # naming this profile. Runs on 8090 so both can be up at once and the same
+  # query can be sent to each.
+  gateway-duckdb:
+    build:
+      context: .
+      target: gateway-duckdb
+    profiles: ["duckdb"]
+    ports:
+      - "8090:8090"
+    command: ["--addr", ":8090", "--sf-url", "http://mocksf:8081", "--zd-url", "http://mockzd:8082",
+              "--join-engine", "duckdb", "--join-memory-limit", "256MB", "--join-threads", "1",
+              "--otlp-endpoint", "jaeger:4318"]
+
   k6:
     image: grafana/k6:latest
     profiles: ["testing"]

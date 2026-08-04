@@ -33,6 +33,7 @@ type Meta struct {
 	CacheHit          bool   `json:"cache_hit,omitempty"`
 	Revalidated       bool   `json:"revalidated,omitempty"`
 	JoinStrategy      string `json:"join_strategy,omitempty"`
+	JoinEngine        string `json:"join_engine,omitempty"`
 	NaiveCallEstimate int    `json:"naive_call_estimate,omitempty"`
 }
 

@@ -1098,7 +1098,7 @@ count, and never a runtime "try small, retry bigger on failure" loop.
 | Tier | What fits and what doesn't fit | How it solves it |
 |---|---|---|
 | **0. Single-table (no join)** | • Fits: every query with no join at all<br>• Doesn't fit: anything with two or more tables → tier 1 | • Straight connector fetch + pushdown, returned as the response<br>• No local engine invoked - nothing to combine, nothing to hold beyond one request |
-| **1. DuckDB (in-process, any join)** | • Fits: any join - 2-table in the MVP executor, N-way by design - whose estimated working set stays within the gateway pod's shared memory budget<br>• Doesn't fit: estimate exceeds that budget → `RESULT_TOO_LARGE`, or if it would fit tier 2, suggest `Prefer: respond-async` | • Embedded DuckDB, explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset after every query<br>• The semi-join rewrite (below) decides how much data actually has to be loaded, which keeps most joins cheap enough to never need to escalate<br>• Nothing survives past the request - nothing to crypto-shred |
+| **1. DuckDB (in-process, any join)** | • Fits: any join - 2-table in the MVP executor, N-way by design - whose estimated working set stays within the gateway pod's shared memory budget<br>• Doesn't fit: estimate exceeds that budget → `RESULT_TOO_LARGE`, or if it would fit tier 2, suggest `Prefer: respond-async` | • **One instance per query, not one shared per pod**: `memory_limit` binds a database instance's buffer manager, not a connection, so this is what makes Section 6.3's K x 256 MB a real per-join ceiling rather than a single pool 90 joins divide between<br>• **`threads` capped low**: DuckDB parallelises within a query, and K concurrent joins each claiming a core oversubscribes the pod. The vectorised execution model still wins single-threaded<br>• **Fed in Arrow batches, never row-at-a-time**: cgo cost is per boundary crossing, and row-granular ingestion puts millions of them inside a window that blocks an OS thread<br>• Explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset after every query<br>• The semi-join rewrite (below) decides how much data actually has to be loaded, which keeps most joins cheap enough to never need to escalate<br>• Nothing survives past the request - nothing to crypto-shred |
 | **2. ClickHouse (warm pool, async)** | • Fits: estimate exceeds the gateway-pod ceiling but stays within what one (larger) node can hold **in memory**<br>• Doesn't fit: estimate exceeds one node's memory, or the join genuinely needs distributed shuffle → tier 3 | • A warm pool running **one job at a time per node** - not an instance per job, not concurrent tenants<br>• **Strictly in-memory, like tier 1** - external sort/aggregation disabled, so the ceiling stays a number the planner can estimate against<br>• Input staged as Parquet on S3 under a per-tenant prefix, SSE-KMS with the tenant's KEK; nothing reaches local disk, so that staged input is the whole shred surface (ADR-010) |
 | **3. Spark serverless (async)** | • Fits: estimate exceeds single-node comfort - genuinely needs distributed shuffle<br>• Doesn't fit: nothing, technically - the only remaining limit is cost | • Managed serverless job (EMR Serverless / Databricks job clusters / Dataproc Serverless); ephemeral executors, one tenant per job<br>• Shuffle spill lives on ephemeral executor disk, destroyed at teardown; the job's output goes to Parquet on S3 with per-tenant SSE-KMS - the same mechanism ADR-010 uses everywhere else |
 
@@ -1608,7 +1608,7 @@ guardrails (Section 8.4), not gateway pod sizing.
 | **Gateway pods** | I/O-bound Go; ~100 QPS/pod, 4 vCPU. Memory (8 GB) derived below, not asserted | **20-24 pods**, 3 AZs, N+1 per AZ |
 | **Planner sidecars** | Only cache misses reach it: 10% x 1,000 = 100 plans/s; Calcite ~25 ms -> L = 2.5 concurrent | **4-6 pods**, floored by HA and warm spares rather than by load. Uncached, 1,000 plans/s -> L = 25 concurrent -> ~10-12 pods. The cache saves **~2-3x**, not an order of magnitude - see ADR-003 for why the fleet saving is *not* the main reason it exists. |
 | **Connector concurrency** | Calls/s = 0.55x1000 + 0.15x2x1000 + ~10% probes ~ **935 calls/s**; at connector p95 0.8 s -> L = 748 | **~750 concurrent outbound**, allocated per connector by semaphore (ADR-006) |
-| **Materialization memory (tiers 0-1 only)** | Joins = 150 QPS x 0.6 s = 90 concurrent x 256 MB `memory_limit` | **~23 GB fleet-wide**; capped at 8 concurrent joins/pod (2 GB), excess queued then shed |
+| **Materialization memory (tiers 0-1 only)** | Joins = 150 QPS x 0.6 s = 90 concurrent x 256 MB `memory_limit`, which multiplies **only under instance-per-query** (ADR-007) - one shared instance per pod would divide a single 256 MB pool 90 ways | **~23 GB fleet-wide**; capped at 8 concurrent joins/pod (2 GB), excess queued then shed. Off-heap, so it takes RSS but no GC multiplier (Section 6.3) |
 | **Result/freshness cache memory** | Miss rate 70% x 1,000 = 700/s; over a 60 s staleness window, 21,000-42,000 live entries x 100-200 KB/entry | **~2-8 GB fleet-wide**; a range, not a point estimate - see derivation below |
 | **Redis** | Lease reconciliation, not per-request: ~24 pods x ~20 buckets x 1 Hz ~ **500 ops/s** | Single 3-node cluster, vastly under-utilized |
 | **Network** | 100 MB/s egress ~ 800 Mbps, plus comparable connector ingest | Budget **2 Gbps** sustained |
@@ -1676,17 +1676,37 @@ to fit in memory at once.
 4. **Binding constraint**: max(12, 10) = **12** - join concurrency, not QPS, is the tighter
    floor. Both sit comfortably under the existing 20-24 pod range, so the headline number
    doesn't change; which constraint actually binds does.
-5. **Peak per-pod live heap**: 2 GB (step 1's cap) + ~0.4 GB (this pod's slice of the 2-8 GB
-   result cache, upper end) + ~0.1 GB (goroutine stacks and connection pools to OPA, the
-   planner, Connector Workers, Redis, and Vault - a generous planning assumption, not a
-   number cited from elsewhere in this document) ~ **2.5 GB**.
-6. **GC headroom**: Go's garbage collector (default `GOGC=100`) wants roughly 2x live heap to
-   collect efficiently rather than thrash -> 2.5 x 2 = **5 GB**.
-7. **Container/OS/sidecar overhead** (~15%): 5 x 1.15 ~ **5.75 GB derived minimum**.
+5. **Peak per-pod footprint, split by allocator.** An earlier draft summed these into a single
+   2.5 GB "live heap" and applied a GC multiplier to all of it. That was a category error:
+   DuckDB is a C++ library reached through cgo, and its buffer manager allocates outside the Go
+   heap, where the collector cannot see it.
+   - *Go heap*: ~0.4 GB (this pod's slice of the 2-8 GB result cache, upper end) + ~0.1 GB
+     (goroutine stacks and connection pools to OPA, the planner, Connector Workers, Redis and
+     Vault), plus whatever fetched rows a join holds before handing them across the boundary
+     -> **~0.5 GB**.
+   - *Off-heap*: step 1's K x 256 MB = **2 GB**, in DuckDB's buffer manager.
+6. **GC headroom applies to the Go heap only**: `GOGC=100` wants roughly 2x live heap. Where the
+   join's 256 MB actually sits therefore decides the total, and the split is unmeasured - the
+   same gap Section 6.4 already ranks first:
+   - *all Go-side* (the earlier assumption): 2.5 x 2 = **5 GB**
+   - *all DuckDB-side*: 0.5 x 2 = 1 GB, plus 2 GB that needs RSS but takes no GC multiplier
+     -> **3 GB**
+7. **Container/OS/sidecar overhead** (~15%): **3.45 - 5.75 GB derived minimum**.
 8. **Target headroom, stated as a design choice** (the same way K was in step 1): provision so
    peak working memory never exceeds ~72% of pod capacity, leaving 28% for burst variance and
    GC unpredictability - a standard capacity-planning convention, applied up front rather than
-   checked after the fact. Final pod size = 5.75 GB / 0.72 ~ **7.99 GB -> 8 GB**.
+   checked after the fact. Final pod size = **4.8 - 8 GB**.
+
+**We provision the 8 GB end.** The split in step 6 is unmeasured and over-provisioning is the
+cheap direction - but a measurement showing the join footprint genuinely lives in DuckDB would
+justify ~5 GB, a 40% saving on the largest line in the budget.
+
+**One precondition is not optional at either size**: `GOMEMLIMIT` must be set below the container
+limit *minus* the off-heap allocation. Go's collector paces off the Go heap and cannot see
+DuckDB's buffers, so without it the runtime feels no pressure while the container walks into its
+limit - the standard way a cgo-heavy Go service OOMs, and one that appears in no Go-level metric.
+`process_resident_memory_bytes` reads /proc and does include it; `go_memstats_heap_inuse_bytes`
+excludes exactly the term that dominates.
 
 The existing 8 GB figure is therefore a genuine *output* of this calculation, not an assertion
 it's being checked against. Steps 5-6 are the ones worth re-verifying once real data exists -

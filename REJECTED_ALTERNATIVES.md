@@ -86,6 +86,7 @@ smoothed over - see "Weakest rejections" at the end.
 |---|---|---|---|
 | **Naive dual full fetch** | Simplest possible implementation. | 505 calls vs. 17 on the reference fixture. | Only competitive when selectivity is poor - and at poor selectivity the semi-join rewrite loses too, for the same reason. |
 | **Container per join (DuckDB)** | Hard process isolation per query. | Container cold start alone can consume the entire 1.5 s P95 budget. | The isolation is achievable with a memory limit; the latency cost of a container per query is not recoverable. |
+| **SQLite for tier 1** (incl. pure-Go `modernc.org/sqlite`) | Pure-Go means no cgo: every byte stays in the Go heap where `GOGC` and `GOMEMLIMIT` can see it, and no OS thread is blocked per join - precisely the property Section 6.3's chain assumes and DuckDB denies. The semi-join rewrite also argues its own engine down: if joins reach tier 1 already small, SQLite is adequate. | **Structural, about shape not capacity.** Its heap limit is a process-wide singleton, so the same 2 GB arrives as one shared pool rather than eight isolated ceilings - and `RESULT_TOO_LARGE` has to name *which* join exceeded. In a shared pool a 5 MB join fails because a 1.9 GB one is holding it. **Predicted, not measured:** single-threaded joins at the ceiling should exceed the 4 s budget; neither engine is a dependency here and nothing was benchmarked. | **Safe under uncertainty, not the better engine** - DuckDB degrades acceptably at both ends of the join-size distribution, SQLite only at the small end. Two things would defeat that argument: metering bytes in Go before the engine sees them, or running one join at a time - which tier 2 does and the sync path cannot afford. **Reverses if** Section 6.4 measures joins averaging ~25 MB, or a benchmark narrows the gap. |
 | **ClickHouse for tier 1** (the in-request join engine) | Scales past single-node; a real, mature server. | It's a server with a lifecycle and a footprint; the sync path needs a join engine creatable and destroyable in milliseconds inside a request. | Rejected for tier 1 only - **ClickHouse is tier 2 of the accepted design.** DuckDB in-process took tier 1. |
 | **On-demand ClickHouse instance per job** (tier 2) | Perfect isolation: a fresh single-tenant instance per job, destroyed after, so no idle cost and no multi-tenant contention. | Never checked the arrival rate. At the risk register's own trigger escalations run ~7.5/s (5% of all traffic would be 50/s); against a 10-30 s startup, Little's Law puts **75-1,500 instances permanently mid-provision**. It is a fleet either way - just one paying a cold start on every job already escalated for being too big. | An early-draft conclusion, corrected. Tier 2 is a warm pool; isolation comes from serialization plus per-tenant S3 prefixes under the tenant's KEK. |
 | **Concurrent multi-tenant jobs on one tier-2 node** | Obvious utilization win - pack several jobs onto a node instead of dedicating it to one. | Concurrent tenants co-mingle rows in a single process heap, which no storage prefix or key separates. Serialization plus a restart between jobs makes the node single-tenant for the job's duration. | Costs less than it appears: a tier-2 job is *defined* as one exceeding the pod ceiling, so it monopolizes a node regardless. What is forfeited is packing the jobs just above the tier-1 line. |
@@ -131,6 +132,10 @@ having been obvious from the start.
 13. The plan-cache hit-ratio target was raised from 90% to 95%, since at 90% the miss population is itself the P95 - planner latency would land in the SLO undiminished.
 14. An earlier draft rejected Trino partly for having no policy-injection hook; this was inaccurate - Trino's `SystemAccessControl` SPI does provide row filters and column masks. The rejection now rests on the connector model, credential scoping, and tenant isolation instead.
 15. An earlier draft rejected Cedar partly for lacking partial evaluation; this was also inaccurate - Cedar has partial evaluation, and its own RFC 0095 uses residual-to-SQL translation as its motivating example. The rejection now rests on maturity.
+16. An earlier draft of Section 6.3 summed DuckDB's `K x 256 MB` into a single "peak live heap"
+    and applied Go's `GOGC=100` 2x multiplier to all of it. DuckDB is reached through cgo and its
+    buffer manager allocates outside the Go heap, so the multiplier was being applied to memory
+    the collector cannot see. The chain now splits by allocator and derives a 4.8-8 GB range.
 
 ---
 
@@ -161,7 +166,13 @@ Ranked by how likely each one is to be reversed on new evidence - the same spiri
    cost optimization rather than a capability, its whole rejection rests on a cost comparison
    nobody has measured - no serverless per-job pricing, no observed escalation rate. It is also
    the one rejection this design's own arithmetic strengthened rather than weakened.
-6. **Cedar (ADR-002).** Corrected once already (see "Design evolution," item 15) - the original
+6. **SQLite for tier 1 (ADR-007).** Ranked here rather than higher because one leg of the
+   rejection is structural - a process-wide heap limit cannot express a per-join ceiling - and
+   structural arguments don't move on measurement. The other leg is an unmeasured prediction: if joins arrive small,
+   the ceiling rarely binds and SQLite's pure-Go footprint wins on everything else. That
+   measurement is Section 6.4's first priority, so this is the rejection most likely to be
+   *revisited soonest*, even if it survives.
+7. **Cedar (ADR-002).** Corrected once already (see "Design evolution," item 15) - the original
    objection was wrong on the facts, not just weak. The current rejection rests on maturity
    (both partial evaluators are behind experimental feature flags), which is a real but
    time-bound objection, not a structural one.

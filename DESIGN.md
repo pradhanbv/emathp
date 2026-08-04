@@ -385,7 +385,7 @@ Routed by a **cost-based cardinality estimate at plan time** — never table cou
 | Tier | What fits / doesn't fit | How it solves it |
 |---|---|---|
 | **0. Single-table** | • Fits: no join at all<br>• Doesn't: 2+ tables → tier 1 | • Straight connector fetch, no local engine invoked |
-| **1. DuckDB** (in-process, any join) | • Fits: working set within the gateway pod's shared memory<br>• Doesn't: exceeds it → `RESULT_TOO_LARGE`, or suggest `Prefer: respond-async` if tier 2 fits | • Explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset every query<br>• Semi-join rewrite minimizes what's loaded<br>• Nothing survives the request — nothing to shred |
+| **1. DuckDB** (in-process, any join) | • Fits: working set within the gateway pod's shared memory<br>• Doesn't: exceeds it → `RESULT_TOO_LARGE`, or suggest `Prefer: respond-async` if tier 2 fits | • **One instance per query**, not one shared per pod — `memory_limit` binds a buffer manager, so this is what makes [§6.2](#62-derived-sizing)'s `K × 256 MB` a real ceiling instead of a shared pool<br>• **`threads` capped low** — DuckDB parallelises *within* a query, and K concurrent joins each claiming a core oversubscribes the pod; the vectorised execution model still wins single-threaded<br>• **Fed in Arrow batches, never row-at-a-time** — cgo cost is per crossing, and row-granular ingestion would put millions of them inside a window that blocks an OS thread<br>• Explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset every query<br>• Semi-join rewrite minimizes what's loaded; nothing survives the request |
 | **2. ClickHouse** (warm pool, async) | • Fits: exceeds pod ceiling, within one node's memory<br>• Doesn't: exceeds one node → tier 3 | • A **warm pool running one job at a time per node** — not an instance per job, not concurrent tenants ([§14](#14-rejected-alternatives-by-decision))<br>• **Strictly in-memory, like tier 1** — external sort and aggregation disabled, so the ceiling stays a number the planner can estimate against<br>• Input staged as Parquet on S3 under a **per-tenant prefix, SSE-KMS with the tenant's KEK** ([ADR-010](#adr-010--keys-crypto-shredding-and-the-audit-conflict)); nothing reaches local disk, so there is nothing else to shred |
 | **3. Spark serverless** | • Fits: needs real distributed shuffle<br>• Doesn't: nothing technical — cost is the only backstop | • Managed serverless job (EMR/Databricks/Dataproc), ephemeral executors, one tenant per job<br>• Input staged exactly as tier 2; output written back to Parquet on S3 under the same per-tenant SSE-KMS envelope<br>• Shuffle spill lives on ephemeral executor disk, destroyed at teardown |
 
@@ -396,6 +396,7 @@ Routed by a **cost-based cardinality estimate at plan time** — never table cou
 |---|---|
 | **Tier 1 in-process, not a container** | Container cold start alone can consume the entire 1.5 s budget |
 | **Tier 1's semi-join rewrite** | Fetch the smaller side, push its join keys into the larger side as an `IN` predicate. **The reduction equals join-key selectivity on the probe side, and nothing else** — fixture: 500 accounts, 50,000 tickets, 2.4% selectivity → **505 → 17 calls (29.7×)**. At low selectivity it saves nothing and adds chunking overhead |
+| **Tier 1 concurrent, not serialized like tier 2** | The obvious question, since both are memory-bounded engines. Tier 2 can serialize because async carries no completion SLO — queueing costs nothing it promised. Tier 1 is on the **sync** path, so one join at a time per pod would queue joins behind each other and blow the 1.5 s / 4 s budget. That is why tier 1 runs K joins concurrently in one process, and therefore why it needs an engine with a **per-instance** memory ceiling: `RESULT_TOO_LARGE` and the tier-2 reroute both have to name *which* join exceeded, and a single shared pool cannot — a 5 MB join would fail because a 1.9 GB one is holding the pool ([§14](#14-rejected-alternatives-by-decision)) |
 | **Tier 2 a warm pool, not an instance per job** | At the risk register's own trigger (`RESULT_TOO_LARGE` on >5% of cross-app joins) escalations run ~7.5/s; 5% of *all* traffic would be 50/s. Against a 10–30 s startup, Little's Law puts **75–1,500 instances permanently mid-provision** |
 | **Tier 2 one job at a time** | Concurrent tenants would co-mingle rows in a single process heap, which no S3 prefix or key separates; serialization plus a restart between jobs makes the node single-tenant for the job's duration. It costs little, since a tier-2 job monopolizes a node regardless — but it does pin node count to concurrent jobs, so tier 2 stops being economical before tier 3 does. That is a provisioning question the risk register already gates, not a routing one |
 | **Tier 2 strictly in memory** | Its value is the **~1,000× jump from tier 1's 256 MB `memory_limit` to a memory-optimized node**, not the disk beneath it. Holding one rule — fit in memory or escalate — through tier 2 leaves tier 3's ephemeral executor disk as the ladder's only spill surface |
@@ -557,6 +558,14 @@ from Little's Law on [§6.1](#61-baseline)'s mix; working set is what one execut
 ⚠️ **74% of all memory rests on that 256 MB**, which is DuckDB's configured *cap* used as if it
 were the *mean*. It is unmeasured — see [§6.4](#64-the-sensitivity-that-actually-matters).
 
+⚠️ **And the term only multiplies if each join gets its own DuckDB instance.** `memory_limit`
+configures a database instance's buffer manager, not a connection — connections attached to one
+instance share a single pool. So `90 × 256 MB` presumes **instance-per-query**
+([ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder)); under one shared instance per
+pod the same setting gives 90 concurrent joins ~2.8 MB each and almost everything trips
+`RESULT_TOO_LARGE`. The two readings differ by ~90×, so the deployment shape is load-bearing and
+is now stated rather than inferred from *"reset after every query."*
+
 **Resident memory — `live entries × bytes/entry`.** Live entries is where the model and the
 implementation currently disagree:
 
@@ -591,19 +600,33 @@ both pools: **~25–31 GB combined**.
 3. Pods for QPS: 1,000 / 100 = **10**.
 4. **Binding constraint: max(12, 10) = 12** — join concurrency, not QPS. Both sit under the 20–24
    range, so the headline doesn't change; *which constraint binds* does.
-5. Peak live heap ≈ **2.5 GB**, and the terms scale independently:
-   **2 GB transient** (K × 256 MB — moves with traffic) + **~0.4 GB resident** (this pod's slice
-   of the cache — moves with key cardinality, and is unbounded until eviction exists) +
-   **~0.1 GB** stacks and connection pools.
-6. GC headroom (`GOGC=100` wants ~2× live heap): **5 GB**.
-7. Container/OS/sidecar overhead ~15%: **5.75 GB derived minimum**.
-8. Target 72% utilization (28% headroom, applied up front): 5.75 ÷ 0.72 ≈ **8 GB**.
+5. **The footprint splits across two allocators, and only one is garbage-collected.**
+   *Go heap:* **~0.4 GB** resident cache (this pod's slice — moves with key cardinality, and is
+   unbounded until eviction exists) + **~0.1 GB** stacks and connection pools, plus the fetched
+   rows a join holds before handing them across. *Off-heap:* **2 GB** (K × 256 MB) in DuckDB's
+   buffer manager, allocated through C and **invisible to Go's collector**.
+6. **GC headroom applies to the Go heap only** (`GOGC=100` wants ~2× live). Where the join's
+   256 MB actually sits therefore decides the answer, and it is unmeasured:
+   • *all Go-side* — 2.5 GB live × 2 → **5 GB**
+   • *all DuckDB-side* — 0.5 GB × 2 = 1 GB, plus 2 GB needing RSS but no GC multiplier → **3 GB**
+7. Container/OS/sidecar overhead ~15%: **3.45–5.75 GB derived minimum**.
+8. Target 72% utilization (28% headroom, applied up front): **4.8–8 GB**.
 
-**8 GB is an output of this chain, not an assertion checked after the fact.** Steps 5–6 are the
-planning assumptions worth re-verifying with real data; step 8's headroom target is the only
-genuinely arbitrary choice, and is labelled as one. **Note which term binds:** the pod is sized by
-*transient* join memory, so the 8 GB survives a hit-ratio collapse — but it does *not* survive
-unbounded cache growth, because step 5's 0.4 GB has no ceiling as built.
+**We provision 8 GB — the conservative end of this chain, not an assertion checked after the
+fact.** Step 6's split is unmeasured and over-provisioning is the cheap direction, but a
+measurement showing the join footprint really lives in DuckDB would justify ~5 GB: a **40% saving
+on the largest line in the budget**, which is why [§6.4](#64-the-sensitivity-that-actually-matters)
+ranks it where it does.
+
+**One precondition is not optional at either size:** `GOMEMLIMIT` must be set below the container
+limit *minus* the off-heap allocation. Go's collector paces off the Go heap and cannot see
+DuckDB's buffers, so without it the runtime feels no pressure while the container walks into its
+limit — the standard way a cgo-heavy Go service OOMs, and one that shows up in *no* Go-level
+metric ([§11](#11-observability)).
+
+**Note which term binds:** the pod is sized by *transient* join memory, so it survives a
+hit-ratio collapse — but it does *not* survive unbounded cache growth, because step 5's 0.4 GB
+has no ceiling as built.
 
 ### 6.4 The sensitivity that actually matters
 
@@ -626,7 +649,7 @@ decides what to measure first:
 | Moves materially with hit ratio | Barely moves |
 |---|---|
 | [§6.2](#62-derived-sizing) **connector concurrency** — the `0.55 × 1000` term *is* the non-cache-hit single-source share | [§6.2](#62-derived-sizing) **planner sidecars** — sized by the *plan* cache's ~90% hit, a different cache and a different number |
-| [§6.2](#62-derived-sizing) **resident cache memory** — misses × TTL × bytes/entry | [§6.3](#63-gateway-pod-size--worked-backwards-not-asserted) **pod size** — the cache slice is 0.4 GB of a 2.5 GB peak heap; join working set is 2 GB. Drive hit ratio to zero and the 8 GB pod stands |
+| [§6.2](#62-derived-sizing) **resident cache memory** — misses × TTL × bytes/entry | [§6.3](#63-gateway-pod-size--worked-backwards-not-asserted) **pod size** — the cache slice is 0.4 GB against a 2 GB join footprint. Drive hit ratio to zero and the pod stands; what moves it is where that 2 GB is allocated, not the hit ratio |
 | [§10.4](#104-cost-guardrails) **cost levers** (#1) and [§12.5](#125-budget) **budget** — egress and vendor calls both scale with miss rate | [§6.1](#61-baseline) **concurrency `L`** — moves ~30% across the whole range above, which the fleet absorbs |
 | [§12.4](#124-risk-register) top risk · [§12.3](#123-milestones) M2 gate · [§13](#13-decisions-we-are-least-confident-about) least-confident #2 | |
 | [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement) is the **cause**; [ADR-005](#adr-005--freshness-watermark-capability-ladder)'s tenant snapshots are the **fallback** | |
@@ -776,6 +799,7 @@ residency tags make global routing a *compliance* problem, not just a traffic pr
 | **Rate-limit flood** | `rate_limit_rejections` spike on one connector | Identify tenant via per-tenant counters → reduce that lease slice → escalate to vendor if the budget itself is wrong |
 | **Connector auth failure** | `CONNECTOR_AUTH_FAILED` spike | Distinguish expired refresh (re-consent) / revoked grant (tenant action) / vendor outage. **Never auto-retry a revoked grant** — it accelerates lockout |
 | **Cache stampede** | Connector calls/s spikes with flat QPS | **Singleflight is specified but not implemented** — the cache releases its lock across the fetch, so every concurrent request for one cold key misses and fetches. Amplification is `1 + (requests/s on one key × fetch duration)`: ~**1.1× at design scale** (1k QPS over 10k principals), but **4–11× when one principal bursts** several parallel queries at a cold key, and worst on a fleet restart when every key is cold at once. A single-hot-key probe measured 112× (README) — a magnifier, not a forecast. Until it is built, the mitigations are TTL jitter and per-connector concurrency caps |
+| **Memory pressure / OOM** | `process_resident_memory_bytes` climbing toward the container limit **while `go_memstats_heap_inuse_bytes` stays flat** — a signature that is otherwise baffling, and the only warning available, since GC frequency and CPU stay calm ([§11](#11-observability)) | Read `materialization_memory_bytes` first: DuckDB holds the dominant term and Go's collector cannot see it. Confirm `GOMEMLIMIT` is set below the container limit *minus* the off-heap allocation ([§6.3](#63-gateway-pod-size--worked-backwards-not-asserted)) — unset is the usual cause. Then check concurrent joins against K: no admission control is built yet, so K is a planning assumption, not an enforced cap |
 | **Off-boarding verification** | Scheduled attestation | DEKs destroyed · KEK disabled · grants revoked · jobs cancelled · caches invalidated · audit tokens unmapped |
 
 ### 10.4 Cost guardrails
@@ -809,6 +833,20 @@ latency rather than our own overhead.
 Plus: `query_duration_seconds` (by class, tenant) · `connector_request_duration_seconds` ·
 `plan_cache_hit_ratio` · `rate_limit_budget_remaining` · `entitlement_denials_total` ·
 `freshness_age_seconds` · `materialization_memory_bytes` · `attribute_cache_age_seconds`.
+
+⚠️ **Memory is the one place the obvious Go metric is not merely incomplete but wrong.** DuckDB
+allocates through C, outside the Go heap ([§6.3](#63-gateway-pod-size--worked-backwards-not-asserted)),
+so on an 8 GB pod holding 2.5 GB the runtime reports roughly 0.5 GB:
+
+| Use | Not |
+|---|---|
+| **`process_resident_memory_bytes`** — reads `/proc/self/statm`, so it *includes* the off-heap allocation | `go_memstats_heap_inuse_bytes` — excludes exactly the term that dominates |
+| **`materialization_memory_bytes`** — must be sourced from DuckDB's own accounting, not inferred | `go_gc_duration_seconds` as a pressure signal — it stays calm while the container fills |
+| **`go_threads`** — the direct observable for cgo thread pinning, free from the default registry | — |
+
+The consequence is that memory exhaustion arrives with **no leading indicator in Go-level
+metrics**: heap growth, GC frequency and GC CPU all stay flat, and the pod goes from healthy to
+OOMKilled in one step. `join.execute` is the span that makes the off-heap phase visible at all.
 
 **`result_cache_hit_ratio` is derived, not stored** — from
 `result_cache_requests_total{tenant, principal, connector, outcome}` via PromQL, so every consumer
@@ -929,7 +967,7 @@ which exists for exactly this and covers it at four times the depth.
 | [**004** Build vs buy](#adr-004--connector-strategy-build-vs-buy)| • Build all<br>• Buy all (Merge / Nango / Airbyte) |
 | [**005** Freshness](#adr-005--freshness-watermark-capability-ladder)| • Centralized CDC / data lake<br>• `SELECT MAX(updated_at)` probes |
 | [**006** Rate limits](#adr-006--rate-limiting-and-multi-tenant-fairness)| • In-memory per-pod buckets<br>• Redis on every decision<br>• Envoy ratelimit service |
-| [**007** Joins](#adr-007--join-strategy-a-four-tier-escalation-ladder)| • Naive dual full fetch<br>• Container-per-join DuckDB<br>• On-demand ClickHouse instance per job<br>• Concurrent multi-tenant jobs on one tier-2 node<br>• Spark-only from day one<br>• Disk spill in tiers 0–2<br>• Native same-source join pushdown (SOQL subqueries) |
+| [**007** Joins](#adr-007--join-strategy-a-four-tier-escalation-ladder)| • Naive dual full fetch<br>• Container-per-join DuckDB<br>• SQLite for tier 1<br>• On-demand ClickHouse instance per job<br>• Concurrent multi-tenant jobs on one tier-2 node<br>• Spark-only from day one<br>• Disk spill in tiers 0–2<br>• Native same-source join pushdown (SOQL subqueries) |
 | [**008** Tenant lifecycle](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api)| • `terraform apply` per tenant onboard/offboard |
 | [**009** Streaming](#adr-009--streaming-timeouts-partial-results)| • Chunked transfer + status code<br>• HTTP trailers |
 | [**010** Crypto-shred](#adr-010--keys-crypto-shredding-and-the-audit-conflict)| • "Instantly destroy the KMS key"<br>• Shred the audit trail under the tenant key |

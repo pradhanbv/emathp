@@ -393,7 +393,7 @@ Routed by a **cost-based cardinality estimate at plan time** — never table cou
 | Tier | What fits / doesn't fit | How it solves it |
 |---|---|---|
 | **0. Single-table** | • Fits: no join at all<br>• Doesn't: 2+ tables → tier 1 | • Straight connector fetch, no local engine invoked |
-| **1. DuckDB** (in-process, any join) | • Fits: working set within the gateway pod's shared memory<br>• Doesn't: exceeds it → `RESULT_TOO_LARGE`, or suggest `Prefer: respond-async` if tier 2 fits | • **One instance per query**, not one shared per pod — `memory_limit` binds a buffer manager, so this is what makes [§6.2](#62-derived-sizing)'s `K × 256 MB` a real ceiling instead of a shared pool<br>• **`threads` capped low** — DuckDB parallelises *within* a query, and K concurrent joins each claiming a core oversubscribes the pod; the vectorised execution model still wins single-threaded<br>• **Fed in Arrow batches, never row-at-a-time** — cgo cost is per crossing, and row-granular ingestion would put millions of them inside a window that blocks an OS thread<br>• Explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset every query<br>• Semi-join rewrite minimizes what's loaded; nothing survives the request |
+| **1. DuckDB** (in-process, any join) | • Fits: working set within the gateway pod's shared memory<br>• Doesn't: exceeds it → `RESULT_TOO_LARGE`, or suggest `Prefer: respond-async` if tier 2 fits | • **One instance per query**, not one shared per pod — `memory_limit` binds a buffer manager, so this is what lets the pod budget **8 concurrent joins × 256 MB** as eight real ceilings rather than one pool they divide ([§6.3](#63-gateway-pod-size--worked-backwards-not-asserted))<br>• **`threads` capped low** — DuckDB parallelises *within* a query, and eight concurrent joins each claiming a core oversubscribes the pod; the vectorised execution model still wins single-threaded<br>• **Fed in Arrow batches, never row-at-a-time** — cgo cost is per crossing, and row-granular ingestion would put millions of them inside a window that blocks an OS thread<br>• Explicit `memory_limit`, per-tenant-encrypted ephemeral temp dir, reset every query<br>• Semi-join rewrite minimizes what's loaded; nothing survives the request |
 | **2. ClickHouse** (warm pool, async) | • Fits: exceeds pod ceiling, within one node's memory<br>• Doesn't: exceeds one node → tier 3 | • A **warm pool running one job at a time per node** — not an instance per job, not concurrent tenants ([§14](#14-rejected-alternatives-by-decision))<br>• **Strictly in-memory, like tier 1** — external sort and aggregation disabled, so the ceiling stays a number the planner can estimate against<br>• Input staged as Parquet on S3 under a **per-tenant prefix, SSE-KMS with the tenant's KEK** ([ADR-010](#adr-010--keys-crypto-shredding-and-the-audit-conflict)); nothing reaches local disk, so there is nothing else to shred |
 | **3. Spark serverless** | • Fits: needs real distributed shuffle<br>• Doesn't: nothing technical — cost is the only backstop | • Managed serverless job (EMR/Databricks/Dataproc), ephemeral executors, one tenant per job<br>• Input staged exactly as tier 2; output written back to Parquet on S3 under the same per-tenant SSE-KMS envelope<br>• Shuffle spill lives on ephemeral executor disk, destroyed at teardown |
 
@@ -404,7 +404,7 @@ Routed by a **cost-based cardinality estimate at plan time** — never table cou
 |---|---|
 | **Tier 1 in-process, not a container** | Container cold start alone can consume the entire 1.5 s budget |
 | **Tier 1's semi-join rewrite** | Fetch the smaller side, push its join keys into the larger side as an `IN` predicate. **The reduction equals join-key selectivity on the probe side, and nothing else** — fixture: 500 accounts, 50,000 tickets, 2.4% selectivity → **505 → 17 calls (29.7×)**. At low selectivity it saves nothing and adds chunking overhead |
-| **Tier 1 concurrent, not serialized like tier 2** | The obvious question, since both are memory-bounded engines. Tier 2 can serialize because async carries no completion SLO — queueing costs nothing it promised. Tier 1 is on the **sync** path, so one join at a time per pod would queue joins behind each other and blow the 1.5 s / 4 s budget. That is why tier 1 runs K joins concurrently in one process, and therefore why it needs an engine with a **per-instance** memory ceiling: `RESULT_TOO_LARGE` and the tier-2 reroute both have to name *which* join exceeded, and a single shared pool cannot — a 5 MB join would fail because a 1.9 GB one is holding the pool ([§14](#14-rejected-alternatives-by-decision)) |
+| **Tier 1 concurrent, not serialized like tier 2** | The obvious question, since both are memory-bounded engines. Tier 2 can serialize because async promises no completion time, so queueing breaks nothing. Tier 1 is on the **sync** path, so one join at a time per pod would queue joins behind each other and blow the 1.5 s / 4 s budget. That is why tier 1 runs K joins concurrently in one process, and therefore why it needs an engine with a **per-instance** memory ceiling: `RESULT_TOO_LARGE` and the tier-2 reroute both have to name *which* join exceeded, and a single shared pool cannot — a 5 MB join would fail because a 1.9 GB one is holding the pool ([§14](#14-rejected-alternatives-by-decision)) |
 | **Tier 2 a warm pool, not an instance per job** | At the risk register's own trigger (`RESULT_TOO_LARGE` on >5% of cross-app joins) escalations run ~7.5/s; 5% of *all* traffic would be 50/s. Against a 10–30 s startup, Little's Law puts **75–1,500 instances permanently mid-provision** |
 | **Tier 2 one job at a time** | Concurrent tenants would co-mingle rows in a single process heap, which no S3 prefix or key separates; serialization plus a restart between jobs makes the node single-tenant for the job's duration. It costs little, since a tier-2 job monopolizes a node regardless — but it does pin node count to concurrent jobs, so tier 2 stops being economical before tier 3 does. That is a provisioning question the risk register already gates, not a routing one |
 | **Tier 2 strictly in memory** | Its value is the **~1,000× jump from tier 1's 256 MB `memory_limit` to a memory-optimized node**, not the disk beneath it. Holding one rule — fit in memory or escalate — through tier 2 leaves tier 3's ephemeral executor disk as the ladder's only spill surface |
@@ -557,18 +557,8 @@ the wrong variable.
 | **Redis** | Lease reconciliation, not per-request: 24 pods × 20 buckets × 1 Hz | **~500 ops/s** — single 3-node cluster, vastly under-utilized |
 | **Network** | 100 MB/s egress ≈ 800 Mbps + comparable ingest | Budget **2 Gbps** sustained |
 
-**Transient memory — `Σ (in-flight per class × working set per class)`.** In-flight counts come
-from Little's Law on [§6.1](#61-baseline)'s mix; working set is what one executing request holds:
-
-| Class | In flight (`L = λW`) | Working set each | Total |
-|---|---|---|---|
-| Result-cache hit | 300 × 0.020 = **6** | ~0 — served from the resident copy, nothing new held | ~0 |
-| Single-source miss | 550 × 0.270 = **148** | ~200 KB of fetched rows | **~30 MB** |
-| Cross-app join | 150 × 0.600 = **90** | **256 MB** (DuckDB `memory_limit`) | **~23 GB** |
-| | **245 in flight** | | **~23 GB** |
-
-⚠️ **`C = 2` is the floor used as the mean** — the same shape of error as the 256 MB cap below.
-It holds only when the build side fits one `IN`-list chunk *and* neither side paginates.
+⚠️ **`C = 2` is a floor being used as a mean.** It holds only when the build side fits one
+`IN`-list chunk *and* neither side paginates.
 [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder)'s own reference fixture — 500
 accounts, `MaxInList` 200 — measures **17 calls for one join**, and `TestSemiJoinReducesProbeCalls`
 bounds the probe side at 20. `C` is set by build-side cardinality, which is unmeasured:
@@ -582,6 +572,17 @@ bounds the probe side at 20. `C` is set by build-side cardinality, which is unme
 Under-counting is the dangerous direction here: [§6.4](#64-the-sensitivity-that-actually-matters)
 calls connector quota *"a hard external ceiling we cannot autoscale past"*, so believing we have
 headroom we don't is worse than over-provisioning pods.
+
+
+**Transient memory — `Σ (in-flight per class × working set per class)`.** In-flight counts come
+from Little's Law on [§6.1](#61-baseline)'s mix; working set is what one executing request holds:
+
+| Class | In flight (`L = λW`) | Working set each | Total |
+|---|---|---|---|
+| Result-cache hit | 300 × 0.020 = **6** | ~0 — served from the resident copy, nothing new held | ~0 |
+| Single-source miss | 550 × 0.270 = **148** | ~200 KB of fetched rows | **~30 MB** |
+| Cross-app join | 150 × 0.600 = **90** | **256 MB** (DuckDB `memory_limit`) | **~23 GB** |
+| | **245 in flight** | | **~23 GB** |
 
 ⚠️ **74% of all memory rests on that 256 MB**, which is DuckDB's configured *cap* used as if it
 were the *mean*. It is unmeasured — see [§6.4](#64-the-sensitivity-that-actually-matters).
@@ -649,8 +650,8 @@ ranks it where it does.
 **One precondition is not optional at either size:** `GOMEMLIMIT` must be set below the container
 limit *minus* the off-heap allocation. Go's collector paces off the Go heap and cannot see
 DuckDB's buffers, so without it the runtime feels no pressure while the container walks into its
-limit — the standard way a cgo-heavy Go service OOMs, and one that shows up in *no* Go-level
-metric ([§11](#11-observability)).
+limit. That is the standard way a cgo-heavy Go service OOMs, and no Go-level metric shows it
+coming ([§11](#11-observability)).
 
 **Note which term binds:** the pod is sized by *transient* join memory, so it survives a
 hit-ratio collapse — but it does *not* survive unbounded cache growth, because step 5's 0.4 GB
@@ -805,7 +806,7 @@ Terraform modules (`/global-control-plane`, `/shared-data-plane`,
 `/tenant-resources`); Helm charts identical across modes. **Argo Rollouts** canary 5 → 25 → 50 →
 100%, each step gated on a Prometheus analysis template. Auto-rollback on P95 > 1.5 s, error rate
 > 1%, **or `ENTITLEMENT_DENIED` rate deviating from baseline** — that last one is a *correctness*
-canary, not a performance one, and it's the one worth having.
+canary rather than a performance one — and correctness is what a rollback gate should watch.
 
 ### 10.2 DR / BCP
 

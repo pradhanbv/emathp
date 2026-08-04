@@ -1813,7 +1813,7 @@ Terraform modules: `/global-control-plane`, `/shared-data-plane`, `/tenant-resou
 Helm charts identical across modes. **Argo Rollouts** canary: 5% -> 25% -> 50% -> 100%, each
 step gated on an analysis template querying Prometheus. Automated rollback on P95 > 1.5 s,
 error rate > 1%, or `ENTITLEMENT_DENIED` rate deviating from baseline - that last one is a
-**correctness** canary, not a performance one, and it is the one worth having.
+**correctness** canary rather than a performance one - and correctness is what a rollback gate should watch.
 
 ### 8.2 DR / BCP
 

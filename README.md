@@ -9,7 +9,7 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 | [`DESIGN.md`](./DESIGN.md) | All 11 ADRs, both capability ladders, capacity math, six-month plan | ~35 min |
 | [`CODE_MAP.md`](./CODE_MAP.md) | Navigating the implementation: request path in call order, ADR-to-code map, known gaps | ~6 min |
 | [`DESIGN_FULL.md`](./DESIGN_FULL.md) | Canonical — worked derivations, full rejection reasoning, 16 diagrams | ~90 min |
-| [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md) | Every option considered and turned down, with its steelman | ~10 min |
+| [`REJECTED_ALTERNATIVES.md`](./REJECTED_ALTERNATIVES.md) | Every option considered and turned down, with its steelman — and the six weakest rejections, ranked | ~20 min |
 | [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) | The TDD build log, cycle by cycle | ~15 min |
 | [`HUMAN_AND_AI.md`](./HUMAN_AND_AI.md) | How this was built with Gemini + Claude — the division of labour, and the four failure modes worth reviewing for | ~6 min |
 
@@ -19,7 +19,7 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 
 ```bash
 docker compose --profile core --profile mocks up -d --build   # gateway + 2 mock SaaS sources
-go test -race ./...                                           # 48 tests, ~5s
+go test -race ./...                                           # 50 tests, ~5s
 docker compose --profile testing run --rm k6                  # load test: 500 req/s for 60s
 
 docker compose --profile "*" down                             # tear down — see note below

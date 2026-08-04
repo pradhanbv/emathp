@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -245,8 +246,23 @@ func colNames(cols []plan.ProjectCol) []string {
 	return names
 }
 
-// distinctValues returns col's non-empty values from rows, deduplicated,
-// in first-seen order - the build side's join keys before chunking.
+// distinctValues returns col's non-empty values from rows, deduplicated
+// and sorted - the build side's join keys before chunking.
+//
+// Sorted, not first-seen, because chunkStrings slices this list into
+// fixed-size groups and each group becomes part of a probe-side result
+// cache key (freshness.cacheKey folds the bound filter values in). That
+// key sorts values *within* a chunk, which canonicalizes how a chunk is
+// written but not which keys land in which chunk. First-seen order is the
+// build side's row order, and a SaaS list endpoint guarantees no ordering
+// without an explicit sort - so the same probe data, reached through a
+// build side that came back in a different order, produced entirely
+// different cache keys and missed every probe-side entry. Sorting makes
+// chunk membership a function of the key set alone.
+//
+// It does not make chunking stable under insertion: add one build row and
+// every boundary after it still shifts. Content-defined boundaries would
+// fix that too, and are not worth it here.
 func distinctValues(rows []connector.Row, col string) []string {
 	seen := make(map[string]bool)
 	var out []string
@@ -258,6 +274,7 @@ func distinctValues(rows []connector.Row, col string) []string {
 		seen[v] = true
 		out = append(out, v)
 	}
+	sort.Strings(out)
 	return out
 }
 

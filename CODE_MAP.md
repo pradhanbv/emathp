@@ -3,7 +3,7 @@
 Navigation for the implementation. The design lives in [`DESIGN.md`](./DESIGN.md); this is where
 each decision actually landed in code, and where the bodies are buried.
 
-**4,663 lines of Go, 1,648 of tests, 48 tests.** Run everything with `go test -race ./...` (~5 s).
+**4,663 lines of Go, 1,713 of tests, 50 tests.** Run everything with `go test -race ./...` (~5 s).
 
 ---
 
@@ -112,6 +112,7 @@ ADR-004, 008 and 010 are design-only — no code. That is deliberate and
 | `TestOuterJoinsRejectedNotSilentlyDowngraded` | `LEFT`/`RIGHT`/`CROSS` are refused, not run as inner |
 | `TestFreshnessCacheIsolatedByPrincipal` | Two users, same role, must not share a cache entry |
 | `TestPaginatedFetchSpendsOneTokenPerPage` | Quota is denominated in HTTP requests |
+| `TestProbeChunksAreIndependentOfBuildRowOrder` | Probe-side cache keys survive a source reordering identical rows |
 | `TestConcurrentHitAndRevalidateOnOneKey` | Worthless without `-race` — asserts an absence |
 
 ---
@@ -127,7 +128,6 @@ These are real and deliberate. Claiming otherwise would be the actual defect.
 | **Per-pod rate limit buckets** | [`ratelimit/`](internal/ratelimit/) | N pods = N× the limit. Design specifies Redis leases |
 | **2-table join cap** | [`build.go:313`](internal/plan/build.go#L313) | MVP executor limit, *not* a planner one — the per-scan pipeline never counts tables |
 | **`LIMIT`/`OFFSET` unsupported** | [`build.go`](internal/plan/build.go) | Same layer as projection; parsed, not honoured |
-| **Probe-side cache keys are build-order sensitive** | `distinctValues` + `chunkStrings` in [`exec.go`](internal/exec/exec.go) | Found in review, not yet fixed |
 | **`extra` can clobber `pushed`** | `fetchScanRows` in [`exec.go`](internal/exec/exec.go) | Latent — unreachable until a catalog declares the join key filterable |
 
 ---
@@ -153,7 +153,7 @@ currently unreachable.
 ## Commands
 
 ```bash
-go test -race ./...                  # 48 tests, ~5s
+go test -race ./...                  # 50 tests, ~5s
 go test ./... -run 'LyingConnector|PlanCacheDoesNotLeak|SemiJoin|TenantDerived' -v
 go run ./cmd/gateway                 # needs mocksf + mockzd, see README Quickstart
 ```

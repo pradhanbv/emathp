@@ -39,6 +39,19 @@ func Token(role string) ReqOption {
 	}
 }
 
+// RawAuth sets the Authorization header verbatim, including the empty
+// string, so a test can exercise credentials that Token cannot express -
+// a missing header, a missing Bearer prefix, unparseable claims.
+func RawAuth(v string) ReqOption {
+	return func(r *http.Request) {
+		if v == "" {
+			r.Header.Del("Authorization")
+			return
+		}
+		r.Header.Set("Authorization", v)
+	}
+}
+
 type Response struct {
 	Code   int
 	Body   server.QueryResponse

@@ -29,5 +29,5 @@ func TestResolveUnregisteredIssuerFailsClosed(t *testing.T) {
 
 	_, err := identity.Resolve(raw, testdata.IssuerRegistry())
 
-	require.ErrorIs(t, err, identity.ErrPrincipalUnresolved)
+	require.ErrorIs(t, err, identity.ErrUnauthenticated)
 }

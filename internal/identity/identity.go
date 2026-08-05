@@ -6,6 +6,7 @@ package identity
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -35,12 +36,12 @@ type Principal struct {
 func Resolve(raw string, registry *Registry) (Principal, error) {
 	var c claims
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
-		return Principal{}, err
+		return Principal{}, fmt.Errorf("%w: claims are not valid JSON", ErrUnauthenticated)
 	}
 
 	reg, ok := registry.ByIssuer(c.Issuer)
 	if !ok {
-		return Principal{}, ErrPrincipalUnresolved
+		return Principal{}, fmt.Errorf("%w: issuer not registered", ErrUnauthenticated)
 	}
 
 	roles := make([]string, 0, len(c.Groups))
@@ -81,7 +82,7 @@ func Resolve(raw string, registry *Registry) (Principal, error) {
 func ResolveFromHeader(authHeader string, registry *Registry) (Principal, error) {
 	raw, ok := strings.CutPrefix(authHeader, "Bearer ")
 	if !ok {
-		return Principal{}, ErrPrincipalUnresolved
+		return Principal{}, fmt.Errorf("%w: missing or malformed Authorization header", ErrUnauthenticated)
 	}
 	return Resolve(raw, registry)
 }

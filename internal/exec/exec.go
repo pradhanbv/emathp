@@ -330,7 +330,7 @@ func chunkStrings(vals []string, size int) [][]string {
 // chunking still required), not the classic matched-rows/corpus-size
 // ratio - exec never learns the probe table's total corpus size, only
 // what came back for the keys it asked about.
-func logSemiJoin(buildTable string, buildRows int, keys []string, chunks [][]string, probeRowsMatched int) {
+func logSemiJoin(probeTable string, buildRows int, keys []string, chunks [][]string, probeRowsMatched int) {
 	totalCalls := 1 + len(chunks)
 	totalCallsNaive := 1 + len(keys)
 	reduction := float64(totalCallsNaive) / float64(totalCalls)
@@ -338,10 +338,10 @@ func logSemiJoin(buildTable string, buildRows int, keys []string, chunks [][]str
 	if len(keys) > 0 {
 		selectivity = float64(len(chunks)) / float64(len(keys))
 	}
-	log.Printf("join.strategy=semi_join build=%s build_rows=%d keys=%d chunks=%d "+
+	log.Printf("join.strategy=semi_join probe=%s build_rows=%d keys=%d chunks=%d "+
 		"probe_calls=%d probe_calls_naive=%d probe_rows_matched=%d total_calls=%d total_calls_naive=%d "+
 		"selectivity=%.3f reduction_total=%.1fx",
-		buildTable, buildRows, len(keys), len(chunks),
+		probeTable, buildRows, len(keys), len(chunks),
 		len(chunks), len(keys), probeRowsMatched, totalCalls, totalCallsNaive,
 		selectivity, reduction)
 }

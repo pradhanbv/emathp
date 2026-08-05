@@ -3,7 +3,7 @@
 Navigation for the implementation. The design lives in [`DESIGN.md`](./DESIGN.md); this is where
 each decision actually landed in code, and where the bodies are buried.
 
-**5,140 lines of Go, 2,020 of tests, 56 tests.** Run everything with `go test -race ./...` (~6 s); `-tags duckdb` adds one more that exercises DuckDB directly.
+**5,140 lines of Go, 2,020 of tests, 57 tests.** Run everything with `go test -race ./...` (~6 s); `-tags duckdb` adds one more that exercises DuckDB directly.
 
 ---
 
@@ -11,9 +11,9 @@ each decision actually landed in code, and where the bodies are buried.
 
 | You want to see… | Go to | Why that file |
 |---|---|---|
-| **The security argument**, end to end | [`exec.go:365`](internal/exec/exec.go#L365) `verifyPushedSecurityPredicates` | The runtime half of ADR-002. Re-applies every `ENFORCED` predicate after fetch, so a connector that lied about enforcing it fails closed rather than leaking |
-| **Whether the design is real** | [`plan/invariant.go:65`](internal/plan/invariant.go#L65) `AssertInvariant` | The plan-time half. Proves no security predicate went missing between policy and plan |
-| **One request, beginning to end** | [`server.go:118`](internal/server/server.go#L118) → the table below | ~200 lines covers admission, policy, planning, execution, envelope |
+| **The security argument**, end to end | [`exec.go:375`](internal/exec/exec.go#L375) `verifyPushedSecurityPredicates` | The runtime half of ADR-002. Re-applies every `ENFORCED` predicate after fetch, so a connector that lied about enforcing it fails closed rather than leaking |
+| **Whether the design is real** | [`plan/invariant.go:66`](internal/plan/invariant.go#L66) `AssertInvariant` | The plan-time half. Proves no security predicate went missing between policy and plan |
+| **One request, beginning to end** | [`server.go:123`](internal/server/server.go#L123) → the table below | ~200 lines covers admission, policy, planning, execution, envelope |
 | **The hardest thing here** | [`exec.go`](internal/exec/exec.go) `runJoin` | The N-way semi-join cascade across SaaS APIs, plus the chunking that keeps each probe bounded |
 
 ---
@@ -24,18 +24,18 @@ Everything below happens inside one `POST /v1/query`. File references are the re
 
 | # | Step | Where | What it decides |
 |---|---|---|---|
-| 1 | **Admission** | [`server.go:118`](internal/server/server.go#L118) `identity.ResolveFromHeader` | Verifies the JWT and derives tenant **from the verified issuer**, never a claim (ADR-011) |
-| 2 | **Object authz (L1)** | [`server.go:184`](internal/server/server.go#L184) `Policy.ObjectDenied` | Rejects a denied table before any catalog or planner work happens |
-| 3 | **Plan (or cache hit)** | [`server.go:194`](internal/server/server.go#L194) → [`plancache.go:77`](internal/plancache/plancache.go#L77) `Resolve` | Six-field key; RLS/CLS residuals injected as plan nodes (L2) |
-| 4 | **Bind literals** | [`build.go:596`](internal/plan/build.go#L596) `Shape` + `ExtractParams` | Cached plans hold `?` placeholders, so two literals share one plan and each still sees its own value |
-| 5 | **Wrap sources** | [`server.go:234`](internal/server/server.go#L234) `freshness.Source{}` | Per-request cache decorator over the shared connector |
+| 1 | **Admission** | [`server.go:123`](internal/server/server.go#L123) `identity.ResolveFromHeader` | Verifies the JWT and derives tenant **from the verified issuer**, never a claim (ADR-011) |
+| 2 | **Object authz (L1)** | [`server.go:189`](internal/server/server.go#L189) `Policy.ObjectDenied` | Rejects a denied table before any catalog or planner work happens |
+| 3 | **Plan (or cache hit)** | [`server.go:199`](internal/server/server.go#L199) → [`plancache.go:77`](internal/plancache/plancache.go#L77) `Resolve` | Six-field key; RLS/CLS residuals injected as plan nodes (L2) |
+| 4 | **Bind literals** | [`build.go:641`](internal/plan/build.go#L641) `Shape` + `ExtractParams` | Cached plans hold `?` placeholders, so two literals share one plan and each still sees its own value |
+| 5 | **Wrap sources** | [`server.go:239`](internal/server/server.go#L239) `freshness.Source{}` | Per-request cache decorator over the shared connector |
 | 6 | **Execute** | [`exec.go`](internal/exec/exec.go) `Run` | Single-table scan, or `runJoin` — an N-way semi-join cascade over the plan's sides and links |
-| 7 | **Fetch + verify (L3)** | [`exec.go:217`](internal/exec/exec.go#L217) | Verification filter, then `applyLocalFilters` — **per side, before any join merge** |
-| 8 | **Project** | [`exec.go:426`](internal/exec/exec.go#L426) `project` | Positional rows, so `a.id` and `t.id` are two slots rather than one overwritten map key |
+| 7 | **Fetch + verify (L3)** | [`exec.go:245`](internal/exec/exec.go#L245) | Verification filter, then `applyLocalFilters` — **per side, before any join merge** |
+| 8 | **Project** | [`exec.go:430`](internal/exec/exec.go#L430) `project` | Positional rows, so `a.id` and `t.id` are two slots rather than one overwritten map key |
 
 **Rate limiting is not in this list on purpose.** It lives one layer deeper, at
 [`httpsource.go`](internal/connector/httpsource.go)'s page loop, because a vendor bills per HTTP
-request and `Fetch` paginates internally. Wired once in [`server.go:62`](internal/server/server.go#L62)
+request and `Fetch` paginates internally. Wired once in [`server.go:72`](internal/server/server.go#L72)
 `New`, never per request — the sources map is shared across concurrent requests.
 
 ---
@@ -83,7 +83,7 @@ the predicate — the adversary the whole entitlement model is built against.
 | ADR | Code |
 |---|---|
 | **001** Planner runtime | [`plan/build.go`](internal/plan/build.go) — a Go stand-in for the Calcite sidecar the design specifies |
-| **002** Entitlements | L1 [`server.go:184`](internal/server/server.go#L184) · L2 [`build.go`](internal/plan/build.go) + [`invariant.go`](internal/plan/invariant.go) · L3 [`exec.go:365`](internal/exec/exec.go#L365) |
+| **002** Entitlements | L1 [`server.go:189`](internal/server/server.go#L189) · L2 [`build.go`](internal/plan/build.go) + [`invariant.go`](internal/plan/invariant.go) · L3 [`exec.go:375`](internal/exec/exec.go#L375) |
 | **003** Caching | [`plancache/`](internal/plancache/) and [`freshness/`](internal/freshness/) |
 | **005** Freshness | [`freshness.go`](internal/freshness/freshness.go) + ETag handling in [`httpsource.go`](internal/connector/httpsource.go) |
 | **006** Rate limits | [`ratelimit/`](internal/ratelimit/) + the page gate in [`httpsource.go`](internal/connector/httpsource.go) |
@@ -106,8 +106,9 @@ ADR-004, 008 and 010 are design-only — no code. That is deliberate and
 | `TestHonestConnectorZeroViolations` | Its pairing — the filter isn't trivially always-firing |
 | `TestPlanCacheDoesNotLeakAcrossRoles` | Privilege escalation via a shared plan |
 | `TestConcurrentResolvesDoNotBleedAcrossRoles` | The same, **under contention** |
-| `TestSemiJoinReducesProbeCalls` | 505 → 17 calls |
+| `TestSemiJoinReducesProbeCalls` | 501 → 4 connector calls (125×) on the reference fixture |
 | `TestFourTableJoinEndToEnd` | **N-way works** — 4 tables, 3 links over HTTP, through every engine in the build (`-tags duckdb` adds DuckDB and requires identical output) |
+| `TestUnauthenticatedIsNotAServiceFailure` | Every credential the caller can fix is a **401**, not a 503 — missing header, bad prefix, unparseable claims, unregistered issuer |
 | `TestJoinRejectsForwardReference` | Every join must reference an earlier table, so a probe's keys are always already fetched |
 | `TestSemiJoinReturnsEveryMatchingRow` | Exactly 2,500 rows across 3 chunks — the correctness half |
 | `TestJoinKeepsBothSidesOfCollidingColumns` | `a.id` and `t.id` both survive the merge |
@@ -155,7 +156,7 @@ currently unreachable.
 ## Commands
 
 ```bash
-go test -race ./...                  # 56 tests, ~6s
+go test -race ./...                  # 57 tests, ~6s
 go test ./... -run 'LyingConnector|PlanCacheDoesNotLeak|SemiJoin|TenantDerived' -v
 go run ./cmd/gateway                 # needs mocksf + mockzd, see README Quickstart
 docker compose --profile duckdb up -d --build   # ADR-007 tier 1 on :8090 (cgo, 148MB vs 49.5MB)

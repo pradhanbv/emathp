@@ -19,8 +19,8 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 
 ```bash
 docker compose --profile core --profile mocks up -d --build   # gateway + 2 mock SaaS sources
-go test -race ./...                                           # 56 tests, ~6s
-go test -race -tags duckdb ./...                              # 57 - adds the DuckDB engine
+go test -race ./...                                           # 57 tests, ~6s
+go test -race -tags duckdb ./...                              # 58 - adds the DuckDB engine
 docker compose --profile testing run --rm k6                  # load test: 500 req/s for 60s
 
 docker compose --profile "*" down                             # tear down — see note below
@@ -65,7 +65,7 @@ Each exists because it proves a design claim a reviewer would otherwise take on 
 |---|---|---|
 | `TestLyingConnectorFailsClosed` | A connector that declares a predicate `ENFORCED` then ignores it is **caught at runtime and fails closed** — RLS survives a connector whose behaviour diverges from its declaration | 002 |
 | `TestPlanCacheDoesNotLeakAcrossRoles` | Caching a plan *before* policy injection is a privilege-escalation vector; the composite cache key prevents it. Built even though the in-process planner is cheap — the bug class covers the result cache too | 003 |
-| `TestSemiJoinReducesProbeCalls` | Cross-app join rewritten as a semi-join: **505 → 17 connector calls (29.7×)** at 2.4% join-key selectivity. The ratio *is* selectivity | 007 |
+| `TestSemiJoinReducesProbeCalls` | Cross-app join rewritten as a semi-join: **501 → 4 connector calls (125×)** on the reference fixture — 500 accounts, 50,000 tickets, `max_in_list` 200, so the probe side is 3 chunked calls instead of one per key. The ratio *is* selectivity | 007 |
 | `TestTenantDerivedFromIssuerNotClaim` | A token asserting `tenant_id: t_evilcorp` resolves to `t_acme` — tenant comes from the verified issuer, the claim is never read | 011 |
 
 ```bash
@@ -79,10 +79,12 @@ return the unfiltered set: an RLS filter that appears pushed, does nothing, and 
 table with a `200`. So every `PUSHED_ENFORCED` security predicate is re-applied locally after
 fetch, with two metrics carrying opposite expectations:
 
-| Metric | Expected | Meaning |
+| Metric | Status | Meaning |
 |---|---|---|
-| `residual_filter_rows_dropped` | Non-zero | Normal — the cost of the `ADVISORY` path |
-| `enforced_predicate_violations_total` | **Zero** | Non-zero ⇒ a connector diverged from its declaration. **Page someone.** |
+| `connector_request_duration_seconds` | **on `/metrics`** | Real histogram — what the screenshot below shows |
+| `result_cache_requests_total` | **on `/metrics`** | `result_cache_hit_ratio` is derived from it in PromQL |
+| `enforced_predicate_violations_total` | **counted in-process, not exported** | Non-zero ⇒ a connector diverged from its declaration. **The alarm that should page someone** — `obs.EnforcedPredicateViolations` is asserted by `TestLyingConnectorFailsClosed` but never registered with Prometheus, so it does not reach `/metrics`. Registering it is one line and the first thing to do before this runs anywhere real |
+| `residual_filter_rows_dropped` | **designed, not built** | Would quantify the `ADVISORY` path's cost |
 
 ---
 
@@ -95,9 +97,9 @@ single per-ADR verdict would flatten into one misleading word.
 
 | Lane | Contents |
 |---|---|
-| **🟢 Built & verified**<br>real code, real tests, real HTTP round trips | Go planner + capability classification · RLS/CLS injection + plan-time invariant + runtime verification filter (002) · parameterized role-isolated plan cache (003) · semi-join rewrite, 505→17 calls (007) · tenant from verified `iss`, never a claim (011) · real Prometheus histogram + real OTel trace · result cache keyed by principal |
+| **🟢 Built & verified**<br>real code, real tests, real HTTP round trips | Go planner + capability classification · RLS/CLS injection + plan-time invariant + runtime verification filter (002) · parameterized role-isolated plan cache (003) · semi-join rewrite, 501→4 calls (007) · tenant from verified `iss`, never a claim (011) · real Prometheus histogram + real OTel trace (two metrics exported; [§11](./DESIGN.md#11-observability) marks the rest designed) · result cache keyed by principal |
 | **🟡 Partial**<br>real mechanism, deliberately narrowed scope | Freshness rungs 1 & 4 + `max_staleness` only (005) · rate limits: single-node bucket, `429`, async reroute — no Redis lease, no fair queue, **no per-tenant dimension** (006) · NDJSON + `SOURCE_TIMEOUT` terminal frame, thin coverage (009) · policy injection real, OPA mocked (002) · identity derivation real, signature verification mocked (011) |
-| **⚪ Mocked / not built**<br>infrastructure a reviewer can assume | Salesforce + Zendesk connectors are mocks (004) · Calcite sidecar + Substrait IR deferred to M1 spike (001) · Calcite/Substrait deferred, so N-way join *ordering* is FROM-order, not cost-based (001, 007) · tenant lifecycle API (008) · per-tenant KMS + crypto-shred (010) · **audit trail (010) — no access log exists; nothing to review post-incident** |
+| **⚪ Mocked / not built**<br>infrastructure a reviewer can assume | no vendor-specific connectors — one generic `HTTPSource` against mock Salesforce/Zendesk *servers*; pagination, ETag and quota are real code, SOQL/OAuth-refresh/vendor error mapping are not (004) · Calcite sidecar + Substrait IR deferred to M1 spike, so N-way join *ordering* is FROM-order rather than cost-based (001, 007) · tenant lifecycle API (008) · per-tenant KMS + crypto-shred (010) · **audit trail (010) — no access log exists; nothing to review post-incident** |
 | **🔵 Open question**<br>not decided, not just unbuilt | `RESULT_TOO_LARGE` — guardrail specified in 007, never implemented. **The sharper risk: a skewed join can exhaust memory today** · `LIMIT`/`OFFSET` — in the grammar, undecided past it (007) |
 | **🟠 Executor limits**<br>narrower than they were | **DuckDB is real now**: `--join-engine=duckdb` runs the merge in an embedded DuckDB (ADR-007 tier 1), one instance per query, `threads=1`; the cgo-free Go hash join stays the default and both are held to the same contract by `TestEnginesAgreeOnFourWayJoin`. **N-way joins work** — 4 tables, 3 links, either engine. What remains: `LIMIT`/`OFFSET` and `ORDER BY` parse and are ignored; outer joins are **rejected**, not downgraded; join *order* follows the FROM clause, since cost-based ordering needs the planner ADR-001 defers |
 
@@ -130,6 +132,9 @@ docker compose --profile testing run --rm -e PRINCIPALS=10 -e QUERIES=10 k6   # 
   <img alt="Two stacked charts sharing an x-axis of distinct cache keys (100, 1,000, 10,000). Top: result cache hit ratio falls from 98.00% to 34.16%. Bottom: p95 latency rises with it from about 1 ms to 941 ms, stepping up once the miss rate passes 5%." src="./docs/hit-ratio-light.svg" width="720">
 </picture>
 
+Little's Law throughout: **`L`** = concurrent requests in flight, **`λ`** = arrival rate
+(requests/s), **`W`** = mean time one request is in the system.
+
 | Users | Distinct keys | `result_cache_hit_ratio` | Cache misses | *ideal* | p95 | In flight (`L=λW`) |
 |---|---|---|---|---|---|---|
 | 10 | 100 | 98.00% | 597 | *200* | 1 ms | 6 |
@@ -155,7 +160,7 @@ Request totals fall short of 30,001 as k6 sheds iterations under load (91 → 73
 
 | Not covered | Why | Consequence |
 |---|---|---|
-| **Hit ratio itself is arithmetic** | `hit = 1 − (N × ⌈D/T⌉) / R` predicts the ratio exactly wherever the fetch window is narrow relative to per-key spacing (N ≥ 1,000 here) | The *ratio* is a tautology of TTL and key cardinality — a formula gets it for free. What the run adds is everything the formula cannot predict: latency, concurrency, and the stampede |
+| **Hit ratio itself is arithmetic** | `hit = 1 − (N × ⌈D∕T⌉) / R` — **`N`** distinct cache keys (`PRINCIPALS × QUERIES`), **`D`** run duration (60 s), **`T`** the `max_staleness` TTL (30 s), **`R`** total requests (`rate × duration` = 30,000). Each key must be re-fetched once per TTL window, so `N × ⌈D∕T⌉` is the miss floor. It predicts the ratio exactly wherever the fetch window is narrow relative to per-key spacing (N ≥ 1,000 here) — and reproduces the *ideal* column above: 200 / 2,000 / 20,000 | The *ratio* is a tautology of TTL and key cardinality — a formula gets it for free. What the run adds is everything the formula cannot predict: latency, concurrency, and the stampede |
 | **What the cache costs** | The load query (`status = 'open-<principal>'`) matches no row, so every entry caches **0 rows / 2 bytes** — a query hitting real data returns ~26 KB. Distinct keys are manufactured by the literal, which is what makes the cardinality sweep work at all | The run exercises lookup bookkeeping — key construction, hit/miss accounting, TTL expiry, revalidation — but never entry **size**. So §6.2's *100–200 KB per entry* (and the 2–8 GB range built on it), assumption **A2**'s ~100 KB payload, serialization and GC pressure, and egress — [§12.5](./DESIGN.md#125-budget)'s dominant budget line — are all untested here |
 | **The plan cache** | `meta.cache_hit` is the **result/freshness** cache | The plan cache is a separate ~90% number, and it sizes planner sidecars in [§6.2](./DESIGN.md#62-derived-sizing) |
 | **Memory** | Working set dominates: **23 GB** materialization vs **2–8 GB** cache; **2 GB of a 2.5 GB** per-pod heap | Pod size follows join concurrency and DuckDB's `memory_limit`. Drive hit ratio to zero and the 8 GB pod stands |
@@ -205,7 +210,8 @@ Every message names **what to do**, not just what broke.
 | `RESULT_TOO_LARGE` | 400 | Materialization would exceed guardrail *(specified, not implemented)* |
 | `CONNECTOR_AUTH_FAILED` | 502 | Token refresh failed / grant revoked |
 | `SCHEMA_DRIFT` | 409 | Source schema changed under a pinned connector version |
-| `PRINCIPAL_UNRESOLVED` | 503 | Attribute resolution failed and cache expired — fail closed |
+| `UNAUTHENTICATED` | 401 | No resolvable principal: missing/malformed `Authorization`, unparseable claims, or an unregistered issuer. **The caller's to fix — re-authenticate, don't retry** |
+| `PRINCIPAL_UNRESOLVED` | 503 | Credential was fine; the *attribute source* was unreachable and no cached copy was fresh — fail closed. No code path reaches this yet |
 | `RESIDENCY_VIOLATION` | 403 | Plan would cross a residency boundary |
 
 ---
@@ -670,7 +676,7 @@ not just repeats - worth pointing out if `result_cache_requests_total` comes up.
    chunk count moves with join-key selectivity, so treat the shape as the claim, not the number.
 4. Screenshot the waterfall. This is the trace screenshot - the semi-join made visible: a single
    small build-side fetch, then the chunked probe fanout, each span with its own real duration.
-   That chunking *is* the 505 -> 17 call reduction, not a log line asserting it happened.
+   That chunking *is* the 501 -> 4 call reduction, not a log line asserting it happened.
 
 **What the pair proves together.** The metrics show call volume (and now cache hit/miss) are
 real and observable; the trace shows *where the time inside one request actually went*, and that

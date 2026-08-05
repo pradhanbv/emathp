@@ -30,7 +30,7 @@ repo's sharpest findings came from.
 
 | What I pushed on | What it fixed |
 |---|---|
-| *"this k6 measurement is meaningless — a formula arrives at the same number"* | Correct. `hit = 1 − (N×⌈D/T⌉)/R` reproduced 3 of 4 rows **exactly**. Arithmetic was being presented as measurement |
+| *"this k6 measurement is meaningless — a formula arrives at the same number"* | Correct. `hit = 1 − (N×⌈D∕T⌉)/R` — `N` distinct keys, `D` run duration, `T` the staleness TTL, `R` total requests — reproduced 3 of 4 rows **exactly**. Arithmetic was being presented as measurement |
 | *"latency doesn't drop because the source is mocked — try 200 ms–1 s"* | The highest-value intervention of the project. It reversed a retraction Claude had made on bad evidence, and converted a tautology into a real measurement that then found two live defects |
 | *"testing 1 principal at 500 req/s is unrealistic"* | A 112× stampede figure was being reported as a production number. The honest figure at design scale is ~1.1× |
 | *"is this load test using any result cache?"* | Every cached entry was **0 rows / 2 bytes** — the query matched nothing. That caveat had existed and was silently lost in a rewrite |

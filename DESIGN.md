@@ -86,10 +86,10 @@ table so it stays scannable.
 | Rate limits: per-app constraints; friendly, actionable exhaustion messages | [ADR-006](#adr-006--rate-limiting-and-multi-tenant-fairness) | **Partial** — bucket, `429`, async reroute | Redis leases, semaphores, fair queues — M5 |
 | Freshness: avoid materially stale data; per-query staleness hints | [ADR-005](#adr-005--freshness-watermark-capability-ladder) | **Partial** — rungs 1 & 4 | Rungs 2 & 3 — M2 |
 | Caching *(implied — nearest is "cache hit ratios" under sizing math)* | [ADR-003](#adr-003--caching-plan-cache--result-cache) | **Partial** — plan + result cache | Result cache's shared Redis tier — M5 |
-| Materialization: short-lived tables for joins/aggregations, lifecycle ≤ N min, encrypted per tenant | [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Partial** — semi-join rewrite only | DuckDB tier — M4; ClickHouse/Spark unscheduled |
+| Materialization: short-lived tables for joins/aggregations, lifecycle ≤ N min, encrypted per tenant | [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Partial** — semi-join rewrite plus tier 1's embedded DuckDB (`--join-engine=duckdb`), one instance per query, destroyed after. N-way | Encryption at rest for the temp dir; ClickHouse/Spark tiers unscheduled |
 | Admin UX: onboard connectors quickly via console/config; connectors versioned | [ADR-004](#adr-004--connector-strategy-build-vs-buy), [§12.3](#123-milestones) M6 | **No** — design only | Console onboarding + connector versioning — M6 |
 | Deployment modes: multi-tenant and single-tenant without code changes | [ADR-008](#adr-008--tenant-lifecycle-terraform-vs-control-plane-api) | **No** — design only | Tenant Lifecycle API — M2 |
-| Error vocabulary + `Retry-After` + async guidance | [§8](#8-error-vocabulary) | **Yes** — all ten codes | — |
+| Error vocabulary + `Retry-After` + async guidance | [§8](#8-error-vocabulary) | **Partial** — 6 of 11 codes are emitted by the running gateway (`RATE_LIMIT_EXHAUSTED`, `ENTITLEMENT_DENIED`, `SOURCE_TIMEOUT`, `UNSUPPORTED_PREDICATE`, `CONNECTOR_AUTH_FAILED`, `UNAUTHENTICATED`), with `Retry-After` and the async hint on the rate-limit path | `STALE_DATA`, `RESULT_TOO_LARGE`, `RESIDENCY_VIOLATION`, `SCHEMA_DRIFT`, `PRINCIPAL_UNRESOLVED` — vocabulary defined, no code path reaches them yet |
 
 ### Non-functional
 
@@ -109,7 +109,7 @@ table so it stays scannable.
 | Backpressure; overload protection | [§6.5](#65-autoscaling-backpressure-overload) | **No** | Admission control + load shedding — M4 |
 | DR/BCP: multi-AZ, RPO/RTO targets | [§10.2](#102-dr--bcp) | **No** | Multi-AZ + cross-region replica — M4 |
 | Runbooks: rate-limit floods, connector auth failures, cache stampedes | [§10.3](#103-runbooks) | **No** — design only | Chaos drills validate them — M6 |
-| Observability: OTel traces, Prometheus metrics, structured logs | [§11](#11-observability) | **Yes** — real histogram, real trace | — |
+| Observability: OTel traces, Prometheus metrics, structured logs | [§11](#11-observability) | **Partial** — real OTel trace and two real Prometheus metrics (`connector_request_duration_seconds`, `result_cache_requests_total`); structured logs with `trace_id` | The other 8 metrics in [§11](#11-observability) are designed, not built — including `enforced_predicate_violations_total`, which is counted in-process but never registered with Prometheus |
 | Six-month plan: team, milestones, acceptance criteria, risks, budget | [§12](#12-six-month-execution-plan) | **n/a** — planning artifact | — |
 | Bonus: cost levers, chaos plan, predicate-pushdown creativity | [§10.4](#104-cost-guardrails), [§12.3](#123-milestones) M6, [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder) | **Partial** — semi-join rewrite built | Cost levers — M5; chaos plan — M6 |
 
@@ -407,7 +407,7 @@ Routed by a **cost-based cardinality estimate at plan time** — never table cou
 |---|---|
 | **Tier 1 runs N-way, not 2-table** | `Join` carries N sides and N-1 links; the merge namespaces columns by **alias**, so two aliases over one table stay addressable. Both engines satisfy the same `JoinEngine` contract and are held to identical output by test |
 | **Tier 1 in-process, not a container** | Container cold start alone can consume the entire 1.5 s budget |
-| **Tier 1's semi-join rewrite** | Fetch the smaller side, push its join keys into the larger side as an `IN` predicate. **The reduction equals join-key selectivity on the probe side, and nothing else** — fixture: 500 accounts, 50,000 tickets, 2.4% selectivity → **505 → 17 calls (29.7×)**. At low selectivity it saves nothing and adds chunking overhead |
+| **Tier 1's semi-join rewrite** | Fetch the smaller side, push its join keys into the larger side as an `IN` predicate. It buys **two different reductions, and conflating them is easy**: <br>• **Calls** — `(K+1) / (1 + ⌈K∕M⌉)`, where `K` is the distinct build-side join keys and `M` the probe table's declared `max_in_list`. Driven by *chunking*, not selectivity, and it asymptotes to `M`: you can never beat one call per `M` keys. Fixture `K=500, M=200` → `501/4 =` **125×**, matching the measured figure exactly. <br>• **Rows** — `1∕s`, where `s` is the fraction of probe rows whose join key is in the build set. Driven by *selectivity* alone. Fixture: 2,500 matched of 50,000 → **20×**. <br>So selectivity decides whether the rewrite is worth doing at all (at `s→1` you fetch the whole probe table anyway and only the chunking overhead remains), while `M` decides how much the call count can fall once it is |
 | **Tier 1 concurrent, not serialized like tier 2** | The obvious question, since both are memory-bounded engines. Tier 2 can serialize because async promises no completion time, so queueing breaks nothing. Tier 1 is on the **sync** path, so one join at a time per pod would queue joins behind each other and blow the 1.5 s / 4 s budget. That is why tier 1 runs K joins concurrently in one process, and therefore why it needs an engine with a **per-instance** memory ceiling: `RESULT_TOO_LARGE` and the tier-2 reroute both have to name *which* join exceeded, and a single shared pool cannot — a 5 MB join would fail because a 1.9 GB one is holding the pool ([§14](#14-rejected-alternatives-by-decision)) |
 | **Tier 2 a warm pool, not an instance per job** | At the risk register's own trigger (`RESULT_TOO_LARGE` on >5% of cross-app joins) escalations run ~7.5/s; 5% of *all* traffic would be 50/s. Against a 10–30 s startup, Little's Law puts **75–1,500 instances permanently mid-provision** |
 | **Tier 2 one job at a time** | Concurrent tenants would co-mingle rows in a single process heap, which no S3 prefix or key separates; serialization plus a restart between jobs makes the node single-tenant for the job's duration. It costs little, since a tier-2 job monopolizes a node regardless — but it does pin node count to concurrent jobs, so tier 2 stops being economical before tier 3 does. That is a provisioning question the risk register already gates, not a routing one |
@@ -560,7 +560,8 @@ proceed without one.
 | Single-source, pushdown, plan-cache hit | 55% | 270 ms (gw 5 + OPA 3 + bind 1 + connector p50 250 + merge 10) |
 | Cross-app join | 15% | 600 ms (parallel fanout ~450 + DuckDB ~100 + merge) |
 
-Weighted mean **W ≈ 245 ms** → by **Little's Law** (`L = λ × W`):
+Weighted mean **W ≈ 245 ms** → by **Little's Law** (`L = λ × W`, where `L` is requests in flight,
+`λ` the arrival rate and `W` the mean time in system):
 **L = 1,000 × 0.245 ≈ 245 concurrent in-flight queries.**
 
 ### 6.2 Derived sizing
@@ -588,15 +589,16 @@ the wrong variable.
 
 ⚠️ **`C = 2` is a floor being used as a mean.** It holds only when the build side fits one
 `IN`-list chunk *and* neither side paginates.
-[ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder)'s own reference fixture — 500
-accounts, `MaxInList` 200 — measures **17 calls for one join**, and `TestSemiJoinReducesProbeCalls`
-bounds the probe side at 20. `C` is set by build-side cardinality, which is unmeasured:
+[ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder)'s reference fixture — 500
+accounts, `MaxInList` 200 — measures **4 calls for one join** (1 build + 3 probe chunks). `C` is
+set by build-side cardinality: 500 keys give 3 chunks, and it grows linearly from there. That
+cardinality is unmeasured against real traffic:
 
 | `C` | Joins contribute | Total calls/s | Concurrent outbound |
 |---|---|---|---|
 | **2** — floor, and what the row above plans on | 300 | ~935 | ~750 |
-| **4** — build side spans two chunks | 600 | ~1,235 | ~990 |
-| **17** — [ADR-007](#adr-007--join-strategy-a-four-tier-escalation-ladder)'s fixture | 2,550 | ~3,185 | ~2,550 |
+| **4** — measured on the reference fixture | 600 | ~1,235 | ~990 |
+| **11** — a 2,000-key build side, 10 chunks | 1,650 | ~2,285 | ~1,830 |
 
 Under-counting is the dangerous direction here: [§6.4](#64-the-sensitivity-that-actually-matters)
 calls connector quota *"a hard external ceiling we cannot autoscale past"*, so believing we have
@@ -606,7 +608,7 @@ headroom we don't is worse than over-provisioning pods.
 **Transient memory — `Σ (in-flight per class × working set per class)`.** In-flight counts come
 from Little's Law on [§6.1](#61-baseline)'s mix; working set is what one executing request holds:
 
-| Class | In flight (`L = λW`) | Working set each | Total |
+| Class | In flight (`L = λW`: arrival rate × service time) | Working set each | Total |
 |---|---|---|---|
 | Result-cache hit | 300 × 0.020 = **6** | ~0 — served from the resident copy, nothing new held | ~0 |
 | Single-source miss | 550 × 0.270 = **148** | ~200 KB of fetched rows | **~30 MB** |
@@ -795,7 +797,8 @@ requests and audited monthly so they can't become a loophole.
 | `RESULT_TOO_LARGE` | 400 | Materialization would exceed guardrail | Estimated cardinality, suggested narrowing |
 | `CONNECTOR_AUTH_FAILED` | 502 | Token refresh failed / grant revoked | Which connector, re-consent link |
 | `SCHEMA_DRIFT` | 409 | Source schema changed under a pinned version | Field, old vs new, version to upgrade to |
-| `PRINCIPAL_UNRESOLVED` | 503 | Attribute resolution failed, cache expired — fail closed | Which attribute, owning system, retry guidance |
+| `UNAUTHENTICATED` | 401 | No resolvable principal: missing or malformed `Authorization`, unparseable claims, unregistered issuer | What was missing; never whether the issuer exists, which would confirm tenants by probing |
+| `PRINCIPAL_UNRESOLVED` | 503 | Credential accepted, but the attribute source was unreachable and no cached copy was fresh — fail closed | Which attribute, owning system, retry guidance |
 | `RESIDENCY_VIOLATION` | 403 | Plan would cross a residency boundary | Which tag, which step |
 
 Every response — success or failure — returns `freshness_ms`, `rate_limit_status`, `trace_id`.
@@ -881,16 +884,19 @@ upgrades turning fetches into 304s; (4) async reroute moving peak into troughs.
 **`connector.fetch` is the span that matters** — it's what proves the SLO is dominated by external
 latency rather than our own overhead.
 
-**Metrics (Prometheus)** — two of these deserve separate attention:
+**Metrics.** Two are scrapeable from `/metrics` today; the rest of this section is the target
+set, and the split is stated because a metric list is easy to read as an inventory:
 
-| Metric | Expected value | Why |
+| Metric | Status | Why it matters |
 |---|---|---|
-| `residual_filter_rows_dropped` | **Non-zero is normal** | The cost of the `ADVISORY` path |
-| `enforced_predicate_violations_total` | **Must be zero** | Non-zero ⇒ a connector's real behaviour diverged from its declared capability. **This is the alarm.** |
+| `connector_request_duration_seconds` | **Built** — real histogram, per connector and outcome | Proves the SLO is dominated by external latency rather than our own overhead |
+| `result_cache_requests_total` | **Built** — counter, `{connector, outcome}` | `result_cache_hit_ratio` is derived from it in PromQL, never stored |
+| `enforced_predicate_violations_total` | **Counted, not exported.** `obs.EnforcedPredicateViolations` is an in-memory counter the tests assert on; it is not registered with Prometheus, so `/metrics` does not carry it | Non-zero ⇒ a connector's real behaviour diverged from its declared capability. **This is the alarm — and today it only rings inside the test suite.** Registering it is a one-line change and the first thing to do before this runs anywhere real |
+| `residual_filter_rows_dropped` | **Designed, not built** | Would quantify the cost of the `ADVISORY` path |
 
-Plus: `query_duration_seconds` (by class, tenant) · `connector_request_duration_seconds` ·
-`plan_cache_hit_ratio` · `rate_limit_budget_remaining` · `entitlement_denials_total` ·
-`freshness_age_seconds` · `materialization_memory_bytes` · `attribute_cache_age_seconds`.
+Also designed and not built: `query_duration_seconds` (by class, tenant) · `plan_cache_hit_ratio` ·
+`rate_limit_budget_remaining` · `entitlement_denials_total` · `freshness_age_seconds` ·
+`materialization_memory_bytes` · `attribute_cache_age_seconds`.
 
 ⚠️ **Memory is the one place the obvious Go metric is not merely incomplete but wrong.** DuckDB
 allocates through C, outside the Go heap ([§6.3](#63-gateway-pod-size--worked-backwards-not-asserted)),

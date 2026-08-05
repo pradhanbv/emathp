@@ -1133,9 +1133,16 @@ connector-specific fast path.
 
 **Tier 1's internal optimization: the semi-join rewrite.** Fetch the smaller side first, then
 push its join keys into the larger side as an `IN` predicate. Applies when the larger connector
-accepts an `IN` list of workable length. **The reduction equals join-key selectivity on the probe
-side, and nothing else.** In our worked fixture - 500 accounts, 50,000 open tickets, 1,200 of
-them matching - selectivity is 2.4%, so total calls fall 505 -> 17 (29.7x). At low selectivity
+accepts an `IN` list of workable length. **Two different reductions, and conflating them is easy.** The *call* reduction is
+`(K+1) / (1 + ceil(K/M))` - K distinct build-side join keys, M the probe table's declared
+`max_in_list` - which is driven by chunking rather than selectivity, and asymptotes to M: you
+can never beat one call per M keys. The *row* reduction is `1/s`, s being the fraction of probe
+rows whose join key is in the build set, and that one is selectivity alone. Selectivity decides
+whether the rewrite is worth doing; M decides how far the call count can fall once it is. In our worked fixture - 500 accounts, 50,000 open tickets, 2,500 of them
+matching - the 500 distinct join keys chunk into 3 probe calls at the catalog's declared
+`max_in_list` of 200, so total calls fall **501 -> 4 (125x)** - which is what the formula above
+gives for K=500, M=200, and what the running gateway measures. The row reduction on the same
+fixture is 2,500 matched of 50,000, i.e. **20x**. At low selectivity
 the rewrite saves nothing and adds chunking overhead; with a large build side, chunk count alone
 can exceed straight pagination; and where a connector's quota is calls-per-second rather than
 bandwidth, chunking can be a net loss. The v1 decision rule uses build-vs-probe cardinality as a
@@ -1649,7 +1656,7 @@ guardrails (Section 8.4), not gateway pod sizing.
 |---|---|---|
 | **Gateway pods** | I/O-bound Go; ~100 QPS/pod, 4 vCPU. Memory (8 GB) derived below, not asserted | **20-24 pods**, 3 AZs, N+1 per AZ |
 | **Planner sidecars** | Only cache misses reach it: 10% x 1,000 = 100 plans/s; Calcite ~25 ms -> L = 2.5 concurrent | **4-6 pods**, floored by HA and warm spares rather than by load. Uncached, 1,000 plans/s -> L = 25 concurrent -> ~10-12 pods. The cache saves **~2-3x**, not an order of magnitude - see ADR-003 for why the fleet saving is *not* the main reason it exists. |
-| **Connector concurrency** | Calls/s = 0.55x1000 single-source + 0.15x1000 x **C** joins + ~10% probes, where **C = 1 build fetch + ceil(distinct build keys / MaxInList) probe chunks**, each of which may be several *billable* requests since quota is spent per page (ADR-006). At **C = 2** that is **935 calls/s**; at connector p95 0.8 s -> L = 748. **C = 2 is the floor used as the mean** - it holds only when the build side fits one IN-list chunk and neither side paginates. ADR-007's reference fixture (500 accounts, MaxInList 200) measures **17 calls for one join**. At C = 4 the total is ~1,235 calls/s (L = 990); at C = 17 it is ~3,185 (L = 2,550). Build-side cardinality is unmeasured, and under-counting is the dangerous direction: Section 5.4 calls connector quota a hard external ceiling we cannot autoscale past | **~750 concurrent outbound** at C = 2, allocated per connector by semaphore (ADR-006) |
+| **Connector concurrency** | Calls/s = 0.55x1000 single-source + 0.15x1000 x **C** joins + ~10% probes, where **C = 1 build fetch + ceil(distinct build keys / MaxInList) probe chunks**, each of which may be several *billable* requests since quota is spent per page (ADR-006). At **C = 2** that is **935 calls/s**; at connector p95 0.8 s -> L = 748. **C = 2 is the floor used as the mean** - it holds only when the build side fits one IN-list chunk and neither side paginates. ADR-007's reference fixture (500 accounts, MaxInList 200) measures **4 calls for one join** - 1 build plus 3 probe chunks. At that C the total is ~1,235 calls/s (L = 990); a 2,000-key build side would give C = 11 and ~2,285 (L = 1,830). Build-side cardinality is unmeasured, and under-counting is the dangerous direction: Section 5.4 calls connector quota a hard external ceiling we cannot autoscale past | **~750 concurrent outbound** at C = 2, allocated per connector by semaphore (ADR-006) |
 | **Materialization memory (tiers 0-1 only)** | Joins = 150 QPS x 0.6 s = 90 concurrent x 256 MB `memory_limit`, which multiplies **only under instance-per-query** (ADR-007) - one shared instance per pod would divide a single 256 MB pool 90 ways | **~23 GB fleet-wide**; capped at 8 concurrent joins/pod (2 GB), excess queued then shed. Off-heap, so it takes RSS but no GC multiplier (Section 6.3) |
 | **Result/freshness cache memory** | Miss rate 70% x 1,000 = 700/s; over a 60 s staleness window, 21,000-42,000 live entries x 100-200 KB/entry | **~2-8 GB fleet-wide**; a range, not a point estimate - see derivation below |
 | **Redis** | Lease reconciliation, not per-request: ~24 pods x ~20 buckets x 1 Hz ~ **500 ops/s** | Single 3-node cluster, vastly under-utilized |
@@ -1665,7 +1672,7 @@ rather than folding into one number.
 |---|---|---|
 | Join share of traffic | 15% of 1,000 QPS = 150 QPS | Section 5.1's query-mix table |
 | Service time per join | 0.6 s | Section 5.1: "600 ms (parallel fanout ~450 + DuckDB ~100 + merge)" |
-| Concurrent joins (Little's Law) | 150 x 0.6 = 90 concurrent | `L = lambda x W` |
+| Concurrent joins (Little's Law) | 150 x 0.6 = 90 concurrent | `L = lambda x W` - in flight = arrival rate x time in system |
 | Memory per join instance | 256 MB | ADR-007's stated DuckDB `memory_limit` |
 | **Total** | 90 x 256 MB = 23,040 MB | **~23 GB fleet-wide** |
 

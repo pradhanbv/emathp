@@ -124,7 +124,15 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		span.RecordError(err)
 		span.End()
-		writeOutcome(w, errorOutcome(traceID, http.StatusServiceUnavailable, "PRINCIPAL_UNRESOLVED", err.Error()))
+		// 401 for a credential the caller can fix, 503 only when the
+		// attribute source we need is unreachable. Both used to return 503,
+		// which told clients to retry an unauthenticated request and paged
+		// an on-call for it.
+		status, code := http.StatusUnauthorized, "UNAUTHENTICATED"
+		if errors.Is(err, identity.ErrPrincipalUnresolved) {
+			status, code = http.StatusServiceUnavailable, "PRINCIPAL_UNRESOLVED"
+		}
+		writeOutcome(w, errorOutcome(traceID, status, code, err.Error()))
 		return
 	}
 	if len(principal.Roles) == 0 {

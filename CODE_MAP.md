@@ -1,80 +1,106 @@
 # Code map
 
-Navigation for the implementation. The design lives in [`DESIGN.md`](./DESIGN.md); this is where
-each decision actually landed in code, and where the bodies are buried.
+What each package is responsible for, which ADR it implements, and what it depends on. The design
+lives in [`DESIGN.md`](./DESIGN.md); this is where each decision landed in code.
 
-**5,140 lines of Go, 2,020 of tests, 57 tests.** Run everything with `go test -race ./...` (~6 s); `-tags duckdb` adds one more that exercises DuckDB directly.
+Deliberately no line numbers — they go stale on the first edit above them, and a stale pointer is
+worse than none. Symbol names are stable; `grep` finds them.
+
+```bash
+go test -race ./...              # 57 tests, ~6s
+go test -race -tags duckdb ./... # 58 — adds the DuckDB join engine (cgo)
+```
 
 ---
 
 ## Start here, by what you want
 
-| You want to see… | Go to | Why that file |
+| You want to see… | Symbol | Why |
 |---|---|---|
-| **The security argument**, end to end | [`exec.go:375`](internal/exec/exec.go#L375) `verifyPushedSecurityPredicates` | The runtime half of ADR-002. Re-applies every `ENFORCED` predicate after fetch, so a connector that lied about enforcing it fails closed rather than leaking |
-| **Whether the design is real** | [`plan/invariant.go:66`](internal/plan/invariant.go#L66) `AssertInvariant` | The plan-time half. Proves no security predicate went missing between policy and plan |
-| **One request, beginning to end** | [`server.go:123`](internal/server/server.go#L123) → the table below | ~200 lines covers admission, policy, planning, execution, envelope |
-| **The hardest thing here** | [`exec.go`](internal/exec/exec.go) `runJoin` | The N-way semi-join cascade across SaaS APIs, plus the chunking that keeps each probe bounded |
+| **The security argument**, end to end | [`exec`](internal/exec/exec.go) · `verifyPushedSecurityPredicates` | The runtime half of ADR-002. Re-applies every `ENFORCED` predicate after fetch, so a connector that lied about enforcing it fails closed rather than leaking |
+| **Whether the design is real** | [`plan`](internal/plan/invariant.go) · `AssertInvariant` | The plan-time half. Proves no security predicate went missing between policy and plan |
+| **One request, beginning to end** | [`server`](internal/server/server.go) · `handleQuery` → `buildAndRoute` → `run` | Admission, policy, planning, execution, envelope |
+| **The hardest thing here** | [`exec`](internal/exec/exec.go) · `runJoin` | The N-way semi-join cascade across SaaS APIs, and the chunking that keeps each probe bounded |
+
+---
+
+## Packages: responsibility and dependencies
+
+Dependencies are internal packages only, computed from imports. **Five packages depend on nothing**
+— they can be read in isolation, and they are where the vocabulary is defined.
+
+| Package | Responsibility | Depends on |
+|---|---|---|
+| [`catalog`](internal/catalog/) | Per-`(table, column, op)` capability with `ENFORCED`/`ADVISORY`, `max_in_list`, masking support. **The vocabulary pushdown decisions are written in** | — |
+| [`policy`](internal/policy/) | Role → RLS residuals, CLS masks, policy version, shape hash. Stands in for OPA's Compile API | — |
+| [`identity`](internal/identity/) | Issuer registry, tenant derivation from the verified `iss`, and the `ErrUnauthenticated` (401) / `ErrPrincipalUnresolved` (503) split | — |
+| [`ratelimit`](internal/ratelimit/) | Token buckets per connector; `Gate` is the per-outbound-call closure the connector consults | — |
+| [`obs`](internal/obs/) | Prometheus metrics and OTel tracing, dual-emitted so tests and `/metrics` cannot drift | — |
+| [`connector`](internal/connector/) | The `Source` contract and its HTTP implementation: pagination, ETag revalidation, per-page quota gate, error classification | `obs` |
+| [`plan`](internal/plan/) | Parse → capability-aware pushdown → RLS/CLS injection → the plan-time invariant. N-way `Join{Sides, Links}` | `catalog`, `policy` |
+| [`plancache`](internal/plancache/) | The six-field cache key and `combinedCapShape`, which folds every referenced table's capability profile | `catalog`, `plan`, `policy` |
+| [`freshness`](internal/freshness/) | Result cache keyed on `principal`, `table`, `columns`, `filters`; entries **immutable once published** | `connector`, `obs` |
+| [`exec`](internal/exec/) | Fetch, the N-way semi-join cascade, two pluggable `JoinEngine`s, verification filter, local filters, masking, projection | `connector`, `obs`, `plan` |
+| [`server`](internal/server/) | HTTP surface, admission, error vocabulary, sync + async + NDJSON paths. **The composition point** | all of the above |
+
+### External dependencies
+
+Five direct, and the build-tag split is the one with consequences.
+
+| Module | Used for | Where |
+|---|---|---|
+| `vitess.io/vitess` | The SQL parser — ADR-001's Go stand-in for the Calcite sidecar. Gives an AST, not an optimizer, which is the whole of that ADR's trade-off | [`plan`](internal/plan/) |
+| `prometheus/client_golang` | `/metrics`, plus the free Go-runtime and process collectors | [`obs`](internal/obs/) |
+| `go.opentelemetry.io/otel` (+ sdk, otlptracehttp) | Spans and OTLP export | [`obs`](internal/obs/) |
+| `marcboeker/go-duckdb` | **ADR-007 tier 1's engine — cgo, behind `-tags duckdb`** | [`duckjoin.go`](internal/exec/duckjoin.go) |
+| `stretchr/testify` | Assertions | tests only |
+
+**The DuckDB dependency is the only one that changes how the binary is built**, so it is isolated
+behind a build tag rather than imported unconditionally:
+
+| | Compiles | cgo | Runtime image | Size |
+|---|---|---|---|---|
+| default | [`duckjoin_stub.go`](internal/exec/duckjoin_stub.go) — returns an error naming the fix | no | `distroless/static` | 49.5 MB |
+| `-tags duckdb` | [`duckjoin.go`](internal/exec/duckjoin.go) — the real engine | **yes** | `distroless/cc` (DuckDB is C++, so libstdc++ as well as glibc) | 148 MB |
+
+Consequences worth knowing before touching it: `go test ./...` does **not compile** the real
+engine, so only `go test -tags duckdb ./...` gives it any coverage; the builder is pinned to
+`golang:1.26-bookworm` so its glibc matches the `-debian12` runtime; and `go.mod` marks go-duckdb
+`// indirect` because `go mod tidy` cannot see an import behind a build tag — harmless, and
+verified not to break the tagged build.
+
+### Test doubles
+
+| Package | Notes | Depends on |
+|---|---|---|
+| [`mocksf`](internal/mocksf/) | Salesforce-shaped. `Capability`, `LieAbout`, `PageSize`, `RateLimit`, `DelayJitter` | `catalog`, `connector` |
+| [`mockzd`](internal/mockzd/) | Zendesk-shaped. `MaxInList` is what forces semi-join chunking | `connector` |
+| [`harness`](test/acceptance/harness/) | Real `httptest` server; `gw.Query(persona, sql)`, plus `RawAuth` for credentials `Token` cannot express | `server` |
+
+**`LieAbout` is the point of the mocks.** It makes a connector declare `ENFORCED` and then ignore
+the predicate — the adversary the whole entitlement model is built against.
 
 ---
 
 ## The request path, in call order
 
-Everything below happens inside one `POST /v1/query`. File references are the real call sites.
+One `POST /v1/query`, all inside `server`:
 
 | # | Step | Where | What it decides |
 |---|---|---|---|
-| 1 | **Admission** | [`server.go:123`](internal/server/server.go#L123) `identity.ResolveFromHeader` | Verifies the JWT and derives tenant **from the verified issuer**, never a claim (ADR-011) |
-| 2 | **Object authz (L1)** | [`server.go:189`](internal/server/server.go#L189) `Policy.ObjectDenied` | Rejects a denied table before any catalog or planner work happens |
-| 3 | **Plan (or cache hit)** | [`server.go:199`](internal/server/server.go#L199) → [`plancache.go:77`](internal/plancache/plancache.go#L77) `Resolve` | Six-field key; RLS/CLS residuals injected as plan nodes (L2) |
-| 4 | **Bind literals** | [`build.go:641`](internal/plan/build.go#L641) `Shape` + `ExtractParams` | Cached plans hold `?` placeholders, so two literals share one plan and each still sees its own value |
-| 5 | **Wrap sources** | [`server.go:239`](internal/server/server.go#L239) `freshness.Source{}` | Per-request cache decorator over the shared connector |
-| 6 | **Execute** | [`exec.go`](internal/exec/exec.go) `Run` | Single-table scan, or `runJoin` — an N-way semi-join cascade over the plan's sides and links |
-| 7 | **Fetch + verify (L3)** | [`exec.go:245`](internal/exec/exec.go#L245) | Verification filter, then `applyLocalFilters` — **per side, before any join merge** |
-| 8 | **Project** | [`exec.go:430`](internal/exec/exec.go#L430) `project` | Positional rows, so `a.id` and `t.id` are two slots rather than one overwritten map key |
+| 1 | **Admission** | `identity.ResolveFromHeader` | Tenant from the verified issuer, never a claim (ADR-011). Caller-fixable credentials are `UNAUTHENTICATED`/401; 503 is reserved for an unreachable attribute source |
+| 2 | **Object authz (L1)** | `policy.ObjectDenied` | Rejects a denied table before any catalog or planner work |
+| 3 | **Plan (or cache hit)** | `plancache.Resolve` | Six-field key; RLS/CLS residuals injected as plan nodes (L2) |
+| 4 | **Bind literals** | `plan.Shape` + `plan.ExtractParams` | Cached plans hold `?` placeholders, so two literals share one plan and each still sees its own value |
+| 5 | **Wrap sources** | `freshness.Source{}` | Per-request cache decorator over the shared connector |
+| 6 | **Execute** | `exec.Run` → `runJoin` | Single-table scan, or the N-way semi-join cascade over the plan's sides and links |
+| 7 | **Fetch + verify (L3)** | `exec.fetchScanRows` | Verification filter, then local filters — **per side, before any join merge** |
+| 8 | **Project** | `exec.project` | Positional rows, so `a.id` and `t.id` are two slots rather than one overwritten map key |
 
-**Rate limiting is not in this list on purpose.** It lives one layer deeper, at
-[`httpsource.go`](internal/connector/httpsource.go)'s page loop, because a vendor bills per HTTP
-request and `Fetch` paginates internally. Wired once in [`server.go:72`](internal/server/server.go#L72)
-`New`, never per request — the sources map is shared across concurrent requests.
-
----
-
-## Packages
-
-Sizes are source lines excluding tests.
-
-### The load-bearing four
-
-| Package | Src | What it owns |
-|---|---|---|
-| [`plan`](internal/plan/) | **1,227** | Parse → capability-aware pushdown → residual injection → the invariant. `build.go` is ~950 of it and is the densest file in the repo |
-| [`server`](internal/server/) | 681 | HTTP surface, admission, error vocabulary, sync + async + NDJSON paths |
-| [`exec`](internal/exec/) | 841 | Fetch, N-way semi-join cascade, two pluggable `JoinEngine`s (Go and DuckDB), verification filter, local filters, masking, projection |
-| [`connector`](internal/connector/) | 244 | The `Source` contract, HTTP implementation, pagination, ETags, per-page quota gate |
-
-### Supporting
-
-| Package | Src | What it owns |
-|---|---|---|
-| [`freshness`](internal/freshness/) | 246 | Result cache keyed `principal\|table\|columns\|filters`. Entries are **immutable once published** |
-| [`obs`](internal/obs/) | 215 | Prometheus metrics + OTel tracing, dual-emitted so tests and `/metrics` can't drift |
-| [`policy`](internal/policy/) | 182 | Role → residuals, masks, version, shape hash. Stands in for OPA's Compile API |
-| [`plancache`](internal/plancache/) | 151 | The six-field key and `combinedCapShape` |
-| [`catalog`](internal/catalog/) | 131 | Per-`(table, column, op)` capability with `ENFORCED`/`ADVISORY` |
-| [`identity`](internal/identity/) | 122 | Issuer registry, tenant derivation |
-| [`ratelimit`](internal/ratelimit/) | 95 | Token buckets, `Gate` |
-
-### Test doubles — read these to understand the tests
-
-| Package | Src | Notes |
-|---|---|---|
-| [`mocksf`](internal/mocksf/) | 334 | Salesforce-shaped. `Capability`, `LieAbout`, `PageSize`, `RateLimit`, `DelayJitter` |
-| [`mockzd`](internal/mockzd/) | 226 | Zendesk-shaped. `MaxInList` is what forces semi-join chunking |
-| [`harness`](test/acceptance/harness/) | 215 | Real `httptest` server; `gw.Query(persona, sql)` |
-
-**`LieAbout` is the point of the mocks.** It makes a connector declare `ENFORCED` and then ignore
-the predicate — the adversary the whole entitlement model is built against.
+**Rate limiting is not in this list on purpose.** It lives one layer deeper, in
+[`connector`](internal/connector/httpsource.go)'s page loop, because a vendor bills per HTTP request
+and `Fetch` paginates internally. Wired once in `server.New`, never per request — the sources map is
+shared across concurrent requests.
 
 ---
 
@@ -82,56 +108,32 @@ the predicate — the adversary the whole entitlement model is built against.
 
 | ADR | Code |
 |---|---|
-| **001** Planner runtime | [`plan/build.go`](internal/plan/build.go) — a Go stand-in for the Calcite sidecar the design specifies |
-| **002** Entitlements | L1 [`server.go:189`](internal/server/server.go#L189) · L2 [`build.go`](internal/plan/build.go) + [`invariant.go`](internal/plan/invariant.go) · L3 [`exec.go:375`](internal/exec/exec.go#L375) |
-| **003** Caching | [`plancache/`](internal/plancache/) and [`freshness/`](internal/freshness/) |
-| **005** Freshness | [`freshness.go`](internal/freshness/freshness.go) + ETag handling in [`httpsource.go`](internal/connector/httpsource.go) |
-| **006** Rate limits | [`ratelimit/`](internal/ratelimit/) + the page gate in [`httpsource.go`](internal/connector/httpsource.go) |
-| **007** Joins | [`exec.go`](internal/exec/exec.go) `runJoin` + [`joinengine.go`](internal/exec/joinengine.go) / [`duckjoin.go`](internal/exec/duckjoin.go) — tier 1 is real (embedded DuckDB, `--join-engine=duckdb`). **`JoinEngine` deliberately stops at tier 1**: it passes rows in memory, and tiers 2–3 exist because rows don't fit. They need a `Submit`/`Poll` interface, not a wider one |
-| **009** Streaming | `runStream` in [`server.go`](internal/server/server.go), NDJSON terminal frame |
-| **011** Identity | [`identity/`](internal/identity/) |
+| **001** Planner runtime | [`plan`](internal/plan/) — a Go stand-in for the Calcite sidecar the design specifies |
+| **002** Entitlements | L1 `policy.ObjectDenied` · L2 [`plan`](internal/plan/) build + invariant · L3 `exec.verifyPushedSecurityPredicates` |
+| **003** Caching | [`plancache`](internal/plancache/) and [`freshness`](internal/freshness/) |
+| **005** Freshness | [`freshness`](internal/freshness/) + ETag handling in [`connector`](internal/connector/) |
+| **006** Rate limits | [`ratelimit`](internal/ratelimit/) + the page gate in [`connector`](internal/connector/) |
+| **007** Joins | `exec.runJoin` + [`joinengine.go`](internal/exec/joinengine.go) / [`duckjoin.go`](internal/exec/duckjoin.go) — tier 1 is real (`--join-engine=duckdb`, `-tags duckdb`). **`JoinEngine` deliberately stops at tier 1**: it passes rows in memory, and tiers 2–3 exist because rows don't fit. They need a `Submit`/`Poll` interface, not a wider one |
+| **009** Streaming | `server.runStream`, NDJSON terminal frame |
+| **011** Identity | [`identity`](internal/identity/) — issuer registry, tenant derivation, and the 401/503 split |
 
-ADR-004, 008 and 010 are design-only — no code. That is deliberate and
+ADR-004, 008 and 010 are design-only — no code. Deliberate, and
 [`README.md`](./README.md)'s MVP status says so.
-
----
-
-## Tests, by what they prove
-
-`test/acceptance/` (747 lines) is the layer worth reading; unit tests sit beside their packages.
-
-| Test | Claim it defends |
-|---|---|
-| `TestLyingConnectorFailsClosed` | **The headline.** Connector declares `ENFORCED`, ignores it, request 403s |
-| `TestHonestConnectorZeroViolations` | Its pairing — the filter isn't trivially always-firing |
-| `TestPlanCacheDoesNotLeakAcrossRoles` | Privilege escalation via a shared plan |
-| `TestConcurrentResolvesDoNotBleedAcrossRoles` | The same, **under contention** |
-| `TestSemiJoinReducesProbeCalls` | 501 → 4 connector calls (125×) on the reference fixture |
-| `TestFourTableJoinEndToEnd` | **N-way works** — 4 tables, 3 links over HTTP, through every engine in the build (`-tags duckdb` adds DuckDB and requires identical output) |
-| `TestUnauthenticatedIsNotAServiceFailure` | Every credential the caller can fix is a **401**, not a 503 — missing header, bad prefix, unparseable claims, unregistered issuer |
-| `TestJoinRejectsForwardReference` | Every join must reference an earlier table, so a probe's keys are always already fetched |
-| `TestSemiJoinReturnsEveryMatchingRow` | Exactly 2,500 rows across 3 chunks — the correctness half |
-| `TestJoinKeepsBothSidesOfCollidingColumns` | `a.id` and `t.id` both survive the merge |
-| `TestOuterJoinsRejectedNotSilentlyDowngraded` | `LEFT`/`RIGHT`/`CROSS` are refused, not run as inner |
-| `TestFreshnessCacheIsolatedByPrincipal` | Two users, same role, must not share a cache entry |
-| `TestPaginatedFetchSpendsOneTokenPerPage` | Quota is denominated in HTTP requests |
-| `TestProbeChunksAreIndependentOfBuildRowOrder` | Probe-side cache keys survive a source reordering identical rows |
-| `TestConcurrentHitAndRevalidateOnOneKey` | Worthless without `-race` — asserts an absence |
 
 ---
 
 ## Known gaps — read before reviewing
 
-These are real and deliberate. Claiming otherwise would be the actual defect.
+Real and deliberate. Claiming otherwise would be the actual defect.
 
 | Gap | Where | Status |
 |---|---|---|
-| **No plan-cache eviction** | [`plancache.go`](internal/plancache/plancache.go) `Cache` | Documented in the type comment. Resident memory grows with distinct keys |
-| **No singleflight** | [`freshness.go`](internal/freshness/freshness.go) | `TestConcurrentMissesOnOneKeyStampedeToTheConnector` **asserts the stampede** so the gap stays visible |
-| **Per-pod rate limit buckets** | [`ratelimit/`](internal/ratelimit/) | N pods = N× the limit. Design specifies Redis leases |
-| **Join order is FROM order** | [`build.go`](internal/plan/build.go) `buildJoin` | N-way works, but the cascade is left-deep in FROM order; cost-based ordering needs the planner ADR-001 defers |
-| **`LIMIT`/`OFFSET` unsupported** | [`build.go`](internal/plan/build.go) | Same layer as projection; parsed, not honoured |
-| **`extra` can clobber `pushed`** | `fetchScanRows` in [`exec.go`](internal/exec/exec.go) | Latent — unreachable until a catalog declares the join key filterable |
+| **No plan-cache eviction** | `plancache.Cache` | Documented in the type comment. Resident memory grows with distinct keys |
+| **No singleflight** | [`freshness`](internal/freshness/) | `TestConcurrentMissesOnOneKeyStampedeToTheConnector` **asserts the stampede**, so the gap stays visible |
+| **Per-pod rate-limit buckets** | [`ratelimit`](internal/ratelimit/) | N pods = N× the limit. Design specifies Redis leases |
+| **Join order is FROM order** | `plan.buildJoin` | N-way works, but the cascade is left-deep in FROM order; cost-based ordering needs the planner ADR-001 defers |
+| **`LIMIT`/`OFFSET` unsupported** | [`plan`](internal/plan/) | Parsed by the grammar, never read by `Build` |
+| **`extra` can clobber `pushed`** | `exec.fetchScanRows` | Latent — unreachable until a catalog declares a join key filterable |
 
 ---
 
@@ -145,21 +147,8 @@ testdata/policy/admin.json           no RLS, no masks
 testdata/tokens/{dana,erin,root}.jwt dana+erin: same role and region, different sub
 ```
 
-**`dana` and `erin` exist to be identical except for `sub`** — that's what isolates the
+**`dana` and `erin` exist to be identical except for `sub`** — that is what isolates the
 principal-keyed cache test from role-driven differences.
 
-`zd.tickets` declares only `status`, which is why the `extra`-clobbers-`pushed` bug above is
-currently unreachable.
-
----
-
-## Commands
-
-```bash
-go test -race ./...                  # 57 tests, ~6s
-go test ./... -run 'LyingConnector|PlanCacheDoesNotLeak|SemiJoin|TenantDerived' -v
-go run ./cmd/gateway                 # needs mocksf + mockzd, see README Quickstart
-docker compose --profile duckdb up -d --build   # ADR-007 tier 1 on :8090 (cgo, 148MB vs 49.5MB)
-```
-
-Full reproduction of every claim: [`README.md`](./README.md)'s recreate appendix.
+`zd.tickets` declares only `status` as a predicate, which is why the `extra`-clobbers-`pushed` gap
+above is currently unreachable.

@@ -1651,6 +1651,10 @@ sequenceDiagram
     CW->>B: mint short-TTL token for (principal=Q, connector=sf, purpose=read)
     B->>SEC: fetch Q's own refresh token - the same one stored in the consent phase
     SEC-->>B: Q's refresh token
+    B->>SEC: fetch our app's OAuth client credentials for this connector type<br/>(client_id/secret - shared across tenants, not per-user)
+    SEC-->>B: connector-type client credentials
+    B->>SOA: exchange refresh_token for access_token<br/>(grant_type=refresh_token, our client_id/secret, Q's refresh_token)
+    SOA-->>B: access_token, expires_in
     B-->>CW: short-TTL access token scoped to Q - memory only, never logged
     Note over CW,S: CW calls the source AS Q, using Q's own delegated<br/>grant - never a generic service identity
     CW->>S: query + PUSHED_ENFORCED predicates, bearer = Q's token
@@ -1665,6 +1669,17 @@ ever reads the Control Plane (tenant registry, role/attribute mapping); the Egre
 Broker only ever reads Secrets (the refresh token a user's own consent established). Neither
 one's failure or compromise exposes what the other holds - which is the concrete version of
 "two trust domains, opposite directions" above.
+
+**Secrets holds two different shapes of credential, keyed differently, and the diagram's
+missing step above is exactly where the difference matters.** A refresh token is keyed
+`(tenant, principal, connector)` - one per user per source, established at consent. The
+client credentials the broker also needs - `client_id`/`client_secret`, or a JWT-bearer
+signing key for the server-to-server variant - are keyed by `connector` alone: one per
+connector *type*, registered once when that connector is built (ADR-004), shared across
+every tenant who uses it, and never touched by a per-user consent flow. Without this second
+credential the broker cannot call the vendor's token endpoint at all - holding a user's
+refresh token is necessary but not sufficient to mint an access token, since only the vendor's
+own auth server can perform that exchange.
 
 **Consequences we accept.**
 - **Authorization staleness becomes an explicit SLO** rather than an accident of token

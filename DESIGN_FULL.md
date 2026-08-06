@@ -331,37 +331,50 @@ sequenceDiagram
 
  G->>G: bind principal params
  G->>G: assert residual invariant - fail closed
- G->>R: reserve tokens (SF:1, ZD:1) from local lease
+ G->>B: mint short-TTL tokens (principal, SF + ZD, read)
+ B-->>G: access tokens - memory only, never logged
 
+ Note over G,S: side 0 = Salesforce, FROM order - no cardinality<br/>estimate exists to pick a smaller relation first (known gap)
+ G->>G: freshness cache lookup (principal, sf.accounts, columns, filters)
+ alt within max_staleness
+ G->>G: serve cached rows, no outbound call
+ else stale or miss
+ G->>R: reserve 1 token (SF) - per outbound call, never pre-allocated
  alt budget exhausted
  R-->>G: denied
  G-->>U: 429 RATE_LIMIT_EXHAUSTED + Retry-After + async hint
  end
-
- G->>B: mint short-TTL tokens (principal, SF + ZD, read)
- B-->>G: access tokens - memory only, never logged
-
- par fan out
- G->>S: SOQL + PUSHED_ENFORCED predicates
+ G->>S: SOQL (side 0, full fetch) + PUSHED_ENFORCED predicates
  S-->>G: L3 rows visible to this user at source
- and
- G->>Z: REST + PUSHED_ENFORCED predicates
- Z-->>G: L3 rows visible to this user at source
  end
 
- G->>G: apply RESIDUAL filters (ADVISORY predicates)
- G->>D: build side = smaller relation, memory_limit set
+ G->>G: extract distinct join keys from side 0,<br/>chunk by Zendesk's declared max_in_list
+ loop each chunk - side 1 depends on side 0's keys, never parallel
+ G->>G: freshness cache lookup (principal, zd.tickets, columns, chunk filter)
+ alt within max_staleness
+ G->>G: serve cached rows, no outbound call
+ else stale or miss
+ G->>R: reserve 1 token (ZD) - per outbound call, never pre-allocated
+ G->>Z: REST + organization_id IN (chunk) + PUSHED_ENFORCED predicates
+ Z-->>G: L3 rows visible to this user at source
+ end
+ end
+
+ G->>G: apply RESIDUAL filters (ADVISORY predicates), per side
+ G->>D: join, side 0 first (FROM order), memory_limit set
  D-->>G: joined rows
  G->>G: apply CLS masks, then reset DuckDB instance
  G->>A: access trail (both sources, policy_ver, residency tag)
  G-->>U: rows + freshness_ms + rate_limit_status + trace_id
 ```
 
-Four steps carry most of the security weight and are easy to miss on a first read: the
+Five steps carry most of the security weight and are easy to miss on a first read: the
 **L1 object check before planning**, the **`policy_shape` and `role_set` components of the
-plan cache key**, the **residual invariant assertion after parameter binding**, and the
-**local application of RESIDUAL filters** for predicates the connector could not enforce.
-ADR-002 expands each; the diagrams there show the deny paths this one omits.
+plan cache key**, the **residual invariant assertion after parameter binding**, the
+**local application of RESIDUAL filters** for predicates the connector could not enforce, and
+the **per-chunk freshness check** that lets a stale-but-cached side skip its outbound call
+entirely. ADR-002 expands the authorization layers; the diagrams there show the deny paths this
+one omits. ADR-005 and ADR-007 expand the freshness and semi-join mechanics only sketched here.
 
 ---
 

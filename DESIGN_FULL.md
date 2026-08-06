@@ -1330,6 +1330,60 @@ hatch; N-way join volume justifies cost-based join ordering rather than FROM ord
 estimate routes a job to a tier too small for it often enough to need a runtime escalation/retry
 path, which does not exist today.
 
+**Tenant isolation for tier 2/3 async jobs - proposed, not built, and not designed past this
+section.** ADR-010 already covers *what* lands on S3 (staged Parquet, per-tenant prefix, the
+tenant's KEK). This covers *who is allowed to read it, and for how long* - the harder question
+once tier 2 reuses one warm node across a sequence of different tenants' jobs.
+
+- **Staging is the one step tiers 2 and 3 share.** The build/probe fetch cascade runs unchanged
+  - same L3 verification filter, same RLS/CLS residual application, per side, before anything
+  leaves the gateway's trust boundary. The only difference from tier 1: each side's rows stream
+  to S3 as Parquet instead of staying in the gateway's heap, partitioned by the semi-join's own
+  chunk boundaries on the probe side for free. The write credential here is the gateway's own
+  service identity, scoped to that tenant's prefix - a different, narrower grant than the
+  per-job *read* credential a tier-2 node or tier-3 executor needs later, and the two should not
+  be reused for each other.
+- **Admission reuses ADR-006's per-tenant semaphore and fair queue**, retargeted at concurrent
+  async jobs instead of outbound connector calls, so one tenant's backlog cannot starve another
+  tenant's access to the small warm pool. Tier 2 admission additionally waits on a free node -
+  "one job at a time per node" is a genuinely scarce resource, not just a fairness policy. Tier
+  3 has no equivalent bottleneck, since managed serverless provisions its own executors, so its
+  admission is cost and concurrency capping only.
+- **Credentials are issued at dispatch, per job, never held long-lived by the node.** The job
+  runner calls `AssumeRole` (or the cloud-native equivalent - IRSA, GCP Workload Identity
+  Federation) for a role scoped by IAM condition keys to exactly `s3:GetObject` on
+  `tenant={tenant}/job={job_id}/*` and `kms:Decrypt` on that one tenant's KEK ARN, TTL bounded to
+  the tier's SLA ceiling. Tier 2 attaches these to the *query*, not the node - ClickHouse's S3
+  table function accepts per-query credentials, so the warm node's own identity never holds
+  blanket access to any tenant's key, only the in-flight query does. Tier 3 attaches the same
+  grant as the execution role at job submission, which is the more natural fit: serverless job
+  platforms are already built around one execution role per submission.
+- **Tier 2's node reset is a real, verified step - this is where "clear the DEKs" actually
+  resolves.** Because tier 2 reuses one physical node across different tenants' jobs, sequentially,
+  three things have to hold before a node goes back into the available pool: every table or temp
+  object the job created is dropped, ideally by running each job in its own session/user context
+  torn down afterward rather than remembering to clean up; the per-query credentials expire on
+  their own bounded TTL, which is the backstop, not the primary control, since the session that
+  held them is closed explicitly first; and a runner that cannot positively confirm the reset -
+  an empty `SHOW TABLES`, a clean teardown - drains that node instead of reusing it, the same
+  fail-closed posture as everything else in this design.
+- **Tier 3 needs none of this, and applying tier 2's reset ritual to it would be solving a
+  problem it doesn't have.** Its isolation is by construction: ephemeral executors, provisioned
+  fresh per job, destroyed at teardown. There is no shared node to reset because "reset" is just
+  the executor no longer existing.
+- **Result delivery follows the same envelope as input.** Output goes back to S3 as Parquet under
+  the tenant's SSE-KMS envelope, so crypto-shred covers results as well as input, not just one
+  direction. The client polls the existing `Prefer: respond-async` 202-plus-poll contract; on
+  completion the gateway reads the result under its own credential, since the ephemeral job
+  credential may already have expired by poll time, and either proxies it or hands back a
+  short-lived pre-signed URL. Both staged input and output are deleted outright once delivered or
+  past a bounded retention window - reap was already one of the async runner's four named jobs,
+  and a leaked stage is customer data left sitting in durable storage.
+
+**Decided by:** not yet - this is a sketch, not a commitment, sitting at the same "Proposed"
+level as ADR-001. **Revisit if:** tier 2/3 usage is ever prioritized ahead of the M5/M6
+placement Section 7 already gives it, since none of the above is worth building before then.
+
 **Open question: `LIMIT`/`OFFSET` - not yet designed past the grammar.** Section 1.4's SQL
 surface lists `LIMIT`/`OFFSET`; nothing past the grammar has been decided, and the prototype
 does not implement either. Both sit in the same implementation layer as projection - the

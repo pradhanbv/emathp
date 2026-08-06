@@ -455,6 +455,10 @@ Routed by a **cost-based cardinality estimate at plan time** — never table cou
   ([ADR-010](#adr-010--keys-crypto-shredding-and-the-audit-conflict)). No new infrastructure: job
   state fits the Postgres catalog or the Redis cluster [§6.2](#62-derived-sizing) measures as
   *"vastly under-utilized."* No completion SLO, so it is built for durability, not latency.
+  **Per-tenant isolation on the shared tier-2 node — who gets to read a job's staged S3 data, and
+  for how long — is sketched in detail, not yet decided:** see "Tenant isolation for tier 2/3
+  async jobs" in [DESIGN_FULL.md's ADR-007](./DESIGN_FULL.md#adr-007---join-strategy-a-four-tier-escalation-ladder),
+  near the end of the section.
 - **`JoinEngine` stops at tier 1 — by necessity, not omission.** The interface takes
   `[]connector.Row` in and returns `[]connector.Row` out, so every row must fit the gateway's Go
   heap. **Tiers 2–3 exist precisely because the working set does not.** Routing to tier 2 through

@@ -6,6 +6,7 @@ query end-to-end: **auth → entitlement checks → rate-limit handling → fres
 | Doc | For | Read time |
 |---|---|---|
 | **This file** | Orientation, quickstart, what's proven and what isn't | **~10 min**, + an ~11 min command appendix you run rather than read |
+| [`HLD.md`](./HLD.md) | The shape of the system in one sitting — diagrams, request path, join tiers, built-vs-proposed at a glance | ~5 min |
 | [`DESIGN.md`](./DESIGN.md) | All 11 ADRs, both capability ladders, capacity math, six-month plan | ~35 min |
 | [`CODE_MAP.md`](./CODE_MAP.md) | Navigating the implementation: request path in call order, ADR-to-code map, known gaps | ~6 min |
 | [`DESIGN_FULL.md`](./DESIGN_FULL.md) | Canonical — worked derivations, full rejection reasoning, 16 diagrams | ~90 min |

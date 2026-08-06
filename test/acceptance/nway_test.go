@@ -1,6 +1,9 @@
 package acceptance
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -48,7 +51,29 @@ func TestFourTableJoinEndToEnd(t *testing.T) {
 			want = res.Body.Rows
 			t.Logf("4-way join: %d rows, naive estimate %d calls", len(res.Body.Rows), res.Body.Meta.NaiveCallEstimate)
 		} else {
-			require.Equal(t, len(want), len(res.Body.Rows), "engines disagree on 4-way row count")
+			// Content, not count. Row order is not part of the contract - the
+			// Go engine folds left-deep while DuckDB picks its own join order
+			// - so both sides are serialised and sorted before comparing.
+			// Comparing lengths alone would let two engines return the same
+			// number of entirely different rows and still pass.
+			require.Equal(t, normalizeRows(want), normalizeRows(res.Body.Rows),
+				"engines returned different result sets for the same query")
 		}
 	}
+}
+
+// normalizeRows renders a result set order-independently: every cell
+// stringified, cells joined per row, rows sorted. Two engines agree only if
+// these are identical.
+func normalizeRows(rows [][]any) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		cells := make([]string, len(r))
+		for i, c := range r {
+			cells[i] = fmt.Sprintf("%v", c)
+		}
+		out = append(out, strings.Join(cells, "\x1f"))
+	}
+	sort.Strings(out)
+	return out
 }

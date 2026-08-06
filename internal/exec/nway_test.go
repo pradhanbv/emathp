@@ -3,6 +3,8 @@ package exec
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/pradhanbv/emathp/internal/connector"
@@ -56,8 +58,29 @@ func TestEnginesAgreeOnFourWayJoin(t *testing.T) {
 		if want == nil {
 			want = n
 			t.Logf("4-way through the engine interface: %d rows", len(got))
-		} else if len(want) != len(n) {
-			t.Fatalf("engines disagree on 4-way: go=%d rows, %s=%d rows", len(want), e.Name(), len(n))
+		} else if !reflect.DeepEqual(want, n) {
+			// Content, not just count. normalize() serialises every column of
+			// every row and sorts, so this compares the actual result sets -
+			// two engines returning the same number of entirely different rows
+			// must not pass.
+			t.Fatalf("engines disagree on 4-way: %d vs %d rows, and the contents differ\n  first mismatch: %s",
+				len(want), len(n), firstDiff(want, n))
 		}
 	}
 }
+
+// firstDiff reports the first position where two normalized result sets
+// differ, so a failure names a row rather than just a count.
+func firstDiff(a, b []string) string {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return "[" + itoa(i) + "] " + a[i] + "  !=  " + b[i]
+		}
+	}
+	if len(a) != len(b) {
+		return "lengths differ: " + itoa(len(a)) + " vs " + itoa(len(b))
+	}
+	return "(none)"
+}
+
+func itoa(i int) string { return strconv.Itoa(i) }

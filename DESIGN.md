@@ -361,17 +361,48 @@ and it was invisible to the whole test suite until a load run varied a `WHERE` v
 
 | Rung | Mechanism | Cost | Delete-safe |
 |---|---|---|---|
-| **1** | Native `ETag` / `If-Modified-Since` conditional request | 1 call, 304 on hit | ✅ |
-| **2** | Change/event feed or cursor API (e.g. Zendesk incremental exports) | 1 call | ✅ |
-| **3** | `updated_after` filter + 1-row sorted fetch as watermark | 1 call | ❌ — pair with periodic full-refresh floor |
+| **1** | Native `ETag` / `If-Modified-Since` conditional request | 1 call, 304 on hit — the probe *is* the fetch, so it never doubles | ✅ |
+| **2** | Change/event feed or cursor API (e.g. Zendesk incremental exports), maintained as a replica rather than probed per query | 0 calls per query once synced; replication runs on its own schedule, not charged to any single request | ✅, only if the feed emits explicit delete events |
+| **3** | `updated_after` filter + 1-row sorted fetch as watermark | 1 call if unchanged; 2+ calls if changed (the probe, then a full live fetch) | ❌ — pair with periodic full-refresh floor |
 | **4** | None — TTL only | 0 calls | ❌ |
 
-- **Quota accounting.** A rung-1/2/3 probe **spends a rate-limit token**, charged to the same
-  bucket as a data fetch and visible in `rate_limit_status`. *Freshness that silently consumes
-  quota is a quota leak with good PR, not freshness control.*
+- **Quota accounting.** A rung-1 or rung-3 probe spends a rate-limit token, charged to the same
+  bucket as a data fetch and visible in `rate_limit_status`. Freshness that silently consumes
+  quota is a quota leak with good PR, not freshness control. Rung 2 doesn't spend a token per
+  query at all — its cost is a background replication job, on its own schedule, not charged to
+  any single request.
 - **`max_staleness` semantics:** within TTL → serve cached · outside TTL → probe at best rung ·
   probe unchanged → serve cached, reset TTL · probe changed or rung-4 → live fetch · probe would
   exceed budget → `STALE_DATA` with actual age, so the **caller** decides rather than us guessing.
+- **Rung 1 depends on what the source actually supports.** Checked against the two vendors this
+  design targets, not assumed. GitHub returns ETags on list endpoints and a 304 doesn't count
+  against the rate limit. Salesforce is different: its REST API only supports conditional
+  requests on single Account records, never on the `/query` resource SOQL results come back
+  through. So for `sf.accounts`, rung 1 isn't usable at all — the gateway needs ETags on query
+  results, and Salesforce doesn't offer that. Zendesk's ticket-list support is unconfirmed.
+- **Rung 2 needs its own component, not another branch of the per-query cache.** Rungs 1, 3, and
+  4 all work the same way: check how old the cached entry is, maybe send one probe, then either
+  serve the cached rows or fetch live. A change feed doesn't fit that shape. Its natural use is
+  keeping one full local copy of a table continuously up to date, independent of any specific
+  query, and then answering any filtered query from that copy with no extra calls. That's a
+  background replicator, not a probe — a different kind of component from what the other three
+  rungs share.
+- **A rung-2 replica can't be shared across principals.** [ADR-002](#adr-002--entitlement-enforcement-the-briefs-hardest-requirement)'s
+  L3 layer sends every connector call under the calling principal's own delegated token, so the
+  source enforces that principal's own sharing rules — Salesforce record ownership, Zendesk
+  group restrictions. A replica built with one principal's token only reflects what that
+  principal can see. Using it to answer a different principal's query would either leak rows the
+  second principal's own access wouldn't return, or hide rows they should see. So each principal
+  needs their own replica. That still saves calls across that principal's own different queries —
+  it just never becomes one shared copy for everyone.
+- **The cache never holds a join result, only single tables.** `freshness.Source` wraps each
+  connector separately. Every fetch it sees — a plain scan, a join's first side, or one
+  semi-join probe chunk — is cached on its own, keyed by that one table's
+  `(principal, columns, filters)`. The join itself happens afterward, once every side has
+  already come back, and that merged result is never cached. This has a side effect: each side
+  of a join ages on its own clock, so one side's cached rows might be fresh while another's are
+  close to the staleness limit. Each side is still within its own budget individually. But the
+  two sides together aren't guaranteed to reflect the same moment in time.
 
 ### ADR-006 — Rate limiting and multi-tenant fairness
 
